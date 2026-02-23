@@ -352,7 +352,9 @@ BASELINE_PII = [
     (r"(?i)\b(?:password|secret|token|api_key)\s*[:=]\s*\S+",    "[SECRET]"),
 ]
 
-def build_patterns(rules: dict) -> list[tuple[str, str]]:
+def build_patterns(rules) -> list[tuple[str, str]]:
+    if isinstance(rules, str):
+        rules = json.loads(rules)
     return BASELINE_PII + [(p, "[REDACTED]") for p in rules.get("redact_patterns", [])]
 
 def redact(data: Any, patterns: list) -> tuple[Any, bool]:
@@ -397,7 +399,9 @@ def _matches(tool: str, pattern: str) -> bool:
     if pattern.endswith("*"): return tool.lower().startswith(pattern[:-1].lower())
     return tool.lower() == pattern.lower()
 
-def check_tool(tool: str, rules: dict) -> tuple[bool, str]:
+def check_tool(tool: str, rules) -> tuple[bool, str]:
+    if isinstance(rules, str):
+        rules = json.loads(rules)
     if rules.get("read_only") and any(t in WRITE_VERBS for t in _tokens(tool)):
         return False, f"'{tool}' is a write op — policy is read-only"
     for p in rules.get("deny_tools", []):
@@ -411,7 +415,9 @@ def check_tool(tool: str, rules: dict) -> tuple[bool, str]:
             return True, "allowed"
     return False, f"'{tool}' not in allowed list"
 
-def check_args(args: dict, rules: dict) -> tuple[bool, str]:
+def check_args(args: dict, rules) -> tuple[bool, str]:
+    if isinstance(rules, str):
+        rules = json.loads(rules)
     max_r = rules.get("max_records")
     if not max_r:
         return True, "ok"
@@ -604,6 +610,8 @@ async def protect(req: ProtectRequest, request: Request,
         req.agent_id, body, x_agent_signature, req.timestamp, req.nonce, rid
     )
     rules    = policy_row["rules"]
+    if isinstance(rules, str):
+        rules = json.loads(rules)
     patterns = build_patterns(rules)
 
     allowed, reason, clean, redacted, action = await run_enforcement(
@@ -644,6 +652,8 @@ async def invoke(req: InvokeRequest, request: Request,
         req.agent_id, body, x_agent_signature, req.timestamp, req.nonce, rid
     )
     rules    = policy_row["rules"]
+    if isinstance(rules, str):
+        rules = json.loads(rules)
     patterns = build_patterns(rules)
 
     # SSRF: resolve + pin IPs at check time
