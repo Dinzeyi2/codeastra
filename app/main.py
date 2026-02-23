@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import anthropic
 import httpx
 import redis.asyncio as aioredis
+from fastapi.middleware.cors import CORSMiddleware
 import structlog
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
@@ -567,6 +568,15 @@ async def load_and_verify(agent_id, body, sig, ts, nonce, request_id):
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="AgentGuard", version="1.5.0", lifespan=lifespan)
 app.state.limiter = limiter
+
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
