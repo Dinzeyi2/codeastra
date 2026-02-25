@@ -20,7 +20,6 @@ from fastapi import FastAPI, HTTPException, Header, Request, Depends, Background
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt as pyjwt
 from passlib.context import CryptContext
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from slowapi import Limiter
@@ -265,12 +264,29 @@ class InvokeRequest(BaseModel):
 
 # ── JWT auth ──────────────────────────────────────────────────────────────────
 def create_jwt(tenant_id: str) -> str:
-    exp = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
-    return pyjwt.encode({"sub": tenant_id, "exp": exp}, JWT_SECRET, algorithm=JWT_ALGO)
+    import hmac as _hmac, base64 as _b64
+    header  = _b64.urlsafe_b64encode(json.dumps({"alg":"HS256","typ":"JWT"}).encode()).rstrip(b"=").decode()
+    exp     = int((datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)).timestamp())
+    payload = _b64.urlsafe_b64encode(json.dumps({"sub": tenant_id, "exp": exp}).encode()).rstrip(b"=").decode()
+    msg     = f"{header}.{payload}".encode()
+    sig     = _b64.urlsafe_b64encode(_hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()).rstrip(b"=").decode()
+    return f"{header}.{payload}.{sig}"
 
 def decode_jwt(token: str) -> str:
+    import hmac as _hmac, base64 as _b64
     try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise ValueError("bad token")
+        header_b, payload_b, sig_b = parts
+        msg      = f"{header_b}.{payload_b}".encode()
+        expected = _b64.urlsafe_b64encode(_hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()).rstrip(b"=").decode()
+        if not _hmac.compare_digest(expected, sig_b):
+            raise ValueError("bad signature")
+        pad     = "=" * (-len(payload_b) % 4)
+        payload = json.loads(_b64.urlsafe_b64decode(payload_b + pad))
+        if payload["exp"] < int(datetime.now(timezone.utc).timestamp()):
+            raise ValueError("expired")
         return payload["sub"]
     except Exception:
         raise HTTPException(401, "Invalid or expired token")
