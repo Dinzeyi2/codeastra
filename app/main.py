@@ -1082,6 +1082,174 @@ async def metrics(x_api_key: str = Header(...)):
     from fastapi.responses import Response
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TIME-SERIES STATS
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/audit/stats/timeseries")
+async def stats_timeseries(
+    tenant = Depends(get_tenant),
+    interval: str = "hour",
+    days: int = 30,
+    agent_id: Optional[str] = None,
+):
+    valid = {"hour": "hour", "day": "day", "week": "week"}
+    trunc = valid.get(interval, "hour")
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if agent_id:
+        where += " AND agent_id=$3"; vals.append(agent_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT date_trunc('{trunc}', created_at) AS period,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE decision='allow') AS allowed,
+                COUNT(*) FILTER (WHERE decision='deny')  AS denied,
+                ROUND(AVG(duration_ms)) AS avg_ms
+            FROM audit_logs {where}
+            GROUP BY period ORDER BY period ASC
+        """, *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/audit/stats/by-tool")
+async def stats_by_tool(
+    tenant = Depends(get_tenant),
+    days: int = 30,
+    agent_id: Optional[str] = None,
+    limit: int = 20,
+):
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if agent_id:
+        where += " AND agent_id=$3"; vals.append(agent_id)
+    vals.append(min(limit, 100))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT tool,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE decision='allow') AS allowed,
+                COUNT(*) FILTER (WHERE decision='deny')  AS denied,
+                ROUND(AVG(duration_ms)) AS avg_ms,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE decision='deny') / NULLIF(COUNT(*),0), 1) AS deny_rate_pct
+            FROM audit_logs {where}
+            GROUP BY tool ORDER BY total DESC LIMIT ${len(vals)}
+        """, *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/audit/anomalies")
+async def audit_anomalies(
+    tenant = Depends(get_tenant),
+    days: int = 7,
+    agent_id: Optional[str] = None,
+):
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if agent_id:
+        where += " AND agent_id=$3"; vals.append(agent_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            WITH hourly AS (
+                SELECT date_trunc('hour', created_at) AS hour, agent_id,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE decision='deny') AS denied
+                FROM audit_logs {where}
+                GROUP BY hour, agent_id
+            ),
+            stats AS (
+                SELECT agent_id, AVG(total) AS avg_total, STDDEV(total) AS std_total
+                FROM hourly GROUP BY agent_id
+            )
+            SELECT h.hour, h.agent_id, h.total, h.denied,
+                ROUND(100.0*h.denied/NULLIF(h.total,0),1) AS deny_rate_pct,
+                CASE
+                    WHEN s.std_total > 0 AND h.total > s.avg_total + (2*s.std_total) THEN 'volume_spike'
+                    WHEN h.total >= 5 AND h.denied::float/NULLIF(h.total,0) > 0.5 THEN 'high_deny_rate'
+                    ELSE NULL
+                END AS anomaly_type
+            FROM hourly h JOIN stats s ON h.agent_id = s.agent_id
+            WHERE (s.std_total > 0 AND h.total > s.avg_total + (2*s.std_total))
+               OR (h.total >= 5 AND h.denied::float/NULLIF(h.total,0) > 0.5)
+            ORDER BY h.hour DESC
+        """, *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/settings/retention")
+async def get_retention(tenant = Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT retention_days FROM tenants WHERE id=$1", tenant["id"])
+    days = row["retention_days"] if row and row["retention_days"] else 90
+    return {"retention_days": days}
+
+@app.put("/settings/retention")
+async def set_retention(body: dict, tenant = Depends(get_tenant)):
+    days = int(body.get("days", 90))
+    if not 7 <= days <= 3650:
+        raise HTTPException(400, "Retention must be 7-3650 days")
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_name='tenants' AND column_name='retention_days')
+                THEN ALTER TABLE tenants ADD COLUMN retention_days INTEGER DEFAULT 90;
+                END IF;
+            END $$""")
+        await conn.execute("UPDATE tenants SET retention_days=$1 WHERE id=$2", days, tenant["id"])
+        deleted = await conn.fetchval(
+            "WITH d AS (DELETE FROM audit_logs WHERE tenant_id=$1 "
+            "AND created_at < NOW() - ($2 || ' days')::INTERVAL RETURNING id) SELECT COUNT(*) FROM d",
+            tenant["id"], str(days)
+        )
+    return {"retention_days": days, "purged_records": deleted}
+
+@app.get("/policies/{name}/history")
+async def policy_history(name: str, tenant = Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        await conn.execute("""CREATE TABLE IF NOT EXISTS policy_history (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+            policy_name TEXT NOT NULL, rules JSONB NOT NULL,
+            changed_at TIMESTAMPTZ DEFAULT NOW())""")
+        rows = await conn.fetch(
+            "SELECT * FROM policy_history WHERE tenant_id=$1 AND policy_name=$2 ORDER BY changed_at DESC",
+            tenant["id"], name
+        )
+    return [dict(r) for r in rows]
+
+@app.post("/webhooks")
+async def create_webhook(body: dict, tenant = Depends(get_tenant)):
+    url    = body.get("url")
+    events = body.get("events", ["deny", "anomaly"])
+    if not url:
+        raise HTTPException(400, "url is required")
+    async with pool.acquire() as conn:
+        await conn.execute("""CREATE TABLE IF NOT EXISTS webhooks (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+            url TEXT NOT NULL, events TEXT[] NOT NULL,
+            secret TEXT NOT NULL, active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMPTZ DEFAULT NOW())""")
+        wh_id  = str(uuid.uuid4())
+        secret = secrets.token_hex(24)
+        await conn.execute(
+            "INSERT INTO webhooks (id,tenant_id,url,events,secret) VALUES ($1,$2,$3,$4,$5)",
+            wh_id, tenant["id"], url, events, secret
+        )
+    return {"id": wh_id, "url": url, "events": events, "secret": secret}
+
+@app.get("/webhooks")
+async def list_webhooks(tenant = Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        try:
+            rows = await conn.fetch("SELECT id,url,events,active,created_at FROM webhooks WHERE tenant_id=$1", tenant["id"])
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+@app.delete("/webhooks/{webhook_id}")
+async def delete_webhook(webhook_id: str, tenant = Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM webhooks WHERE id=$1 AND tenant_id=$2", webhook_id, tenant["id"])
+    if res == "DELETE 0":
+        raise HTTPException(404, "Webhook not found")
+    return {"deleted": webhook_id}
+
 @app.get("/health")
 async def health():
     checks = {"postgres": False, "redis": None}
