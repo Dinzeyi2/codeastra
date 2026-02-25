@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Header, Request, Depends, Background
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import JWTError, jwt
+import jwt as pyjwt
 from passlib.context import CryptContext
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from slowapi import Limiter
@@ -95,24 +95,25 @@ async def lifespan(app: FastAPI):
 
 async def init_db():
     async with pool.acquire() as conn:
-        await conn.execute("""
-        -- ── Tenants (one per customer/company) ─────────────────────────────
-        CREATE TABLE IF NOT EXISTS tenants (
-            id           TEXT PRIMARY KEY,
-            name         TEXT NOT NULL,
-            email        TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            plan         TEXT NOT NULL DEFAULT 'starter',  -- starter|pro|enterprise
-            api_key      TEXT UNIQUE NOT NULL,
-            sso_provider TEXT,          -- 'google' | 'github' | null
-            sso_id       TEXT,
-            created_at   TIMESTAMPTZ DEFAULT NOW()
-        );
+        # Create each table separately so IF NOT EXISTS works correctly
+        # even when migrating from older schema versions
 
-        -- ── Agents (scoped to tenant) ───────────────────────────────────────
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS tenants (
+            id            TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            email         TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            plan          TEXT NOT NULL DEFAULT 'starter',
+            api_key       TEXT UNIQUE NOT NULL,
+            sso_provider  TEXT,
+            sso_id        TEXT,
+            created_at    TIMESTAMPTZ DEFAULT NOW()
+        )""")
+
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS agents (
             id            TEXT PRIMARY KEY,
-            tenant_id     TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
             name          TEXT NOT NULL,
             policy        TEXT NOT NULL DEFAULT 'default',
             public_key    TEXT,
@@ -120,35 +121,59 @@ async def init_db():
             revoked       BOOLEAN DEFAULT FALSE,
             created_at    TIMESTAMPTZ DEFAULT NOW(),
             updated_at    TIMESTAMPTZ DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS agents_tenant_idx ON agents(tenant_id);
+        )""")
 
-        -- ── Key rotation history ────────────────────────────────────────────
+        # Migrate: add tenant_id to agents if missing
+        await conn.execute("""
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='agents' AND column_name='tenant_id'
+            ) THEN
+                ALTER TABLE agents ADD COLUMN tenant_id TEXT;
+            END IF;
+        END $$""")
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS agents_tenant_idx ON agents(tenant_id)""")
+
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS agent_key_history (
             id         TEXT PRIMARY KEY,
             agent_id   TEXT NOT NULL,
-            tenant_id  TEXT NOT NULL,
+            tenant_id  TEXT,
             public_key TEXT NOT NULL,
             rotated_at TIMESTAMPTZ DEFAULT NOW(),
             reason     TEXT
-        );
+        )""")
 
-        -- ── Policies (scoped to tenant) ─────────────────────────────────────
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS policies (
             id         TEXT PRIMARY KEY,
-            tenant_id  TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
             name       TEXT NOT NULL,
             rules      JSONB NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            UNIQUE(tenant_id, name)
-        );
-        CREATE INDEX IF NOT EXISTS policies_tenant_idx ON policies(tenant_id, name);
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )""")
 
-        -- ── Audit logs (scoped to tenant) ───────────────────────────────────
+        # Migrate: add tenant_id to policies if missing
+        await conn.execute("""
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='policies' AND column_name='tenant_id'
+            ) THEN
+                ALTER TABLE policies ADD COLUMN tenant_id TEXT;
+            END IF;
+        END $$""")
+
+        await conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS policies_tenant_name_idx
+        ON policies(tenant_id, name) WHERE tenant_id IS NOT NULL""")
+
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS audit_logs (
             id          TEXT PRIMARY KEY,
             request_id  TEXT,
-            tenant_id   TEXT NOT NULL,
             agent_id    TEXT,
             user_id     TEXT,
             tool        TEXT NOT NULL,
@@ -158,26 +183,41 @@ async def init_db():
             redacted    BOOLEAN DEFAULT FALSE,
             duration_ms INTEGER,
             created_at  TIMESTAMPTZ DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS audit_tenant_idx   ON audit_logs(tenant_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS audit_agent_idx    ON audit_logs(agent_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS audit_decision_idx ON audit_logs(tenant_id, decision, created_at DESC);
+        )""")
 
-        -- ── Anomaly alerts ──────────────────────────────────────────────────
+        # Migrate: add tenant_id to audit_logs if missing
+        await conn.execute("""
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='audit_logs' AND column_name='tenant_id'
+            ) THEN
+                ALTER TABLE audit_logs ADD COLUMN tenant_id TEXT;
+            END IF;
+        END $$""")
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS audit_tenant_idx
+        ON audit_logs(tenant_id, created_at DESC) WHERE tenant_id IS NOT NULL""")
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS audit_agent_idx
+        ON audit_logs(agent_id, created_at DESC)""")
+
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS anomaly_alerts (
-            id          TEXT PRIMARY KEY,
-            tenant_id   TEXT NOT NULL,
-            agent_id    TEXT,
-            alert_type  TEXT NOT NULL,
-            detail      TEXT,
-            resolved    BOOLEAN DEFAULT FALSE,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS anomaly_tenant_idx ON anomaly_alerts(tenant_id, created_at DESC);
-        """)
+            id         TEXT PRIMARY KEY,
+            tenant_id  TEXT,
+            agent_id   TEXT,
+            alert_type TEXT NOT NULL,
+            detail     TEXT,
+            resolved   BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )""")
 
-        # Seed default policies for any tenant that needs them
-        # (actual seeding happens at tenant creation time)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS anomaly_tenant_idx
+        ON anomaly_alerts(tenant_id, created_at DESC) WHERE tenant_id IS NOT NULL""")
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class TenantSignup(BaseModel):
@@ -226,13 +266,13 @@ class InvokeRequest(BaseModel):
 # ── JWT auth ──────────────────────────────────────────────────────────────────
 def create_jwt(tenant_id: str) -> str:
     exp = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
-    return jwt.encode({"sub": tenant_id, "exp": exp}, JWT_SECRET, algorithm=JWT_ALGO)
+    return pyjwt.encode({"sub": tenant_id, "exp": exp}, JWT_SECRET, algorithm=JWT_ALGO)
 
 def decode_jwt(token: str) -> str:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
         return payload["sub"]
-    except JWTError:
+    except Exception:
         raise HTTPException(401, "Invalid or expired token")
 
 async def get_tenant(
