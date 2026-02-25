@@ -1,35 +1,36 @@
 """
-AgentGuard v1.5.0 — Production-ready AI Agent Governance Gateway
+AgentGuard v2.0.0 — Multi-tenant, Compliance-ready, Enterprise AI Governance API
 """
-import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio
+import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio, secrets
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from base64 import b64decode, b64encode
 from typing import Any, Optional
 from urllib.parse import urlparse
+from io import BytesIO
 
 import anthropic
 import httpx
 import redis.asyncio as aioredis
-from fastapi.middleware.cors import CORSMiddleware
 import structlog
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Header, Request, Depends, BackgroundTasks
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from tenacity import (
-    AsyncRetrying, stop_after_attempt, wait_exponential,
-    retry_if_exception_type, RetryError,
-)
-from pydantic import BaseModel
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
+from pydantic import BaseModel, EmailStr
 import asyncpg
 
-# ── Structured logging ────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -37,9 +38,7 @@ structlog.configure(
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer(),
     ],
-    wrapper_class=structlog.make_filtering_bound_logger(
-        20 if os.environ.get("AGENTGUARD_ENV") == "prod" else 10
-    ),
+    wrapper_class=structlog.make_filtering_bound_logger(20),
 )
 log = structlog.get_logger()
 
@@ -48,23 +47,23 @@ ADMIN_API_KEY      = os.environ.get("AGENTGUARD_API_KEY",  "dev-key-change-me")
 AGENTGUARD_ENV     = os.environ.get("AGENTGUARD_ENV",      "dev")
 IS_PROD            = AGENTGUARD_ENV == "prod"
 REPLAY_WINDOW_SECS = 30
+JWT_SECRET         = os.environ.get("JWT_SECRET", "dev-jwt-secret-change-me")
+JWT_ALGO           = "HS256"
+JWT_EXPIRE_HOURS   = 24
 
 _ah = os.environ.get("AGENTGUARD_ALLOWED_HOSTS", "")
 ALLOWED_INVOKE_HOSTS: set[str] = set(h.strip() for h in _ah.split(",") if h.strip())
 
-# ── Prometheus metrics ────────────────────────────────────────────────────────
-REQUESTS_TOTAL    = Counter("agentguard_requests_total",    "Total protect/invoke calls",
-                             ["endpoint", "decision"])
-LATENCY           = Histogram("agentguard_latency_seconds", "Request latency",
-                               ["endpoint"], buckets=[.01,.025,.05,.1,.25,.5,1,2.5,5])
-SEMANTIC_CALLS    = Counter("agentguard_semantic_calls_total", "Claude semantic check calls",
-                             ["cached", "result"])
-REDIS_ERRORS      = Counter("agentguard_redis_errors_total", "Redis operation failures")
-ANTHROPIC_ERRORS  = Counter("agentguard_anthropic_errors_total", "Anthropic API errors")
-ACTIVE_AGENTS     = Gauge("agentguard_registered_agents", "Number of registered agents")
+# ── Prometheus ────────────────────────────────────────────────────────────────
+REQUESTS_TOTAL   = Counter("agentguard_requests_total",    "Requests", ["endpoint","decision","tenant"])
+LATENCY          = Histogram("agentguard_latency_seconds", "Latency",  ["endpoint"], buckets=[.01,.025,.05,.1,.25,.5,1,2.5,5])
+SEMANTIC_CALLS   = Counter("agentguard_semantic_calls_total", "Semantic checks", ["cached","result"])
+ANTHROPIC_ERRORS = Counter("agentguard_anthropic_errors_total", "Anthropic errors")
+REDIS_ERRORS     = Counter("agentguard_redis_errors_total", "Redis errors")
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────
-limiter = Limiter(key_func=get_remote_address)
+pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
+bearer   = HTTPBearer(auto_error=False)
+limiter  = Limiter(key_func=get_remote_address)
 
 # ── DB + Redis ────────────────────────────────────────────────────────────────
 pool:       asyncpg.Pool   = None
@@ -73,26 +72,22 @@ redis_conn: aioredis.Redis = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, redis_conn
-
     pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=2, max_size=10)
-
     redis_url = os.environ.get("REDIS_URL")
     if redis_url:
         redis_conn = await aioredis.from_url(redis_url, decode_responses=True,
-                                              socket_connect_timeout=3,
-                                              socket_timeout=2)
+                                              socket_connect_timeout=3, socket_timeout=2)
         try:
             await redis_conn.ping()
-            log.info("redis.connected", url=redis_url[:30])
+            log.info("redis.connected")
         except Exception as e:
-            log.error("redis.connection_failed", error=str(e))
+            log.error("redis.failed", error=str(e))
             if IS_PROD:
-                raise RuntimeError("Redis is required in prod (REDIS_URL not reachable)") from e
+                raise RuntimeError("Redis required in prod") from e
     elif IS_PROD:
-        raise RuntimeError("REDIS_URL is required in prod for distributed nonce tracking")
-
+        raise RuntimeError("REDIS_URL required in prod")
     await init_db()
-    log.info("agentguard.started", env=AGENTGUARD_ENV, version="1.5.0")
+    log.info("agentguard.started", version="2.0.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
     if redis_conn:
@@ -101,31 +96,59 @@ async def lifespan(app: FastAPI):
 async def init_db():
     async with pool.acquire() as conn:
         await conn.execute("""
+        -- ── Tenants (one per customer/company) ─────────────────────────────
+        CREATE TABLE IF NOT EXISTS tenants (
+            id           TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            email        TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            plan         TEXT NOT NULL DEFAULT 'starter',  -- starter|pro|enterprise
+            api_key      TEXT UNIQUE NOT NULL,
+            sso_provider TEXT,          -- 'google' | 'github' | null
+            sso_id       TEXT,
+            created_at   TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        -- ── Agents (scoped to tenant) ───────────────────────────────────────
         CREATE TABLE IF NOT EXISTS agents (
             id            TEXT PRIMARY KEY,
+            tenant_id     TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
             name          TEXT NOT NULL,
             policy        TEXT NOT NULL DEFAULT 'default',
-            public_key    TEXT,               -- Ed25519 public key, base64; NULL = pending
+            public_key    TEXT,
             allowed_hosts TEXT[],
             revoked       BOOLEAN DEFAULT FALSE,
             created_at    TIMESTAMPTZ DEFAULT NOW(),
             updated_at    TIMESTAMPTZ DEFAULT NOW()
         );
+        CREATE INDEX IF NOT EXISTS agents_tenant_idx ON agents(tenant_id);
+
+        -- ── Key rotation history ────────────────────────────────────────────
         CREATE TABLE IF NOT EXISTS agent_key_history (
-            id          TEXT PRIMARY KEY,
-            agent_id    TEXT NOT NULL,
-            public_key  TEXT NOT NULL,
-            rotated_at  TIMESTAMPTZ DEFAULT NOW(),
-            reason      TEXT
+            id         TEXT PRIMARY KEY,
+            agent_id   TEXT NOT NULL,
+            tenant_id  TEXT NOT NULL,
+            public_key TEXT NOT NULL,
+            rotated_at TIMESTAMPTZ DEFAULT NOW(),
+            reason     TEXT
         );
+
+        -- ── Policies (scoped to tenant) ─────────────────────────────────────
         CREATE TABLE IF NOT EXISTS policies (
-            name       TEXT PRIMARY KEY,
+            id         TEXT PRIMARY KEY,
+            tenant_id  TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            name       TEXT NOT NULL,
             rules      JSONB NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW()
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(tenant_id, name)
         );
+        CREATE INDEX IF NOT EXISTS policies_tenant_idx ON policies(tenant_id, name);
+
+        -- ── Audit logs (scoped to tenant) ───────────────────────────────────
         CREATE TABLE IF NOT EXISTS audit_logs (
             id          TEXT PRIMARY KEY,
             request_id  TEXT,
+            tenant_id   TEXT NOT NULL,
             agent_id    TEXT,
             user_id     TEXT,
             tool        TEXT NOT NULL,
@@ -136,58 +159,130 @@ async def init_db():
             duration_ms INTEGER,
             created_at  TIMESTAMPTZ DEFAULT NOW()
         );
-        CREATE INDEX IF NOT EXISTS audit_agent_idx ON audit_logs(agent_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS audit_decision_idx ON audit_logs(decision, created_at DESC);
+        CREATE INDEX IF NOT EXISTS audit_tenant_idx   ON audit_logs(tenant_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS audit_agent_idx    ON audit_logs(agent_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS audit_decision_idx ON audit_logs(tenant_id, decision, created_at DESC);
+
+        -- ── Anomaly alerts ──────────────────────────────────────────────────
+        CREATE TABLE IF NOT EXISTS anomaly_alerts (
+            id          TEXT PRIMARY KEY,
+            tenant_id   TEXT NOT NULL,
+            agent_id    TEXT,
+            alert_type  TEXT NOT NULL,
+            detail      TEXT,
+            resolved    BOOLEAN DEFAULT FALSE,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS anomaly_tenant_idx ON anomaly_alerts(tenant_id, created_at DESC);
         """)
 
-        for name, rules in [
-            ("default", {
-                "allow_tools": [], "deny_tools": [], "max_records": 100,
-                "require_approval": [], "read_only": False,
-                "redact_patterns": [r"\b\d{3}-\d{2}-\d{4}\b",
-                                    r"\b4[0-9]{12}(?:[0-9]{3})?\b",
-                                    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"],
-            }),
-            ("permissive", {
-                "allow_tools": ["*"], "deny_tools": [], "max_records": 1000,
-                "require_approval": [], "redact_patterns": [], "read_only": False,
-            }),
-            ("strict-read-only", {
-                "allow_tools": ["*"],
-                "deny_tools": ["delete*","drop*","truncate*","update*","insert*",
-                               "create*","write*","patch*"],
-                "max_records": 50, "require_approval": [], "read_only": True,
-                "redact_patterns": [r"\b\d{3}-\d{2}-\d{4}\b",
-                                    r"\b4[0-9]{12}(?:[0-9]{3})?\b",
-                                    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"],
-            }),
-        ]:
-            await conn.execute(
-                "INSERT INTO policies (name, rules) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-                name, json.dumps(rules)
-            )
+        # Seed default policies for any tenant that needs them
+        # (actual seeding happens at tenant creation time)
 
-# ── Models ────────────────────────────────────────────────────────────────────
-class ProtectRequest(BaseModel):
-    tool: str; args: dict[str, Any] = {}; agent_id: str; user_id: str
-    context: Optional[str] = None; timestamp: Optional[int] = None; nonce: Optional[str] = None
+# ── Pydantic models ───────────────────────────────────────────────────────────
+class TenantSignup(BaseModel):
+    name:     str
+    email:    str
+    password: str
 
-class InvokeRequest(BaseModel):
-    tool: str; args: dict[str, Any] = {}; agent_id: str; user_id: str
-    context: Optional[str] = None; target_url: str
-    timestamp: Optional[int] = None; nonce: Optional[str] = None
+class TenantLogin(BaseModel):
+    email:    str
+    password: str
 
 class AgentCreate(BaseModel):
-    name: str; policy: str = "default"; allowed_hosts: list[str] = []
-
-class PolicyCreate(BaseModel):
-    name: str; rules: dict
+    name:          str
+    policy:        str = "default"
+    allowed_hosts: list[str] = []
 
 class RegisterKeyRequest(BaseModel):
-    public_key:    str
-    policy:        Optional[str] = None
-    allowed_hosts: Optional[list[str]] = None
-    rotation_reason: Optional[str] = None  # for key rotation audit trail
+    public_key:      str
+    policy:          Optional[str] = None
+    allowed_hosts:   Optional[list[str]] = None
+    rotation_reason: Optional[str] = None
+
+class PolicyCreate(BaseModel):
+    name:  str
+    rules: dict
+
+class ProtectRequest(BaseModel):
+    tool:      str
+    args:      dict[str, Any] = {}
+    agent_id:  str
+    user_id:   str
+    context:   Optional[str] = None
+    timestamp: Optional[int] = None
+    nonce:     Optional[str] = None
+
+class InvokeRequest(BaseModel):
+    tool:       str
+    args:       dict[str, Any] = {}
+    agent_id:   str
+    user_id:    str
+    context:    Optional[str] = None
+    target_url: str
+    timestamp:  Optional[int] = None
+    nonce:      Optional[str] = None
+
+# ── JWT auth ──────────────────────────────────────────────────────────────────
+def create_jwt(tenant_id: str) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    return jwt.encode({"sub": tenant_id, "exp": exp}, JWT_SECRET, algorithm=JWT_ALGO)
+
+def decode_jwt(token: str) -> str:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return payload["sub"]
+    except JWTError:
+        raise HTTPException(401, "Invalid or expired token")
+
+async def get_tenant(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
+    x_api_key: Optional[str] = Header(None),
+) -> asyncpg.Record:
+    """Resolve tenant from JWT bearer token OR api key header."""
+    tenant = None
+    async with pool.acquire() as conn:
+        if creds:
+            tenant_id = decode_jwt(creds.credentials)
+            tenant = await conn.fetchrow("SELECT * FROM tenants WHERE id=$1", tenant_id)
+        elif x_api_key:
+            tenant = await conn.fetchrow("SELECT * FROM tenants WHERE api_key=$1", x_api_key)
+        # Admin bypass
+        if not tenant and x_api_key == ADMIN_API_KEY:
+            return {"id": "__admin__", "plan": "enterprise"}
+    if not tenant:
+        raise HTTPException(401, "Authentication required — provide Bearer token or x-api-key")
+    return tenant
+
+# ── Tenant seed policies ──────────────────────────────────────────────────────
+DEFAULT_POLICIES = [
+    ("default", {
+        "allow_tools": [], "deny_tools": [], "max_records": 100,
+        "require_approval": [], "read_only": False,
+        "redact_patterns": [r"\b\d{3}-\d{2}-\d{4}\b",
+                            r"\b4[0-9]{12}(?:[0-9]{3})?\b",
+                            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"],
+    }),
+    ("permissive", {
+        "allow_tools": ["*"], "deny_tools": [], "max_records": 1000,
+        "require_approval": [], "redact_patterns": [], "read_only": False,
+    }),
+    ("strict-read-only", {
+        "allow_tools": ["*"],
+        "deny_tools": ["delete*","drop*","truncate*","update*","insert*","create*","write*","patch*"],
+        "max_records": 50, "require_approval": [], "read_only": True,
+        "redact_patterns": [r"\b\d{3}-\d{2}-\d{4}\b",
+                            r"\b4[0-9]{12}(?:[0-9]{3})?\b",
+                            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"],
+    }),
+]
+
+async def seed_tenant_policies(tenant_id: str, conn):
+    for name, rules in DEFAULT_POLICIES:
+        await conn.execute(
+            "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+            str(uuid.uuid4()), tenant_id, name, json.dumps(rules)
+        )
 
 # ── Ed25519 ───────────────────────────────────────────────────────────────────
 def verify_ed25519(public_key_b64: str, body: bytes, sig_b64: str) -> tuple[bool, str]:
@@ -200,10 +295,10 @@ def verify_ed25519(public_key_b64: str, body: bytes, sig_b64: str) -> tuple[bool
     except Exception as e:
         return False, f"Signature error: {type(e).__name__}"
 
-# ── Nonce store (Redis mandatory in prod, LRU dev fallback) ───────────────────
+# ── Nonce store ───────────────────────────────────────────────────────────────
 _local_nonces: OrderedDict[str, float] = OrderedDict()
 
-async def _redis_healthy() -> bool:
+async def _redis_ok() -> bool:
     try:
         await asyncio.wait_for(redis_conn.ping(), timeout=1.0)
         return True
@@ -213,18 +308,10 @@ async def _redis_healthy() -> bool:
 
 async def is_nonce_fresh(nonce: str) -> bool:
     if redis_conn:
-        if not await _redis_healthy():
-            if IS_PROD:
-                log.error("redis.unhealthy_fail_closed", nonce=nonce[:8])
-                return False  # fail closed — reject request if Redis is down in prod
-            log.warning("redis.unhealthy_dev_fallback")
-        else:
-            result = await redis_conn.set(
-                f"ag:nonce:{nonce}", "1", ex=REPLAY_WINDOW_SECS, nx=True
-            )
-            return result is not None
-
-    # Dev fallback only
+        if not await _redis_ok():
+            return not IS_PROD  # dev: allow; prod: deny
+        result = await redis_conn.set(f"ag:n:{nonce}", "1", ex=REPLAY_WINDOW_SECS, nx=True)
+        return result is not None
     now = time.time()
     cutoff = now - REPLAY_WINDOW_SECS
     while _local_nonces and next(iter(_local_nonces.values())) < cutoff:
@@ -236,110 +323,66 @@ async def is_nonce_fresh(nonce: str) -> bool:
     _local_nonces[nonce] = now
     return True
 
-# ── Request verification ──────────────────────────────────────────────────────
-async def verify_request(agent, body, signature, timestamp, nonce) -> tuple[bool, str]:
+async def verify_request(agent, body, sig, ts, nonce) -> tuple[bool, str]:
     if IS_PROD:
-        for field, val, msg in [
-            ("signature", signature, "Missing x-agent-signature"),
-            ("timestamp", timestamp, "Missing required timestamp"),
-            ("nonce",     nonce,     "Missing required nonce"),
-        ]:
+        for val, msg in [(sig,"Missing x-agent-signature"),(ts,"Missing timestamp"),(nonce,"Missing nonce")]:
             if val is None:
                 return False, msg
-
-    if timestamp is not None:
-        age = abs(int(time.time()) - timestamp)
-        if age > REPLAY_WINDOW_SECS:
-            return False, f"Request expired ({age}s old)"
-
+    if ts is not None and abs(int(time.time()) - ts) > REPLAY_WINDOW_SECS:
+        return False, f"Request expired"
     if nonce is not None and not await is_nonce_fresh(nonce):
-        return False, "Nonce reused — replay attack detected"
-
-    if signature is not None:
+        return False, "Nonce reused — replay detected"
+    if sig is not None:
         if not agent["public_key"]:
             return False, "Agent has no registered public key"
-        ok, reason = verify_ed25519(agent["public_key"], body, signature)
+        ok, reason = verify_ed25519(agent["public_key"], body, sig)
         if not ok:
             return False, reason
-
     return True, "ok"
 
-# ── SSRF: resolve + pin IPs ───────────────────────────────────────────────────
-_PRIVATE_NETS = [
-    ipaddress.ip_network(n) for n in [
-        "10.0.0.0/8","172.16.0.0/12","192.168.0.0/16",
-        "127.0.0.0/8","169.254.0.0/16","0.0.0.0/8",
-        "::1/128","fc00::/7","fe80::/10","100.64.0.0/10",
-    ]
-]
+# ── SSRF ──────────────────────────────────────────────────────────────────────
+_PRIVATE_NETS = [ipaddress.ip_network(n) for n in [
+    "10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8",
+    "169.254.0.0/16","0.0.0.0/8","::1/128","fc00::/7","fe80::/10","100.64.0.0/10",
+]]
 
 def _is_private(addr: str) -> bool:
     try:
-        return any(ipaddress.ip_address(addr) in net for net in _PRIVATE_NETS)
+        return any(ipaddress.ip_address(addr) in n for n in _PRIVATE_NETS)
     except ValueError:
         return True
 
-def validate_and_resolve_target(url: str, agent_hosts: list[str]) -> tuple[bool, str, list[str]]:
-    """
-    Returns (ok, reason, pinned_ips).
-    Resolves hostname → IPs and validates all are public.
-    Caller must connect to a pinned IP (not re-resolve) to prevent TOCTOU.
-    """
+def validate_and_resolve_target(url: str, agent_hosts: list) -> tuple[bool, str, list]:
     try:
         parsed = urlparse(url)
     except Exception:
         return False, "Invalid URL", []
-
-    if parsed.scheme not in ("http", "https"):
+    if parsed.scheme not in ("http","https"):
         return False, f"Scheme '{parsed.scheme}' not allowed", []
-
     host = parsed.hostname or ""
     effective = set(ALLOWED_INVOKE_HOSTS) | set(agent_hosts or [])
     if not effective:
-        return False, "No allowed invoke hosts configured (set AGENTGUARD_ALLOWED_HOSTS)", []
+        return False, "No allowed invoke hosts configured", []
     if host not in effective:
-        return False, f"Host '{host}' not in allowed list: {sorted(effective)}", []
-
+        return False, f"Host '{host}' not in allowed list", []
     try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme=="https" else 80),
-                                    type=socket.SOCK_STREAM)
-        ips = [info[4][0] for info in infos]
+        ips = [i[4][0] for i in socket.getaddrinfo(host, None)]
     except socket.gaierror as e:
-        return False, f"DNS failed for '{host}': {e}", []
-
+        return False, f"DNS failed: {e}", []
     for ip in ips:
         if _is_private(ip):
             return False, f"'{host}' resolves to private IP {ip}", []
-
     return True, "ok", list(set(ips))
 
-async def invoke_with_pinned_ip(url: str, pinned_ips: list[str], payload: dict,
-                                 agent_id: str) -> tuple[bool, Any]:
-    """Connect to a pre-resolved IP with SNI/TLS hostname verification intact."""
-    parsed   = urlparse(url)
-    host     = parsed.hostname
-    port     = parsed.port or (443 if parsed.scheme == "https" else 80)
-    use_ssl  = parsed.scheme == "https"
-    ip       = pinned_ips[0]
-
-    # Rebuild URL with IP but pass Host header — TLS SNI still uses hostname
-    ip_url = url.replace(f"://{host}", f"://{ip}")
-    headers = {
-        "Host":             f"{host}:{port}" if parsed.port else host,
-        "x-forwarded-by":   "agentguard",
-        "x-agent-id":       agent_id,
-    }
-
+async def invoke_with_pinned_ip(url, pinned_ips, payload, agent_id):
+    parsed  = urlparse(url)
+    host    = parsed.hostname
+    ip_url  = url.replace(f"://{host}", f"://{pinned_ips[0]}")
+    headers = {"Host": host, "x-forwarded-by": "agentguard", "x-agent-id": agent_id}
     try:
-        async with httpx.AsyncClient(
-            timeout=30.0,
-            follow_redirects=False,
-            verify=use_ssl,  # keep TLS verification on
-        ) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
             resp = await client.post(ip_url, json=payload, headers=headers)
-        result = (resp.json()
-                  if resp.headers.get("content-type","").startswith("application/json")
-                  else {"body": resp.text})
+        result = resp.json() if resp.headers.get("content-type","").startswith("application/json") else {"body": resp.text}
         return resp.is_success, result
     except Exception as e:
         return False, {"error": str(e)}
@@ -352,16 +395,16 @@ BASELINE_PII = [
     (r"(?i)\b(?:password|secret|token|api_key)\s*[:=]\s*\S+",    "[SECRET]"),
 ]
 
-def build_patterns(rules) -> list[tuple[str, str]]:
+def build_patterns(rules) -> list:
     if isinstance(rules, str):
         rules = json.loads(rules)
     return BASELINE_PII + [(p, "[REDACTED]") for p in rules.get("redact_patterns", [])]
 
-def redact(data: Any, patterns: list) -> tuple[Any, bool]:
+def redact(data, patterns) -> tuple[Any, bool]:
     try:
         text = json.dumps(data, default=str)
     except Exception:
-        return {"_err": "serialize_failed"}, True
+        return {"_err": "serialize"}, True
     orig = text
     for pat, label in patterns:
         try:
@@ -372,55 +415,47 @@ def redact(data: Any, patterns: list) -> tuple[Any, bool]:
     try:
         return json.loads(text), changed
     except json.JSONDecodeError:
-        return {"_err": "post_redact_parse_failed"}, True
+        return {"_err": "parse"}, True
 
-def safe_log_args(args: dict, patterns: list) -> dict:
+def safe_log_args(args, patterns):
     clean, _ = redact(args, patterns)
-    return {
-        k: (hashlib.sha256(str(v).encode()).hexdigest()[:12] + "…"
-            if len(str(v)) > 80 else v)
-        for k, v in (clean if isinstance(clean, dict) else {}).items()
-    }
+    return {k: (hashlib.sha256(str(v).encode()).hexdigest()[:12]+"…" if len(str(v))>80 else v)
+            for k, v in (clean if isinstance(clean, dict) else {}).items()}
 
 # ── Policy enforcement ────────────────────────────────────────────────────────
-WRITE_VERBS = {
-    "delete","drop","truncate","update","insert","create","write","patch",
-    "put","post","remove","destroy","clear","reset","purge","wipe","modify",
-    "alter","exec","execute","run",
-}
+WRITE_VERBS = {"delete","drop","truncate","update","insert","create","write","patch",
+               "put","post","remove","destroy","clear","reset","purge","wipe","modify",
+               "alter","exec","execute","run"}
 
-def _tokens(tool: str) -> list[str]:
-    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', tool)
-    s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
-    return [t for t in re.split(r'[_.\-/]', s.lower()) if t]
+def _tokens(tool):
+    s = re.sub(r'([a-z0-9])([A-Z])',r'\1_\2',tool)
+    s = re.sub(r'([A-Z]+)([A-Z][a-z])',r'\1_\2',s)
+    return [t for t in re.split(r'[_.\-/]',s.lower()) if t]
 
-def _matches(tool: str, pattern: str) -> bool:
+def _matches(tool, pattern):
     if pattern == "*": return True
     if pattern.endswith("*"): return tool.lower().startswith(pattern[:-1].lower())
     return tool.lower() == pattern.lower()
 
-def check_tool(tool: str, rules) -> tuple[bool, str]:
-    if isinstance(rules, str):
-        rules = json.loads(rules)
+def check_tool(tool, rules) -> tuple[bool, str]:
+    if isinstance(rules, str): rules = json.loads(rules)
     if rules.get("read_only") and any(t in WRITE_VERBS for t in _tokens(tool)):
         return False, f"'{tool}' is a write op — policy is read-only"
     for p in rules.get("deny_tools", []):
         if _matches(tool, p):
-            return False, f"'{tool}' is explicitly blocked"
+            return False, f"'{tool}' is blocked by policy"
     allow = rules.get("allow_tools", [])
     if not allow:
-        return False, f"'{tool}' not permitted — deny-by-default policy"
+        return False, f"'{tool}' not permitted — deny-by-default"
     for p in allow:
         if _matches(tool, p):
             return True, "allowed"
     return False, f"'{tool}' not in allowed list"
 
-def check_args(args: dict, rules) -> tuple[bool, str]:
-    if isinstance(rules, str):
-        rules = json.loads(rules)
+def check_args(args, rules) -> tuple[bool, str]:
+    if isinstance(rules, str): rules = json.loads(rules)
     max_r = rules.get("max_records")
-    if not max_r:
-        return True, "ok"
+    if not max_r: return True, "ok"
     for k in ("limit","count","max","size","page_size","per_page","top","take"):
         v = args.get(k)
         if v is not None:
@@ -431,24 +466,19 @@ def check_args(args: dict, rules) -> tuple[bool, str]:
                 pass
     return True, "ok"
 
-# ── Anthropic semantic check with circuit breaker + retry ────────────────────
+# ── Semantic check ────────────────────────────────────────────────────────────
 SEMANTIC_CACHE_MAX = 512
 SEMANTIC_CACHE_TTL = 60
-_sem_cache: OrderedDict[str, tuple[bool, str, float]] = OrderedDict()
+_sem_cache: OrderedDict = OrderedDict()
 _sem_failures = 0
-_sem_circuit_open_until = 0.0
-CIRCUIT_OPEN_SECS   = 60
-CIRCUIT_FAIL_THRESH = 5
-SUSPICIOUS_VERBS    = WRITE_VERBS | {"admin","sudo","bypass","override","impersonate","escalate"}
+_sem_open_until = 0.0
+CIRCUIT_OPEN_SECS = 60
+CIRCUIT_THRESH    = 5
+SUSPICIOUS_VERBS  = WRITE_VERBS | {"admin","sudo","bypass","override","impersonate","escalate"}
 
-async def semantic_check(tool: str, args: dict, context: Optional[str],
-                          policy: str) -> tuple[bool, str]:
-    global _sem_failures, _sem_circuit_open_until
-
-    cache_key = hashlib.sha256(
-        json.dumps([tool, sorted(args.items()), context, policy], default=str).encode()
-    ).hexdigest()
-
+async def semantic_check(tool, args, context, policy) -> tuple[bool, str]:
+    global _sem_failures, _sem_open_until
+    cache_key = hashlib.sha256(json.dumps([tool,sorted(args.items()),context,policy],default=str).encode()).hexdigest()
     cached = _sem_cache.get(cache_key)
     if cached:
         allowed, reason, ts = cached
@@ -456,392 +486,444 @@ async def semantic_check(tool: str, args: dict, context: Optional[str],
             _sem_cache.move_to_end(cache_key)
             SEMANTIC_CALLS.labels(cached="true", result=str(allowed)).inc()
             return allowed, f"{reason} [cached]"
-
-    # Circuit breaker open?
-    if time.time() < _sem_circuit_open_until:
-        log.warning("semantic.circuit_open", tool=tool)
-        return False, "Semantic check circuit open (too many Anthropic errors) — denying for safety"
-
+    if time.time() < _sem_open_until:
+        return False, "Semantic circuit open — denying for safety"
     try:
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(2),
-            wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-            retry=retry_if_exception_type((anthropic.APIConnectionError, anthropic.RateLimitError)),
-            reraise=False,
-        ):
+        async for attempt in AsyncRetrying(stop=stop_after_attempt(2),
+                                           wait=wait_exponential(min=0.5,max=4),
+                                           retry=retry_if_exception_type((anthropic.APIConnectionError,)),
+                                           reraise=False):
             with attempt:
                 client = anthropic.AsyncAnthropic()
-                msg = await asyncio.wait_for(
-                    client.messages.create(
-                        model="claude-sonnet-4-6",
-                        max_tokens=200,
-                        messages=[{"role": "user", "content":
-                            f"You are a strict AI security enforcement agent.\n"
-                            f"Tool: {tool}\nArgs: {json.dumps(args, default=str)}\n"
-                            f"User context: {context or 'none'}\nPolicy: {policy}\n\n"
-                            f"Deny if: destructive/admin/bypass without justification, "
-                            f"injection patterns in args, missing context for risky tools.\n"
-                            f"Respond ONLY with valid JSON: "
-                            f'{{\"allowed\": true, \"reason\": \"brief\"}}'
-                        }]
-                    ),
-                    timeout=8.0,
-                )
-
-        raw     = re.sub(r"^```(?:json)?\n?|\n?```$", "", msg.content[0].text.strip())
-        result  = json.loads(raw)
-        allowed = bool(result.get("allowed", False))
-        reason  = str(result.get("reason", ""))
-
-        _sem_failures = 0  # reset on success
-        if len(_sem_cache) >= SEMANTIC_CACHE_MAX:
-            _sem_cache.popitem(last=False)
+                msg = await asyncio.wait_for(client.messages.create(
+                    model="claude-sonnet-4-6", max_tokens=200,
+                    messages=[{"role":"user","content":
+                        f"Strict AI security agent. Evaluate tool call.\n"
+                        f"Tool: {tool}\nArgs: {json.dumps(args,default=str)}\n"
+                        f"Context: {context or 'none'}\nPolicy: {policy}\n"
+                        f"Deny if destructive/bypass/injection. Allow if clearly legitimate.\n"
+                        f"JSON only: {{\"allowed\":true,\"reason\":\"brief\"}}"}]
+                ), timeout=8.0)
+        raw    = re.sub(r"^```(?:json)?\n?|\n?```$","",msg.content[0].text.strip())
+        result = json.loads(raw)
+        allowed, reason = bool(result.get("allowed",False)), str(result.get("reason",""))
+        _sem_failures = 0
+        if len(_sem_cache) >= SEMANTIC_CACHE_MAX: _sem_cache.popitem(last=False)
         _sem_cache[cache_key] = (allowed, reason, time.time())
         SEMANTIC_CALLS.labels(cached="false", result=str(allowed)).inc()
         return allowed, reason
-
-    except (RetryError, asyncio.TimeoutError, Exception) as e:
+    except Exception as e:
         _sem_failures += 1
         ANTHROPIC_ERRORS.inc()
-        log.error("semantic.error", error=str(e), failures=_sem_failures, tool=tool)
-        if _sem_failures >= CIRCUIT_FAIL_THRESH:
-            _sem_circuit_open_until = time.time() + CIRCUIT_OPEN_SECS
-            log.error("semantic.circuit_opened", open_until=_sem_circuit_open_until)
-        return False, f"Semantic check failed ({type(e).__name__}) — denying for safety"
+        if _sem_failures >= CIRCUIT_THRESH:
+            _sem_open_until = time.time() + CIRCUIT_OPEN_SECS
+        return False, f"Semantic error ({type(e).__name__}) — denying for safety"
 
-# ── Audit logging ─────────────────────────────────────────────────────────────
-VALID_DECISIONS = {"allow", "deny", "pending", "invoke_error"}
+# ── Anomaly detection ─────────────────────────────────────────────────────────
+async def check_anomalies(tenant_id: str, agent_id: str, tool: str, bg: BackgroundTasks):
+    bg.add_task(_run_anomaly_checks, tenant_id, agent_id, tool)
 
-async def log_action(request_id, agent_id, user_id, tool, args, decision,
-                     reason, redacted, duration_ms, patterns):
+async def _run_anomaly_checks(tenant_id: str, agent_id: str, tool: str):
+    try:
+        async with pool.acquire() as conn:
+            # Check 1: sudden spike — 3x normal rate in last 5 min
+            recent = await conn.fetchval(
+                "SELECT COUNT(*) FROM audit_logs WHERE agent_id=$1 AND created_at > NOW() - INTERVAL '5 minutes'",
+                agent_id
+            )
+            baseline = await conn.fetchval(
+                "SELECT COALESCE(AVG(cnt),0) FROM ("
+                "  SELECT COUNT(*) as cnt FROM audit_logs"
+                "  WHERE agent_id=$1 AND created_at BETWEEN NOW()-INTERVAL '2 hours' AND NOW()-INTERVAL '5 minutes'"
+                "  GROUP BY date_trunc('minute', created_at)"
+                ") t", agent_id
+            )
+            if baseline and recent > (baseline * 3) and recent > 20:
+                await _create_alert(conn, tenant_id, agent_id, "rate_spike",
+                    f"Agent made {recent} calls in 5min (baseline: {baseline:.0f}/min)")
+
+            # Check 2: high deny rate — >50% denied in last 10 min
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM audit_logs WHERE agent_id=$1 AND created_at > NOW() - INTERVAL '10 minutes'",
+                agent_id
+            )
+            denied = await conn.fetchval(
+                "SELECT COUNT(*) FROM audit_logs WHERE agent_id=$1 AND decision='deny' AND created_at > NOW() - INTERVAL '10 minutes'",
+                agent_id
+            )
+            if total and total >= 10 and (denied / total) > 0.5:
+                await _create_alert(conn, tenant_id, agent_id, "high_deny_rate",
+                    f"{denied}/{total} requests denied in last 10min ({100*denied//total}%)")
+
+            # Check 3: new tool never seen before
+            seen_before = await conn.fetchval(
+                "SELECT COUNT(*) FROM audit_logs WHERE agent_id=$1 AND tool=$2 AND created_at < NOW() - INTERVAL '1 hour'",
+                agent_id, tool
+            )
+            if seen_before == 0:
+                recent_this = await conn.fetchval(
+                    "SELECT COUNT(*) FROM audit_logs WHERE agent_id=$1 AND tool=$2",
+                    agent_id, tool
+                )
+                if recent_this and recent_this <= 3:
+                    await _create_alert(conn, tenant_id, agent_id, "new_tool_detected",
+                        f"Agent called new tool '{tool}' for the first time")
+    except Exception as e:
+        log.error("anomaly.check_failed", error=str(e))
+
+async def _create_alert(conn, tenant_id, agent_id, alert_type, detail):
+    # Deduplicate: don't create same alert type twice in 1 hour
+    existing = await conn.fetchval(
+        "SELECT id FROM anomaly_alerts WHERE agent_id=$1 AND alert_type=$2 "
+        "AND created_at > NOW() - INTERVAL '1 hour' AND resolved=FALSE",
+        agent_id, alert_type
+    )
+    if not existing:
+        await conn.execute(
+            "INSERT INTO anomaly_alerts (id,tenant_id,agent_id,alert_type,detail) VALUES ($1,$2,$3,$4,$5)",
+            str(uuid.uuid4()), tenant_id, agent_id, alert_type, detail
+        )
+        log.warning("anomaly.alert_created", tenant_id=tenant_id, agent_id=agent_id,
+                    alert_type=alert_type, detail=detail)
+
+# ── Audit log + enforcement pipeline ─────────────────────────────────────────
+VALID_DECISIONS = {"allow","deny","pending","invoke_error"}
+
+async def log_action(request_id, tenant_id, agent_id, user_id, tool, args,
+                     decision, reason, redacted, duration_ms, patterns):
     assert decision in VALID_DECISIONS
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO audit_logs "
-            "(id,request_id,agent_id,user_id,tool,args,decision,reason,redacted,duration_ms)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-            str(uuid.uuid4()), request_id, agent_id, user_id, tool,
-            json.dumps(safe_log_args(args, patterns)),
-            decision, reason, redacted, duration_ms,
+            "INSERT INTO audit_logs (id,request_id,tenant_id,agent_id,user_id,tool,args,decision,reason,redacted,duration_ms)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            str(uuid.uuid4()), request_id, tenant_id, agent_id, user_id, tool,
+            json.dumps(safe_log_args(args, patterns)), decision, reason, redacted, duration_ms
         )
+    REQUESTS_TOTAL.labels(endpoint="protect", decision=decision, tenant=tenant_id[:8]).inc()
 
-# ── Shared enforcement pipeline ───────────────────────────────────────────────
 async def run_enforcement(tool, args, agent, rules, patterns, context):
+    if isinstance(rules, str): rules = json.loads(rules)
     ok, reason = check_tool(tool, rules)
-    if not ok:
-        return False, reason, args, False, "blocked"
-
+    if not ok: return False, reason, args, False, "blocked"
     clean, redacted = redact(args, patterns)
-    if not isinstance(clean, dict):
-        clean = {}
-
+    if not isinstance(clean, dict): clean = {}
     ok, reason = check_args(clean, rules)
-    if not ok:
-        return False, reason, clean, redacted, "blocked"
-
+    if not ok: return False, reason, clean, redacted, "blocked"
     toks = _tokens(tool)
     if context is not None or any(t in SUSPICIOUS_VERBS for t in toks):
         sem_ok, sem_reason = await semantic_check(tool, clean, context, agent["policy"])
-        if not sem_ok:
-            return False, sem_reason, clean, redacted, "blocked_semantic"
-
+        if not sem_ok: return False, sem_reason, clean, redacted, "blocked_semantic"
     hitl = rules.get("require_approval", [])
     if any(_matches(tool, p) for p in hitl):
         return False, "requires human approval", clean, redacted, "pending_approval"
-
     return True, "all checks passed", clean, redacted, "proceed"
 
-# ── Load + verify helper ──────────────────────────────────────────────────────
-async def load_and_verify(agent_id, body, sig, ts, nonce, request_id):
+async def load_agent_and_policy(agent_id: str, tenant_id: str):
     async with pool.acquire() as conn:
-        agent = await conn.fetchrow("SELECT * FROM agents WHERE id=$1", agent_id)
+        agent = await conn.fetchrow(
+            "SELECT * FROM agents WHERE id=$1 AND tenant_id=$2", agent_id, tenant_id
+        )
         if not agent:
             raise HTTPException(404, f"Agent '{agent_id}' not found")
         if agent["revoked"]:
-            log.warning("agent.revoked_access_attempt", agent_id=agent_id, request_id=request_id)
             raise HTTPException(403, f"Agent '{agent_id}' is revoked")
-        policy_row = await conn.fetchrow("SELECT * FROM policies WHERE name=$1", agent["policy"])
-        if not policy_row:
+        policy = await conn.fetchrow(
+            "SELECT * FROM policies WHERE tenant_id=$1 AND name=$2", tenant_id, agent["policy"]
+        )
+        if not policy:
             raise HTTPException(404, f"Policy '{agent['policy']}' not found")
-
-    ok, reason = await verify_request(agent, body, sig, ts, nonce)
-    if not ok:
-        log.warning("request.auth_failed", agent_id=agent_id, reason=reason, request_id=request_id)
-        raise HTTPException(401, reason)
-
-    return agent, policy_row
+    return agent, policy
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AgentGuard", version="1.5.0", lifespan=lifespan)
+app = FastAPI(title="AgentGuard", version="2.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=600,
-)
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS","*").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS, allow_credentials=True,
+    allow_methods=["GET","POST","PUT","DELETE","OPTIONS","PATCH"],
+    allow_headers=["*"], expose_headers=["*"], max_age=600)
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(status_code=429, content={"error": "rate_limit_exceeded",
-                                                   "detail": str(exc.detail)})
+    return JSONResponse(429, {"error": "rate_limit_exceeded", "detail": str(exc.detail)})
 
-def require_admin(x_api_key: str = Header(...)):
-    if x_api_key != ADMIN_API_KEY:
-        raise HTTPException(401, "Invalid API key")
-
-def request_id_from(request: Request) -> str:
+def rid(request: Request) -> str:
     return request.headers.get("x-request-id") or str(uuid.uuid4())
 
-# ── /protect ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTH ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+@app.post("/auth/signup")
+async def signup(body: TenantSignup):
+    tenant_id = f"t_{uuid.uuid4().hex[:16]}"
+    api_key   = f"sk-guard-{secrets.token_hex(32)}"
+    pw_hash   = pwd_ctx.hash(body.password)
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO tenants (id,name,email,password_hash,api_key) VALUES ($1,$2,$3,$4,$5)",
+                tenant_id, body.name, body.email, pw_hash, api_key
+            )
+            await seed_tenant_policies(tenant_id, conn)
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(400, "Email already registered")
+    token = create_jwt(tenant_id)
+    log.info("tenant.created", tenant_id=tenant_id, email=body.email)
+    return {"token": token, "api_key": api_key, "tenant_id": tenant_id,
+            "note": "Save your api_key — use it as x-api-key header in all SDK calls"}
+
+@app.post("/auth/login")
+async def login(body: TenantLogin):
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow("SELECT * FROM tenants WHERE email=$1", body.email)
+    if not tenant or not pwd_ctx.verify(body.password, tenant["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    return {"token": create_jwt(tenant["id"]), "api_key": tenant["api_key"],
+            "tenant_id": tenant["id"], "name": tenant["name"]}
+
+@app.get("/auth/me")
+async def me(tenant = Depends(get_tenant)):
+    if tenant["id"] == "__admin__":
+        return {"id": "__admin__", "plan": "enterprise"}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id,name,email,plan,api_key,created_at FROM tenants WHERE id=$1", tenant["id"]
+        )
+    return dict(row)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROTECT + INVOKE  (the core product)
+# ══════════════════════════════════════════════════════════════════════════════
 @app.post("/protect")
 @limiter.limit("120/minute;20/second")
-async def protect(req: ProtectRequest, request: Request,
+async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
+                  tenant = Depends(get_tenant),
                   x_agent_signature: Optional[str] = Header(None)):
-    rid   = request_id_from(request)
     start = time.monotonic()
-    structlog.contextvars.bind_contextvars(request_id=rid, agent_id=req.agent_id,
-                                           user_id=req.user_id, tool=req.tool)
+    request_id = rid(request)
     body = await request.body()
-    agent, policy_row = await load_and_verify(
-        req.agent_id, body, x_agent_signature, req.timestamp, req.nonce, rid
-    )
-    rules    = policy_row["rules"]
-    if isinstance(rules, str):
-        rules = json.loads(rules)
-    patterns = build_patterns(rules)
+    structlog.contextvars.bind_contextvars(request_id=request_id, tenant_id=tenant["id"],
+                                           agent_id=req.agent_id, tool=req.tool)
+    agent, policy_row = await load_agent_and_policy(req.agent_id, tenant["id"])
+    ok, reason = await verify_request(agent, body, x_agent_signature, req.timestamp, req.nonce)
+    if not ok:
+        raise HTTPException(401, reason)
 
+    rules    = policy_row["rules"]
+    patterns = build_patterns(rules)
     allowed, reason, clean, redacted, action = await run_enforcement(
         req.tool, req.args, agent, rules, patterns, req.context
     )
-    decision = "allow" if allowed else ("pending" if action == "pending_approval" else "deny")
-    ms = int((time.monotonic() - start) * 1000)
+    decision = "allow" if allowed else ("pending" if action=="pending_approval" else "deny")
+    ms = int((time.monotonic()-start)*1000)
 
-    await log_action(rid, req.agent_id, req.user_id, req.tool, clean,
-                     decision, reason, redacted, ms, patterns)
-    REQUESTS_TOTAL.labels(endpoint="protect", decision=decision).inc()
-    LATENCY.labels(endpoint="protect").observe(ms / 1000)
+    await log_action(request_id, tenant["id"], req.agent_id, req.user_id,
+                     req.tool, clean, decision, reason, redacted, ms, patterns)
+    LATENCY.labels(endpoint="protect").observe(ms/1000)
 
-    log.info("protect.decision", decision=decision, reason=reason,
-             tool=req.tool, ms=ms, redacted=redacted)
+    if decision == "allow":
+        await check_anomalies(tenant["id"], req.agent_id, req.tool, bg)
+
+    log.info("protect.decision", decision=decision, tool=req.tool, ms=ms)
 
     if not allowed:
         if action == "pending_approval":
             return {"allowed": False, "action": action, "reason": reason, "args": clean}
-        return JSONResponse(403, {"allowed": False, "reason": reason,
-                                  "action": action, "request_id": rid})
+        return JSONResponse(403, {"allowed": False, "reason": reason, "action": action, "request_id": request_id})
 
     return {"allowed": True, "action": "proceed", "args": clean,
-            "redacted": redacted, "duration_ms": ms,
-            "policy": agent["policy"], "request_id": rid}
+            "redacted": redacted, "duration_ms": ms, "policy": agent["policy"], "request_id": request_id}
 
-# ── /invoke ───────────────────────────────────────────────────────────────────
 @app.post("/invoke")
 @limiter.limit("60/minute;10/second")
-async def invoke(req: InvokeRequest, request: Request,
+async def invoke(req: InvokeRequest, request: Request, bg: BackgroundTasks,
+                 tenant = Depends(get_tenant),
                  x_agent_signature: Optional[str] = Header(None)):
-    rid   = request_id_from(request)
     start = time.monotonic()
-    structlog.contextvars.bind_contextvars(request_id=rid, agent_id=req.agent_id,
-                                           user_id=req.user_id, tool=req.tool)
+    request_id = rid(request)
     body = await request.body()
-    agent, policy_row = await load_and_verify(
-        req.agent_id, body, x_agent_signature, req.timestamp, req.nonce, rid
-    )
-    rules    = policy_row["rules"]
-    if isinstance(rules, str):
-        rules = json.loads(rules)
-    patterns = build_patterns(rules)
+    agent, policy_row = await load_agent_and_policy(req.agent_id, tenant["id"])
+    ok, reason = await verify_request(agent, body, x_agent_signature, req.timestamp, req.nonce)
+    if not ok:
+        raise HTTPException(401, reason)
 
-    # SSRF: resolve + pin IPs at check time
+    rules    = policy_row["rules"]
+    patterns = build_patterns(rules)
     url_ok, url_reason, pinned_ips = validate_and_resolve_target(
         req.target_url, list(agent["allowed_hosts"] or [])
     )
     if not url_ok:
-        log.warning("invoke.ssrf_blocked", reason=url_reason, url=req.target_url, request_id=rid)
-        return JSONResponse(400, {"allowed": False, "reason": url_reason,
-                                  "action": "ssrf_blocked", "request_id": rid})
+        return JSONResponse(400, {"allowed": False, "reason": url_reason, "action": "ssrf_blocked"})
 
     allowed, reason, clean, redacted, action = await run_enforcement(
         req.tool, req.args, agent, rules, patterns, req.context
     )
-    ms = int((time.monotonic() - start) * 1000)
-
+    ms = int((time.monotonic()-start)*1000)
     if not allowed:
-        decision = "pending" if action == "pending_approval" else "deny"
-        await log_action(rid, req.agent_id, req.user_id, req.tool, clean,
-                         decision, reason, redacted, ms, patterns)
-        REQUESTS_TOTAL.labels(endpoint="invoke", decision=decision).inc()
+        decision = "pending" if action=="pending_approval" else "deny"
+        await log_action(request_id, tenant["id"], req.agent_id, req.user_id,
+                         req.tool, clean, decision, reason, redacted, ms, patterns)
         if action == "pending_approval":
-            return {"allowed": False, "action": action, "reason": reason, "request_id": rid}
-        return JSONResponse(403, {"allowed": False, "reason": reason,
-                                  "action": action, "request_id": rid})
+            return {"allowed": False, "action": action, "reason": reason}
+        return JSONResponse(403, {"allowed": False, "reason": reason, "action": action})
 
-    # Connect to pinned IP — prevents TOCTOU DNS rebinding
     invoke_ok, tool_result = await invoke_with_pinned_ip(
         req.target_url, pinned_ips,
-        {"tool": req.tool, "args": clean, "user_id": req.user_id},
-        req.agent_id,
+        {"tool": req.tool, "args": clean, "user_id": req.user_id}, req.agent_id
     )
-
-    ms = int((time.monotonic() - start) * 1000)
+    ms = int((time.monotonic()-start)*1000)
     decision = "allow" if invoke_ok else "invoke_error"
-    await log_action(rid, req.agent_id, req.user_id, req.tool, clean,
-                     decision, reason, redacted, ms, patterns)
-    REQUESTS_TOTAL.labels(endpoint="invoke", decision=decision).inc()
-    LATENCY.labels(endpoint="invoke").observe(ms / 1000)
-    log.info("invoke.complete", decision=decision, tool=req.tool, ms=ms, success=invoke_ok)
-
+    await log_action(request_id, tenant["id"], req.agent_id, req.user_id,
+                     req.tool, clean, decision, reason, redacted, ms, patterns)
+    LATENCY.labels(endpoint="invoke").observe(ms/1000)
+    if invoke_ok:
+        await check_anomalies(tenant["id"], req.agent_id, req.tool, bg)
     return {"allowed": True, "action": "invoked", "result": tool_result, "success": invoke_ok,
-            "redacted": redacted, "duration_ms": ms, "policy": agent["policy"], "request_id": rid}
+            "redacted": redacted, "duration_ms": ms, "policy": agent["policy"]}
 
-# ── Agents ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENTS
+# ══════════════════════════════════════════════════════════════════════════════
 @app.post("/agents")
-async def create_agent(body: AgentCreate, x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+async def create_agent(body: AgentCreate, tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
-        if not await conn.fetchrow("SELECT name FROM policies WHERE name=$1", body.policy):
-            raise HTTPException(400, f"Policy '{body.policy}' does not exist")
+        if not await conn.fetchrow("SELECT id FROM policies WHERE tenant_id=$1 AND name=$2",
+                                    tenant["id"], body.policy):
+            raise HTTPException(400, f"Policy '{body.policy}' not found")
     agent_id = f"agent_{uuid.uuid4().hex[:12]}"
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO agents (id,name,policy,public_key,allowed_hosts) VALUES ($1,$2,$3,$4,$5)",
-            agent_id, body.name, body.policy, None, body.allowed_hosts or []
+            "INSERT INTO agents (id,tenant_id,name,policy,allowed_hosts) VALUES ($1,$2,$3,$4,$5)",
+            agent_id, tenant["id"], body.name, body.policy, body.allowed_hosts or []
         )
-    ACTIVE_AGENTS.inc()
-    log.info("agent.created", agent_id=agent_id, policy=body.policy)
     return {"agent_id": agent_id, "name": body.name, "policy": body.policy,
-            "allowed_hosts": body.allowed_hosts,
             "next_step": f"POST /agents/{agent_id}/register-key with your Ed25519 public key"}
 
 @app.post("/agents/{agent_id}/register-key")
-async def register_key(agent_id: str, body: RegisterKeyRequest, x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+async def register_key(agent_id: str, body: RegisterKeyRequest, tenant = Depends(get_tenant)):
     try:
         Ed25519PublicKey.from_public_bytes(b64decode(body.public_key))
     except Exception as e:
         raise HTTPException(400, f"Invalid Ed25519 public key: {e}")
-
     async with pool.acquire() as conn:
-        agent = await conn.fetchrow("SELECT * FROM agents WHERE id=$1", agent_id)
+        agent = await conn.fetchrow("SELECT * FROM agents WHERE id=$1 AND tenant_id=$2",
+                                     agent_id, tenant["id"])
         if not agent:
-            raise HTTPException(404, f"Agent '{agent_id}' not found")
-
-        # Archive old key if rotating
+            raise HTTPException(404, "Agent not found")
         if agent["public_key"]:
             await conn.execute(
-                "INSERT INTO agent_key_history (id,agent_id,public_key,reason) VALUES ($1,$2,$3,$4)",
-                str(uuid.uuid4()), agent_id, agent["public_key"],
-                body.rotation_reason or "key rotation"
+                "INSERT INTO agent_key_history (id,agent_id,tenant_id,public_key,reason) VALUES ($1,$2,$3,$4,$5)",
+                str(uuid.uuid4()), agent_id, tenant["id"], agent["public_key"],
+                body.rotation_reason or "rotation"
             )
-
         updates = {"public_key": body.public_key}
         if body.policy:
-            if not await conn.fetchrow("SELECT name FROM policies WHERE name=$1", body.policy):
-                raise HTTPException(400, f"Policy '{body.policy}' does not exist")
+            if not await conn.fetchrow("SELECT id FROM policies WHERE tenant_id=$1 AND name=$2",
+                                        tenant["id"], body.policy):
+                raise HTTPException(400, f"Policy '{body.policy}' not found")
             updates["policy"] = body.policy
         if body.allowed_hosts is not None:
             updates["allowed_hosts"] = body.allowed_hosts
-
-        set_clause = ", ".join(f"{k}=${i+2}" for i, k in enumerate(updates))
-        vals       = [agent_id] + list(updates.values())
-        await conn.execute(f"UPDATE agents SET {set_clause}, updated_at=NOW() WHERE id=$1", *vals)
-
-    log.info("agent.key_registered", agent_id=agent_id,
-             rotation=bool(agent["public_key"]), reason=body.rotation_reason)
-    return {"agent_id": agent_id, "registered": True,
-            "rotated": bool(agent["public_key"]), "policy": updates.get("policy", agent["policy"])}
+        set_clause = ", ".join(f"{k}=${i+2}" for i,k in enumerate(updates))
+        await conn.execute(f"UPDATE agents SET {set_clause}, updated_at=NOW() WHERE id=$1",
+                           agent_id, *updates.values())
+    return {"agent_id": agent_id, "registered": True, "rotated": bool(agent["public_key"])}
 
 @app.post("/agents/{agent_id}/revoke")
-async def revoke_agent(agent_id: str, x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+async def revoke_agent(agent_id: str, tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
         res = await conn.execute(
-            "UPDATE agents SET revoked=TRUE, updated_at=NOW() WHERE id=$1", agent_id
+            "UPDATE agents SET revoked=TRUE, updated_at=NOW() WHERE id=$1 AND tenant_id=$2",
+            agent_id, tenant["id"]
         )
     if res == "UPDATE 0":
-        raise HTTPException(404, f"Agent '{agent_id}' not found")
-    ACTIVE_AGENTS.dec()
-    log.warning("agent.revoked", agent_id=agent_id)
+        raise HTTPException(404, "Agent not found")
     return {"agent_id": agent_id, "revoked": True}
 
 @app.get("/agents")
-async def list_agents(x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+async def list_agents(tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id,name,policy,allowed_hosts,revoked,created_at,updated_at "
-            "FROM agents ORDER BY created_at DESC"
+            "SELECT id,name,policy,allowed_hosts,revoked,created_at FROM agents "
+            "WHERE tenant_id=$1 ORDER BY created_at DESC", tenant["id"]
         )
     return [dict(r) for r in rows]
 
 @app.delete("/agents/{agent_id}")
-async def delete_agent(agent_id: str, x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+async def delete_agent(agent_id: str, tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
-        res = await conn.execute("DELETE FROM agents WHERE id=$1", agent_id)
+        res = await conn.execute("DELETE FROM agents WHERE id=$1 AND tenant_id=$2",
+                                  agent_id, tenant["id"])
     if res == "DELETE 0":
-        raise HTTPException(404, f"Agent '{agent_id}' not found")
-    ACTIVE_AGENTS.dec()
+        raise HTTPException(404, "Agent not found")
     return {"deleted": agent_id}
 
-# ── Policies ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# POLICIES
+# ══════════════════════════════════════════════════════════════════════════════
 @app.post("/policies")
-async def create_policy(body: PolicyCreate, x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+async def create_policy(body: PolicyCreate, tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO policies (name,rules) VALUES ($1,$2)"
-            " ON CONFLICT (name) DO UPDATE SET rules=$2",
-            body.name, json.dumps(body.rules)
+            "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)"
+            " ON CONFLICT (tenant_id,name) DO UPDATE SET rules=$4",
+            str(uuid.uuid4()), tenant["id"], body.name, json.dumps(body.rules)
         )
     return {"name": body.name, "rules": body.rules}
 
 @app.get("/policies")
-async def list_policies(x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+async def list_policies(tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM policies ORDER BY name")
+        rows = await conn.fetch("SELECT * FROM policies WHERE tenant_id=$1 ORDER BY name",
+                                 tenant["id"])
     return [dict(r) for r in rows]
 
 @app.get("/policies/{name}")
-async def get_policy(name: str, x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+async def get_policy(name: str, tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM policies WHERE name=$1", name)
+        row = await conn.fetchrow("SELECT * FROM policies WHERE tenant_id=$1 AND name=$2",
+                                   tenant["id"], name)
     if not row:
         raise HTTPException(404, f"Policy '{name}' not found")
     return dict(row)
 
-# ── Audit ─────────────────────────────────────────────────────────────────────
+@app.delete("/policies/{name}")
+async def delete_policy(name: str, tenant = Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM policies WHERE tenant_id=$1 AND name=$2",
+                                  tenant["id"], name)
+    if res == "DELETE 0":
+        raise HTTPException(404, "Policy not found")
+    return {"deleted": name}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUDIT
+# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/audit")
-async def audit_logs(
-    agent_id: Optional[str]=None, user_id: Optional[str]=None,
-    decision: Optional[str]=None, tool: Optional[str]=None,
-    limit: int=100, x_api_key: str=Header(...),
-):
-    require_admin(x_api_key)
-    filters, vals, i = [], [], 1
-    for col, val in [("agent_id",agent_id),("user_id",user_id),("decision",decision),("tool",tool)]:
+async def audit_logs(tenant = Depends(get_tenant),
+                     agent_id: Optional[str]=None, decision: Optional[str]=None,
+                     tool: Optional[str]=None, limit: int=100):
+    filters = ["tenant_id=$1"]
+    vals    = [tenant["id"]]
+    i = 2
+    for col, val in [("agent_id",agent_id),("decision",decision),("tool",tool)]:
         if val:
-            filters.append(f"{col}=${i}"); vals.append(val); i += 1
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
-    vals.append(min(limit, 1000))
+            filters.append(f"{col}=${i}"); vals.append(val); i+=1
+    vals.append(min(limit,1000))
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT * FROM audit_logs {where} ORDER BY created_at DESC LIMIT ${i}", *vals
+            f"SELECT * FROM audit_logs WHERE {' AND '.join(filters)} ORDER BY created_at DESC LIMIT ${i}",
+            *vals
         )
     return [dict(r) for r in rows]
 
 @app.get("/audit/stats")
-async def audit_stats(agent_id: Optional[str]=None, x_api_key: str=Header(...)):
-    require_admin(x_api_key)
-    where = "WHERE agent_id=$1" if agent_id else ""
+async def audit_stats(tenant = Depends(get_tenant), agent_id: Optional[str]=None):
+    where = "WHERE tenant_id=$1"
+    vals  = [tenant["id"]]
+    if agent_id:
+        where += " AND agent_id=$2"; vals.append(agent_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(f"""
             SELECT COUNT(*) AS total,
@@ -851,23 +933,102 @@ async def audit_stats(agent_id: Optional[str]=None, x_api_key: str=Header(...)):
                 COUNT(*) FILTER (WHERE decision='invoke_error') AS invoke_errors,
                 COUNT(*) FILTER (WHERE redacted=true)           AS redacted,
                 ROUND(AVG(duration_ms))                         AS avg_ms,
-                ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP
-                      (ORDER BY duration_ms))                   AS p95_ms
+                ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)) AS p95_ms
             FROM audit_logs {where}
-        """, *([agent_id] if agent_id else []))
+        """, *vals)
     return dict(row)
 
-# ── Metrics (Prometheus) ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPLIANCE REPORT EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/audit/export/json")
+async def export_json(tenant = Depends(get_tenant),
+                      days: int = 30, agent_id: Optional[str] = None):
+    """Export full audit log as JSON for GDPR/SOC2/HIPAA compliance."""
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if agent_id:
+        where += " AND agent_id=$3"; vals.append(agent_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"SELECT * FROM audit_logs {where} ORDER BY created_at DESC", *vals)
+    data = {
+        "export_date":  datetime.now(timezone.utc).isoformat(),
+        "tenant_id":    tenant["id"],
+        "period_days":  days,
+        "total_records": len(rows),
+        "records": [dict(r) for r in rows],
+    }
+    content = json.dumps(data, default=str, indent=2).encode()
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename=agentguard-audit-{days}d.json"}
+    )
+
+@app.get("/audit/export/csv")
+async def export_csv(tenant = Depends(get_tenant), days: int = 30):
+    """Export audit log as CSV."""
+    import csv, io
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id,request_id,agent_id,user_id,tool,decision,reason,redacted,duration_ms,created_at"
+            " FROM audit_logs WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
+            " ORDER BY created_at DESC", tenant["id"], str(days)
+        )
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id","request_id","agent_id","user_id","tool","decision","reason","redacted","duration_ms","created_at"])
+    for r in rows:
+        writer.writerow([r["id"],r["request_id"],r["agent_id"],r["user_id"],
+                         r["tool"],r["decision"],r["reason"],r["redacted"],
+                         r["duration_ms"],r["created_at"]])
+    content = output.getvalue().encode()
+    return StreamingResponse(
+        iter([content]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=agentguard-audit-{days}d.csv"}
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANOMALY ALERTS
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/alerts")
+async def list_alerts(tenant = Depends(get_tenant), resolved: Optional[bool] = None, limit: int = 50):
+    where = "WHERE tenant_id=$1"
+    vals  = [tenant["id"]]
+    if resolved is not None:
+        where += " AND resolved=$2"; vals.append(resolved)
+    vals.append(min(limit, 200))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT * FROM anomaly_alerts {where} ORDER BY created_at DESC LIMIT ${len(vals)}",
+            *vals
+        )
+    return [dict(r) for r in rows]
+
+@app.post("/alerts/{alert_id}/resolve")
+async def resolve_alert(alert_id: str, tenant = Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE anomaly_alerts SET resolved=TRUE WHERE id=$1 AND tenant_id=$2",
+            alert_id, tenant["id"]
+        )
+    if res == "UPDATE 0":
+        raise HTTPException(404, "Alert not found")
+    return {"resolved": alert_id}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METRICS + HEALTH
+# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/metrics")
 async def metrics(x_api_key: str = Header(...)):
-    require_admin(x_api_key)
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(401, "Admin key required")
     from fastapi.responses import Response
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-# ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    checks = {"postgres": False, "redis": False}
+    checks = {"postgres": False, "redis": None}
     try:
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
@@ -875,13 +1036,10 @@ async def health():
     except Exception:
         pass
     if redis_conn:
-        checks["redis"] = await _redis_healthy()
-    else:
-        checks["redis"] = None  # not configured
-
-    all_ok = checks["postgres"] and (checks["redis"] is not False)
+        checks["redis"] = await _redis_ok()
+    all_ok = checks["postgres"] and checks.get("redis") is not False
     return JSONResponse(
         status_code=200 if all_ok else 503,
-        content={"status": "ok" if all_ok else "degraded",
-                 "checks": checks, "env": AGENTGUARD_ENV, "version": "1.5.0"}
+        content={"status":"ok" if all_ok else "degraded",
+                 "checks": checks, "env": AGENTGUARD_ENV, "version": "2.0.0"}
     )
