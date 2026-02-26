@@ -154,6 +154,18 @@ async def init_db():
             created_at TIMESTAMPTZ DEFAULT NOW()
         )""")
 
+        # Migrate: add id column to policies if missing
+        await conn.execute("""
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='policies' AND column_name='id'
+            ) THEN
+                ALTER TABLE policies ADD COLUMN id TEXT;
+                UPDATE policies SET id = gen_random_uuid()::text WHERE id IS NULL;
+            END IF;
+        END $$""")
+
         # Migrate: add tenant_id to policies if missing
         await conn.execute("""
         DO $$ BEGIN
@@ -357,10 +369,15 @@ DEFAULT_POLICIES = [
 
 async def seed_tenant_policies(tenant_id: str, conn):
     for name, rules in DEFAULT_POLICIES:
-        await conn.execute(
-            "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-            str(uuid.uuid4()), tenant_id, name, json.dumps(rules)
+        # Use UPSERT on (tenant_id, name) — safe even if id column was just added
+        existing = await conn.fetchval(
+            "SELECT id FROM policies WHERE tenant_id=$1 AND name=$2", tenant_id, name
         )
+        if not existing:
+            await conn.execute(
+                "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)",
+                str(uuid.uuid4()), tenant_id, name, json.dumps(rules)
+            )
 
 # ── Ed25519 ───────────────────────────────────────────────────────────────────
 def verify_ed25519(public_key_b64: str, body: bytes, sig_b64: str) -> tuple[bool, str]:
