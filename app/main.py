@@ -218,6 +218,28 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS anomaly_tenant_idx
         ON anomaly_alerts(tenant_id, created_at DESC) WHERE tenant_id IS NOT NULL""")
 
+        # Migrate: add retention_days to tenants if missing
+        await conn.execute("""
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='tenants' AND column_name='retention_days')
+            THEN ALTER TABLE tenants ADD COLUMN retention_days INTEGER DEFAULT 90;
+            END IF;
+        END $$""")
+
+        # Migrate: create policy_history table
+        await conn.execute("""CREATE TABLE IF NOT EXISTS policy_history (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+            policy_name TEXT NOT NULL, rules JSONB NOT NULL,
+            changed_at TIMESTAMPTZ DEFAULT NOW())""")
+
+        # Migrate: create webhooks table
+        await conn.execute("""CREATE TABLE IF NOT EXISTS webhooks (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+            url TEXT NOT NULL, events TEXT[] NOT NULL,
+            secret TEXT NOT NULL, active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMPTZ DEFAULT NOW())""")
+
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class TenantSignup(BaseModel):
     name:     str
