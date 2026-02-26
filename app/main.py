@@ -254,12 +254,20 @@ async def init_db():
         EXCEPTION WHEN others THEN NULL;
         END $$""")
 
-        # Migrate: add retention_days to tenants if missing
+        # Migrate: add retention_days, api_call_count, last_seen_at to tenants
         await conn.execute("""
         DO $$ BEGIN
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_name='tenants' AND column_name='retention_days')
             THEN ALTER TABLE tenants ADD COLUMN retention_days INTEGER DEFAULT 90;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='tenants' AND column_name='api_call_count')
+            THEN ALTER TABLE tenants ADD COLUMN api_call_count INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='tenants' AND column_name='last_seen_at')
+            THEN ALTER TABLE tenants ADD COLUMN last_seen_at TIMESTAMPTZ;
             END IF;
         END $$""")
 
@@ -361,6 +369,11 @@ async def get_tenant(
             tenant = await conn.fetchrow("SELECT * FROM tenants WHERE id=$1", tenant_id)
         elif x_api_key:
             tenant = await conn.fetchrow("SELECT * FROM tenants WHERE api_key=$1", x_api_key)
+            if tenant:
+                await conn.execute(
+                    "UPDATE tenants SET api_call_count = COALESCE(api_call_count,0)+1, last_seen_at=NOW() WHERE id=$1",
+                    tenant["id"]
+                )
         # Admin bypass
         if not tenant and x_api_key == ADMIN_API_KEY:
             return {"id": "__admin__", "plan": "enterprise"}
@@ -1337,6 +1350,26 @@ async def delete_webhook(webhook_id: str, tenant = Depends(get_tenant)):
     if res == "DELETE 0":
         raise HTTPException(404, "Webhook not found")
     return {"deleted": webhook_id}
+
+@app.get("/admin/tenants")
+async def admin_tenants(x_api_key: str = Header(...)):
+    """Admin only — see all tenants and their usage."""
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(401, "Admin key required")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT t.id, t.name, t.email, t.plan, t.created_at,
+                   COALESCE(t.api_call_count, 0) AS api_call_count,
+                   t.last_seen_at,
+                   COUNT(DISTINCT a.id) AS agent_count,
+                   COUNT(DISTINCT al.id) AS audit_log_count
+            FROM tenants t
+            LEFT JOIN agents a ON a.tenant_id = t.id
+            LEFT JOIN audit_logs al ON al.tenant_id = t.id
+            GROUP BY t.id, t.name, t.email, t.plan, t.created_at, t.api_call_count, t.last_seen_at
+            ORDER BY t.created_at DESC
+        """)
+    return [dict(r) for r in rows]
 
 @app.get("/health")
 async def health():
