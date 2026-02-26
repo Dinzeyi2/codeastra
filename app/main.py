@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Header, Request, Depends, Background
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from passlib.context import CryptContext
+import bcrypt as _bcrypt
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -60,7 +60,7 @@ SEMANTIC_CALLS   = Counter("agentguard_semantic_calls_total", "Semantic checks",
 ANTHROPIC_ERRORS = Counter("agentguard_anthropic_errors_total", "Anthropic errors")
 REDIS_ERRORS     = Counter("agentguard_redis_errors_total", "Redis errors")
 
-pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 bearer   = HTTPBearer(auto_error=False)
 limiter  = Limiter(key_func=get_remote_address)
 
@@ -744,7 +744,7 @@ async def signup(body: TenantSignup):
             })
     tenant_id = f"t_{uuid.uuid4().hex[:16]}"
     api_key   = f"sk-guard-{secrets.token_hex(32)}"
-    pw_hash   = pwd_ctx.hash(body.password)
+    pw_hash   = _bcrypt.hashpw(body.password.encode(), _bcrypt.gensalt()).decode()
     try:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -772,7 +772,7 @@ async def signup(body: TenantSignup):
 async def login(body: TenantLogin):
     async with pool.acquire() as conn:
         tenant = await conn.fetchrow("SELECT * FROM tenants WHERE email=$1", body.email)
-    if not tenant or not pwd_ctx.verify(body.password, tenant["password_hash"]):
+    if not tenant or not _bcrypt.checkpw(body.password.encode(), tenant["password_hash"].encode()):
         raise HTTPException(401, "Invalid email or password")
     return {"token": create_jwt(tenant["id"]), "api_key": tenant["api_key"],
             "tenant_id": tenant["id"], "name": tenant["name"]}
