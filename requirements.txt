@@ -10,5 +10,5 @@ slowapi==0.1.9
 structlog==24.4.0
 prometheus-client==0.21.0
 tenacity==9.0.0
-passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 python-multipart==0.0.12
