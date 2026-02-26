@@ -712,6 +712,14 @@ def rid(request: Request) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/auth/signup")
 async def signup(body: TenantSignup):
+    # Check if email already exists first — gives clean error before any insert
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT id FROM tenants WHERE email=$1", body.email)
+        if existing:
+            return JSONResponse(status_code=400, content={
+                "error": "email_exists",
+                "detail": "An account with this email already exists. Please log in instead."
+            })
     tenant_id = f"t_{uuid.uuid4().hex[:16]}"
     api_key   = f"sk-guard-{secrets.token_hex(32)}"
     pw_hash   = pwd_ctx.hash(body.password)
@@ -723,7 +731,16 @@ async def signup(body: TenantSignup):
             )
             await seed_tenant_policies(tenant_id, conn)
     except asyncpg.UniqueViolationError:
-        raise HTTPException(400, "Email already registered")
+        return JSONResponse(status_code=400, content={
+            "error": "email_exists",
+            "detail": "An account with this email already exists. Please log in instead."
+        })
+    except Exception as e:
+        log.error("signup.failed", error=str(e))
+        return JSONResponse(status_code=500, content={
+            "error": "signup_failed",
+            "detail": "Account creation failed. Please try again."
+        })
     token = create_jwt(tenant_id)
     log.info("tenant.created", tenant_id=tenant_id, email=body.email)
     return {"token": token, "api_key": api_key, "tenant_id": tenant_id,
