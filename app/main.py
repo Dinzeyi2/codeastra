@@ -230,6 +230,30 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS anomaly_tenant_idx
         ON anomaly_alerts(tenant_id, created_at DESC) WHERE tenant_id IS NOT NULL""")
 
+        # CRITICAL: migrate policies table — fix old schema where name was PK
+        await conn.execute("""
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='policies' AND column_name='id')
+            THEN ALTER TABLE policies ADD COLUMN id TEXT DEFAULT gen_random_uuid()::text;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name='policies' AND column_name='tenant_id')
+            THEN ALTER TABLE policies ADD COLUMN tenant_id TEXT;
+            END IF;
+        END $$""")
+        await conn.execute("""
+        DO $$ BEGIN
+            IF EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_class t ON c.conrelid=t.oid
+                WHERE t.relname='policies' AND c.conname='policies_pkey' AND c.contype='p'
+                AND EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_index i ON a.attrelid=i.indrelid
+                    WHERE i.indrelid=t.oid AND i.indisprimary AND a.attnum=ANY(i.indkey) AND a.attname='name'))
+            THEN
+                ALTER TABLE policies DROP CONSTRAINT policies_pkey;
+            END IF;
+        EXCEPTION WHEN others THEN NULL;
+        END $$""")
+
         # Migrate: add retention_days to tenants if missing
         await conn.execute("""
         DO $$ BEGIN
@@ -368,16 +392,28 @@ DEFAULT_POLICIES = [
 ]
 
 async def seed_tenant_policies(tenant_id: str, conn):
-    for name, rules in DEFAULT_POLICIES:
-        # Use UPSERT on (tenant_id, name) — safe even if id column was just added
-        existing = await conn.fetchval(
-            "SELECT id FROM policies WHERE tenant_id=$1 AND name=$2", tenant_id, name
-        )
-        if not existing:
-            await conn.execute(
-                "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)",
-                str(uuid.uuid4()), tenant_id, name, json.dumps(rules)
+    for pol_name, rules in DEFAULT_POLICIES:
+        try:
+            # Check if this tenant already has this policy
+            existing = await conn.fetchval(
+                "SELECT name FROM policies WHERE tenant_id=$1 AND name=$2", tenant_id, pol_name
             )
+            if existing:
+                continue
+            # Try insert with id column
+            try:
+                await conn.execute(
+                    "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)",
+                    str(uuid.uuid4()), tenant_id, pol_name, json.dumps(rules)
+                )
+            except Exception:
+                # Fallback: old schema where name is PK, no id column
+                await conn.execute(
+                    "INSERT INTO policies (name,rules) VALUES ($1,$2) ON CONFLICT (name) DO NOTHING",
+                    pol_name, json.dumps(rules)
+                )
+        except Exception as e:
+            log.warning("seed_policy.skipped", name=pol_name, error=str(e))
 
 # ── Ed25519 ───────────────────────────────────────────────────────────────────
 def verify_ed25519(public_key_b64: str, body: bytes, sig_b64: str) -> tuple[bool, str]:
