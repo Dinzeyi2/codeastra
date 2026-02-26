@@ -734,17 +734,13 @@ def rid(request: Request) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/auth/signup")
 async def signup(body: TenantSignup):
-    # Check if email already exists first — gives clean error before any insert
-    async with pool.acquire() as conn:
-        existing = await conn.fetchrow("SELECT id FROM tenants WHERE email=$1", body.email)
-        if existing:
-            return JSONResponse(status_code=400, content={
-                "error": "email_exists",
-                "detail": "An account with this email already exists. Please log in instead."
-            })
     tenant_id = f"t_{uuid.uuid4().hex[:16]}"
     api_key   = f"sk-guard-{secrets.token_hex(32)}"
-    pw_hash   = _bcrypt.hashpw(body.password.encode(), _bcrypt.gensalt()).decode()
+    try:
+        pw_hash = _bcrypt.hashpw(body.password.encode(), _bcrypt.gensalt()).decode()
+    except Exception as e:
+        log.error("signup.bcrypt_failed", error=str(e))
+        return JSONResponse(status_code=500, content={"error": "server_error", "detail": str(e)})
     try:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -758,10 +754,10 @@ async def signup(body: TenantSignup):
             "detail": "An account with this email already exists. Please log in instead."
         })
     except Exception as e:
-        log.error("signup.failed", error=str(e))
+        log.error("signup.insert_failed", error=str(e), error_type=type(e).__name__)
         return JSONResponse(status_code=500, content={
             "error": "signup_failed",
-            "detail": "Account creation failed. Please try again."
+            "detail": str(e)
         })
     token = create_jwt(tenant_id)
     log.info("tenant.created", tenant_id=tenant_id, email=body.email)
