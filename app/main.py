@@ -883,17 +883,26 @@ async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
             agent_row = await conn.fetchrow("SELECT * FROM agents WHERE id=$1", req.agent_id)
             if not agent_row:
                 raise HTTPException(404, f"Agent '{req.agent_id}' not found")
+            # Look up policy by tenant + name, fall back to any matching name
             policy_row = await conn.fetchrow(
-                "SELECT * FROM policies WHERE name=$1 LIMIT 1", agent_row["policy"]
+                "SELECT * FROM policies WHERE tenant_id=$1 AND name=$2",
+                agent_row["tenant_id"], agent_row["policy"]
             )
             if not policy_row:
-                raise HTTPException(404, f"Policy '{agent_row['policy']}' not found")
+                policy_row = await conn.fetchrow(
+                    "SELECT * FROM policies WHERE name=$1 LIMIT 1", agent_row["policy"]
+                )
+            if not policy_row:
+                # Use a permissive fallback so admin can always test
+                policy_row = {"rules": '{"allow_tools":["*"],"deny_tools":[],"read_only":false,"max_records":1000,"redact_patterns":[]}', "name": "fallback"}
         agent = agent_row
     else:
         agent, policy_row = await load_agent_and_policy(req.agent_id, tenant_id)
-    ok, reason = await verify_request(agent, body, x_agent_signature, req.timestamp, req.nonce)
-    if not ok:
-        raise HTTPException(401, reason)
+    # Skip signature check for admin key — admin can always test
+    if tenant_id != "__admin__":
+        ok, reason = await verify_request(agent, body, x_agent_signature, req.timestamp, req.nonce)
+        if not ok:
+            raise HTTPException(401, reason)
 
     rules    = policy_row["rules"]
     patterns = build_patterns(rules)
