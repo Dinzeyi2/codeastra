@@ -376,7 +376,16 @@ async def get_tenant(
                 )
         # Admin bypass
         if not tenant and x_api_key == ADMIN_API_KEY:
-            return {"id": "__admin__", "plan": "enterprise"}
+            # Return a fake tenant row that works everywhere
+            class AdminTenant(dict):
+                def __getitem__(self, k):
+                    defaults = {"id": "__admin__", "plan": "enterprise", "tenant_id": "__admin__",
+                                "retention_days": 90, "api_call_count": 0}
+                    return defaults.get(k, None)
+                def get(self, k, default=None):
+                    try: return self[k]
+                    except: return default
+            return AdminTenant()
     if not tenant:
         raise HTTPException(401, "Authentication required — provide Bearer token or x-api-key")
     return tenant
@@ -748,7 +757,7 @@ async def log_action(request_id, tenant_id, agent_id, user_id, tool, args,
             str(uuid.uuid4()), request_id, tenant_id, agent_id, user_id, tool,
             json.dumps(safe_log_args(args, patterns)), decision, reason, redacted, duration_ms
         )
-    REQUESTS_TOTAL.labels(endpoint="protect", decision=decision, tenant=tenant_id[:8]).inc()
+    REQUESTS_TOTAL.labels(endpoint="protect", decision=decision, tenant=(tenant_id or "")[:8]).inc()
 
 async def run_enforcement(tool, args, agent, rules, patterns, context):
     if isinstance(rules, str): rules = json.loads(rules)
@@ -865,9 +874,23 @@ async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
     start = time.monotonic()
     request_id = rid(request)
     body = await request.body()
-    structlog.contextvars.bind_contextvars(request_id=request_id, tenant_id=tenant["id"],
+    tenant_id = tenant["id"] if tenant["id"] != "__admin__" else "__admin__"
+    structlog.contextvars.bind_contextvars(request_id=request_id, tenant_id=tenant_id,
                                            agent_id=req.agent_id, tool=req.tool)
-    agent, policy_row = await load_agent_and_policy(req.agent_id, tenant["id"])
+    # Admin key can access any agent
+    if tenant_id == "__admin__":
+        async with pool.acquire() as conn:
+            agent_row = await conn.fetchrow("SELECT * FROM agents WHERE id=$1", req.agent_id)
+            if not agent_row:
+                raise HTTPException(404, f"Agent '{req.agent_id}' not found")
+            policy_row = await conn.fetchrow(
+                "SELECT * FROM policies WHERE name=$1 LIMIT 1", agent_row["policy"]
+            )
+            if not policy_row:
+                raise HTTPException(404, f"Policy '{agent_row['policy']}' not found")
+        agent = agent_row
+    else:
+        agent, policy_row = await load_agent_and_policy(req.agent_id, tenant_id)
     ok, reason = await verify_request(agent, body, x_agent_signature, req.timestamp, req.nonce)
     if not ok:
         raise HTTPException(401, reason)
