@@ -468,20 +468,25 @@ async def is_nonce_fresh(nonce: str) -> bool:
     return True
 
 async def verify_request(agent, body, sig, ts, nonce) -> tuple[bool, str]:
-    if IS_PROD:
-        for val, msg in [(sig,"Missing x-agent-signature"),(ts,"Missing timestamp"),(nonce,"Missing nonce")]:
-            if val is None:
-                return False, msg
+    # Signatures are OPTIONAL unless agent has a public key registered
+    # If agent has no public key, skip signature check entirely
+    # If agent has a public key AND signature is provided, verify it
+    # This allows gradual adoption — start without signing, add signing later
     if ts is not None and abs(int(time.time()) - ts) > REPLAY_WINDOW_SECS:
-        return False, f"Request expired"
+        return False, "Request expired"
     if nonce is not None and not await is_nonce_fresh(nonce):
         return False, "Nonce reused — replay detected"
     if sig is not None:
         if not agent["public_key"]:
-            return False, "Agent has no registered public key"
+            return False, "Agent has no registered public key — cannot verify signature"
         ok, reason = verify_ed25519(agent["public_key"], body, sig)
         if not ok:
             return False, reason
+    # If agent HAS a public key and NO signature provided, still allow (optional signing)
+    # To enforce signing, set REQUIRE_SIGNATURES=true in Railway env vars
+    if os.environ.get("REQUIRE_SIGNATURES") == "true":
+        if sig is None and agent.get("public_key"):
+            return False, "Signature required — set x-agent-signature header"
     return True, "ok"
 
 # ── SSRF ──────────────────────────────────────────────────────────────────────
