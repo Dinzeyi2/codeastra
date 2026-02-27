@@ -915,7 +915,7 @@ async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
     if not allowed:
         if action == "pending_approval":
             return {"allowed": False, "action": action, "reason": reason, "args": clean}
-        return JSONResponse(403, {"allowed": False, "reason": reason, "action": action, "request_id": request_id})
+        return JSONResponse(status_code=403, content={"allowed": False, "reason": reason, "action": action, "request_id": request_id})
 
     return {"allowed": True, "action": "proceed", "args": clean,
             "redacted": redacted, "duration_ms": ms, "policy": agent["policy"], "request_id": request_id}
@@ -939,7 +939,7 @@ async def invoke(req: InvokeRequest, request: Request, bg: BackgroundTasks,
         req.target_url, list(agent["allowed_hosts"] or [])
     )
     if not url_ok:
-        return JSONResponse(400, {"allowed": False, "reason": url_reason, "action": "ssrf_blocked"})
+        return JSONResponse(status_code=400, content={"allowed": False, "reason": url_reason, "action": "ssrf_blocked"})
 
     allowed, reason, clean, redacted, action = await run_enforcement(
         req.tool, req.args, agent, rules, patterns, req.context
@@ -951,7 +951,7 @@ async def invoke(req: InvokeRequest, request: Request, bg: BackgroundTasks,
                          req.tool, clean, decision, reason, redacted, ms, patterns)
         if action == "pending_approval":
             return {"allowed": False, "action": action, "reason": reason}
-        return JSONResponse(403, {"allowed": False, "reason": reason, "action": action})
+        return JSONResponse(status_code=403, content={"allowed": False, "reason": reason, "action": action})
 
     invoke_ok, tool_result = await invoke_with_pinned_ip(
         req.target_url, pinned_ips,
