@@ -1022,11 +1022,19 @@ async def delete_agent(agent_id: str, tenant = Depends(get_tenant)):
 @app.post("/policies")
 async def create_policy(body: PolicyCreate, tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)"
-            " ON CONFLICT (tenant_id,name) DO UPDATE SET rules=$4",
-            str(uuid.uuid4()), tenant["id"], body.name, json.dumps(body.rules)
+        existing = await conn.fetchrow(
+            "SELECT id FROM policies WHERE tenant_id=$1 AND name=$2", tenant["id"], body.name
         )
+        if existing:
+            await conn.execute(
+                "UPDATE policies SET rules=$1 WHERE tenant_id=$2 AND name=$3",
+                json.dumps(body.rules), tenant["id"], body.name
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)",
+                str(uuid.uuid4()), tenant["id"], body.name, json.dumps(body.rules)
+            )
     return {"name": body.name, "rules": body.rules}
 
 @app.get("/policies")
