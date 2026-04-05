@@ -27,6 +27,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
 from pydantic import BaseModel, EmailStr
+from app.v3 import *
 import asyncpg
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -91,7 +92,9 @@ async def lifespan(app: FastAPI):
     await pool.close()
     if redis_conn:
         await redis_conn.aclose()
-
+# v3 migrations — sessions, HITL, injection, rate limits
+for _sql in SESSION_MIGRATIONS:
+    await conn.execute(_sql)
 async def init_db():
     async with pool.acquire() as conn:
         # Create each table separately so IF NOT EXISTS works correctly
@@ -907,7 +910,8 @@ async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
     rules    = policy_row["rules"]
     patterns = build_patterns(rules)
     allowed, reason, clean, redacted, action = await run_enforcement(
-        req.tool, req.args, agent, rules, patterns, req.context
+        req.tool, req.args, agent, rules, patterns, req.context,
+        tenant_id=tenant_id
     )
     decision = "allow" if allowed else ("pending" if action=="pending_approval" else "deny")
     ms = int((time.monotonic()-start)*1000)
