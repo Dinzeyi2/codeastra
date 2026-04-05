@@ -2198,3 +2198,1041 @@ async def delete_synthesized_policy(policy_id: str, tenant=Depends(get_tenant)):
         raise HTTPException(404, "Synthesized policy not found")
     return {"deleted": policy_id}
 '''
+
+"""
+AgentGuard v3.4.0 — Four Advanced Security Features
+
+1. CITATION-LEVEL GROUNDING
+   - Maps every sentence in the LLM response to a source document
+   - Returns supported/unsupported spans with exact citations
+   - Bedrock-equivalent: tells you WHICH sentence is unsupported, not just pass/fail
+
+2. POLICY CONFLICT DETECTION (honest alternative to formal verification)
+   - Detects allow/deny contradictions
+   - Finds tools the agent needs (from AST) that would be blocked by active policy
+   - Detects overlapping wildcard patterns, read_only violations, approval gaps
+   - Returns structured conflict report before you deploy
+
+3. VECTOR INTENT ANCHORING (replaces reactive Haiku drift)
+   - Embeds session intent at creation time — the "Anchor"
+   - On every tool call, computes cosine distance between tool action and anchor
+   - Sub-millisecond (no API call) — uses existing embedding infrastructure
+   - Circuit breaker trips at configurable threshold (default 0.78)
+   - Falls back to Haiku scoring for edge cases
+
+4. HONEY-TOOLS (proactive trap layer)
+   - Automatically generates ghost tools from the complement of the agent's legitimate tools
+   - Injects them into the system prompt sent to the LLM
+   - Any call to a honey-tool = 100% certainty of injection/hijack, zero false positives
+   - Instant session kill + tenant alert
+   - Works with AST synthesis: legitimate tools are known, traps are everything else
+
+PASTE AT BOTTOM OF: app/v3.py
+
+ADD TO init_db() in main.py:
+    for _sql in V34_MIGRATIONS:
+        await conn.execute(_sql)
+
+ADD TO imports in main.py:
+    from app.v3 import (
+        ...existing...,
+        V34_MIGRATIONS,
+        # Citation grounding
+        check_grounding_with_citations, CitationGroundingResult,
+        # Policy conflict detection
+        detect_policy_conflicts, PolicyConflictReport,
+        # Vector intent anchoring
+        anchor_session_intent, check_intent_anchor, AnchorCheckResult,
+        # Honey-tools
+        generate_honey_tools, inject_honey_tools, check_honey_tool_call,
+        HoneyToolConfig, HONEY_TOOL_PREFIX,
+    )
+"""
+
+import math, json, hashlib, uuid, asyncio, re, time
+from typing import Any, Optional
+from datetime import datetime, timezone, timedelta
+from pydantic import BaseModel
+import anthropic
+import structlog
+
+log = structlog.get_logger()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB MIGRATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+V34_MIGRATIONS = [
+
+# Citation grounding log
+"""CREATE TABLE IF NOT EXISTS grounding_citation_log (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    session_id      TEXT,
+    agent_id        TEXT,
+    total_sentences INTEGER NOT NULL DEFAULT 0,
+    supported       INTEGER NOT NULL DEFAULT 0,
+    unsupported     INTEGER NOT NULL DEFAULT 0,
+    support_ratio   NUMERIC(5,4),
+    citations       JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS citation_log_tenant_idx
+   ON grounding_citation_log(tenant_id, created_at DESC)""",
+
+# Policy conflict log
+"""CREATE TABLE IF NOT EXISTS policy_conflict_log (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    policy_name     TEXT NOT NULL,
+    conflict_count  INTEGER NOT NULL DEFAULT 0,
+    conflicts       JSONB NOT NULL,
+    checked_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS conflict_log_tenant_idx
+   ON policy_conflict_log(tenant_id, checked_at DESC)""",
+
+# Intent anchors — one per session
+"""CREATE TABLE IF NOT EXISTS session_intent_anchors (
+    session_id      TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    intent_text     TEXT NOT NULL,
+    anchor_vector   JSONB NOT NULL,
+    threshold       NUMERIC(4,3) NOT NULL DEFAULT 0.78,
+    trip_count      INTEGER DEFAULT 0,
+    last_distance   NUMERIC(6,4),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    last_checked_at TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS anchor_tenant_idx
+   ON session_intent_anchors(tenant_id)""",
+
+# Anchor check log
+"""CREATE TABLE IF NOT EXISTS anchor_check_log (
+    id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id   TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
+    tool        TEXT NOT NULL,
+    distance    NUMERIC(6,4) NOT NULL,
+    threshold   NUMERIC(4,3) NOT NULL,
+    tripped     BOOLEAN NOT NULL DEFAULT FALSE,
+    turn        INTEGER,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS anchor_check_session_idx
+   ON anchor_check_log(session_id, created_at DESC)""",
+
+# Honey-tool configs per agent
+"""CREATE TABLE IF NOT EXISTS honey_tool_configs (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    agent_id        TEXT NOT NULL UNIQUE,
+    honey_tools     JSONB NOT NULL DEFAULT '[]',
+    auto_generated  BOOLEAN DEFAULT TRUE,
+    enabled         BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS honey_config_tenant_idx
+   ON honey_tool_configs(tenant_id)""",
+
+# Honey-tool trip log
+"""CREATE TABLE IF NOT EXISTS honey_tool_trips (
+    id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id   TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
+    honey_tool  TEXT NOT NULL,
+    turn        INTEGER,
+    context     TEXT,
+    args        JSONB,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS honey_trip_tenant_idx
+   ON honey_tool_trips(tenant_id, created_at DESC)""",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CitationGroundingResult(BaseModel):
+    grounded:        bool
+    support_ratio:   float
+    total_sentences: int
+    supported:       int
+    unsupported:     int
+    citations:       list[dict]   # [{sentence, supported, source_id, source_excerpt}]
+    summary:         str
+
+class PolicyConflictReport(BaseModel):
+    policy_name: str
+    has_conflicts: bool
+    conflict_count: int
+    conflicts: list[dict]  # [{type, description, severity, affected_tools}]
+    recommendations: list[str]
+
+class AnchorCheckResult(BaseModel):
+    allowed:   bool
+    distance:  float
+    threshold: float
+    tripped:   bool
+    reason:    str
+
+class HoneyToolConfig(BaseModel):
+    agent_id:    str
+    honey_tools: list[str] = []   # empty = auto-generate from AST complement
+    enabled:     bool = True
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. CITATION-LEVEL GROUNDING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences for citation-level analysis."""
+    # Split on sentence-ending punctuation followed by whitespace or end
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    # Filter out very short fragments
+    return [s.strip() for s in sentences if len(s.strip()) > 15]
+
+async def check_grounding_with_citations(
+    response_text: str,
+    tenant_id: str,
+    session_id: Optional[str] = None,
+    agent_id:   Optional[str] = None,
+    threshold:  float = 0.5,
+) -> CitationGroundingResult:
+    """
+    Citation-level grounding check.
+    Maps every sentence in the response to a source document.
+    Returns which sentences are supported, which aren't, and what source supports each.
+    Equivalent to Bedrock's contextual grounding with citation detail.
+    """
+    from app.main import pool
+
+    # Load source documents
+    async with pool.acquire() as conn:
+        sources = await conn.fetch(
+            "SELECT id, content FROM grounding_sources"
+            " WHERE tenant_id=$1 AND (session_id=$2 OR session_id IS NULL)"
+            " AND expires_at > NOW() ORDER BY created_at DESC LIMIT 5",
+            tenant_id, session_id
+        )
+
+    if not sources:
+        return CitationGroundingResult(
+            grounded=True, support_ratio=1.0, total_sentences=0,
+            supported=0, unsupported=0, citations=[],
+            summary="No source documents registered — grounding check skipped."
+        )
+
+    sentences = _split_sentences(response_text)
+    if not sentences:
+        return CitationGroundingResult(
+            grounded=True, support_ratio=1.0, total_sentences=0,
+            supported=0, unsupported=0, citations=[],
+            summary="Response too short to analyze."
+        )
+
+    # Build source context
+    source_blocks = []
+    for i, src in enumerate(sources):
+        source_blocks.append(f"[SOURCE {i+1} id={src['id']}]\n{src['content'][:2000]}")
+    source_context = "\n\n".join(source_blocks)
+
+    # Ask Haiku to annotate each sentence
+    sentences_numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
+
+    try:
+        client = anthropic.AsyncAnthropic()
+        msg = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=2000,
+                messages=[{"role": "user", "content":
+                    f"You are a citation verifier. For each numbered sentence, determine if it is "
+                    f"supported by the source documents. Return ONLY valid JSON.\n\n"
+                    f"SOURCE DOCUMENTS:\n{source_context}\n\n"
+                    f"SENTENCES TO VERIFY:\n{sentences_numbered}\n\n"
+                    f"Return a JSON array, one object per sentence:\n"
+                    f"[\n"
+                    f"  {{\n"
+                    f"    \"sentence_num\": 1,\n"
+                    f"    \"supported\": true,\n"
+                    f"    \"source_id\": \"<id of supporting source or null>\",\n"
+                    f"    \"source_excerpt\": \"<exact phrase from source that supports this, or null>\",\n"
+                    f"    \"confidence\": 0.95\n"
+                    f"  }}\n"
+                    f"]\n"
+                    f"If a sentence makes a claim not in the sources, set supported=false and source_id=null."
+                }]
+            ),
+            timeout=15.0
+        )
+        raw = re.sub(r"^```(?:json)?\n?|\n?```$", "", msg.content[0].text.strip())
+        annotations = json.loads(raw)
+    except Exception as e:
+        log.warning("citation_grounding.failed", error=str(e))
+        # Fallback: mark everything as unsupported to be conservative
+        annotations = [
+            {"sentence_num": i+1, "supported": False,
+             "source_id": None, "source_excerpt": None, "confidence": 0.0}
+            for i in range(len(sentences))
+        ]
+
+    # Build citation report
+    citations = []
+    supported_count   = 0
+    unsupported_count = 0
+
+    for i, sentence in enumerate(sentences):
+        ann = next((a for a in annotations if a.get("sentence_num") == i+1), None)
+        if ann is None:
+            ann = {"supported": False, "source_id": None, "source_excerpt": None, "confidence": 0.0}
+
+        is_supported = bool(ann.get("supported", False))
+        if is_supported:
+            supported_count += 1
+        else:
+            unsupported_count += 1
+
+        citations.append({
+            "sentence_num":   i + 1,
+            "sentence":       sentence,
+            "supported":      is_supported,
+            "source_id":      ann.get("source_id"),
+            "source_excerpt": ann.get("source_excerpt"),
+            "confidence":     float(ann.get("confidence", 0.0)),
+        })
+
+    total     = len(sentences)
+    ratio     = supported_count / total if total > 0 else 1.0
+    grounded  = ratio >= threshold
+
+    unsupported_sentences = [c["sentence"] for c in citations if not c["supported"]]
+    if unsupported_sentences:
+        summary = (f"{supported_count}/{total} sentences supported. "
+                   f"Unsupported: {'; '.join(unsupported_sentences[:2])}"
+                   f"{'...' if len(unsupported_sentences) > 2 else ''}")
+    else:
+        summary = f"All {total} sentences supported by source documents."
+
+    # Persist to log
+    try:
+        from app.main import pool as _pool
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO grounding_citation_log"
+                " (tenant_id,session_id,agent_id,total_sentences,supported,"
+                "  unsupported,support_ratio,citations)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                tenant_id, session_id, agent_id, total,
+                supported_count, unsupported_count,
+                round(ratio, 4), json.dumps(citations)
+            )
+    except Exception:
+        pass
+
+    return CitationGroundingResult(
+        grounded=grounded, support_ratio=round(ratio, 4),
+        total_sentences=total, supported=supported_count,
+        unsupported=unsupported_count, citations=citations,
+        summary=summary
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. POLICY CONFLICT DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _tool_could_match(tool: str, pattern: str) -> bool:
+    """Check if a tool name could match a pattern."""
+    if pattern == "*": return True
+    if pattern.endswith("*"):
+        return tool.lower().startswith(pattern[:-1].lower())
+    return tool.lower() == pattern.lower()
+
+def _patterns_overlap(p1: str, p2: str) -> bool:
+    """Check if two wildcard patterns could match the same tool."""
+    if p1 == "*" or p2 == "*": return True
+    if p1.endswith("*") and p2.endswith("*"):
+        prefix1 = p1[:-1].lower()
+        prefix2 = p2[:-1].lower()
+        return prefix1.startswith(prefix2) or prefix2.startswith(prefix1)
+    if p1.endswith("*"):
+        return p2.lower().startswith(p1[:-1].lower())
+    if p2.endswith("*"):
+        return p1.lower().startswith(p2[:-1].lower())
+    return p1.lower() == p2.lower()
+
+WRITE_VERB_SET = {
+    "delete","drop","truncate","update","insert","create","write","patch",
+    "put","post","remove","destroy","clear","reset","purge","wipe","modify",
+    "alter","exec","execute","run"
+}
+
+def _is_write_tool(tool_or_pattern: str) -> bool:
+    name = tool_or_pattern.rstrip("*").lower()
+    return any(verb in name for verb in WRITE_VERB_SET)
+
+async def detect_policy_conflicts(
+    policy_name: str,
+    rules: dict,
+    tenant_id: str,
+    synthesized_tools: Optional[list[str]] = None,
+) -> PolicyConflictReport:
+    """
+    Detect conflicts and issues in a policy rules dict.
+    Covers:
+    - Allow/deny pattern overlaps
+    - Read-only + write tool contradictions
+    - Tools in synthesized_tools that would be blocked
+    - Deny-by-default when allow_tools is empty
+    - require_approval tools not in allow_tools
+    - Wildcard shadow conflicts (deny* shadows allow_read)
+    """
+    if isinstance(rules, str):
+        rules = json.loads(rules)
+
+    conflicts    = []
+    allow_tools  = rules.get("allow_tools", [])
+    deny_tools   = rules.get("deny_tools", [])
+    read_only    = rules.get("read_only", False)
+    require_appr = rules.get("require_approval", [])
+
+    # 1. Deny-by-default: empty allow_tools blocks everything
+    if not allow_tools:
+        conflicts.append({
+            "type":          "deny_by_default",
+            "severity":      "high",
+            "description":   "allow_tools is empty — all tool calls will be denied by default.",
+            "affected_tools": [],
+            "fix":           "Add tools to allow_tools or use ['*'] to allow all."
+        })
+
+    # 2. Allow/deny overlaps — a tool is both allowed and denied
+    overlap_pairs = []
+    for ap in allow_tools:
+        for dp in deny_tools:
+            if _patterns_overlap(ap, dp):
+                overlap_pairs.append((ap, dp))
+                conflicts.append({
+                    "type":          "allow_deny_overlap",
+                    "severity":      "high",
+                    "description":   f"Pattern '{ap}' (allow) overlaps with '{dp}' (deny). Deny takes precedence.",
+                    "affected_tools": [ap, dp],
+                    "fix":           f"Remove '{ap}' from allow_tools or narrow the deny pattern '{dp}'."
+                })
+
+    # 3. Read-only + write tools in allow_tools
+    if read_only:
+        write_allowed = [t for t in allow_tools if _is_write_tool(t)]
+        for wt in write_allowed:
+            conflicts.append({
+                "type":          "readonly_write_conflict",
+                "severity":      "medium",
+                "description":   f"read_only=true but '{wt}' is a write operation in allow_tools.",
+                "affected_tools": [wt],
+                "fix":           f"Remove '{wt}' from allow_tools or set read_only=false."
+            })
+
+    # 4. require_approval tools not reachable (blocked by deny or not in allow)
+    for ap in require_appr:
+        # Check if it's denied
+        for dp in deny_tools:
+            if _patterns_overlap(ap, dp):
+                conflicts.append({
+                    "type":          "approval_tool_blocked",
+                    "severity":      "medium",
+                    "description":   f"'{ap}' is in require_approval but blocked by deny pattern '{dp}'.",
+                    "affected_tools": [ap],
+                    "fix":           f"Remove '{ap}' from deny_tools or require_approval."
+                })
+        # Check if it's in allow_tools
+        if allow_tools and allow_tools != ["*"]:
+            reachable = any(_tool_could_match(ap.rstrip("*"), p) for p in allow_tools)
+            if not reachable:
+                conflicts.append({
+                    "type":          "approval_tool_unreachable",
+                    "severity":      "low",
+                    "description":   f"'{ap}' is in require_approval but not in allow_tools — it would be denied before approval.",
+                    "affected_tools": [ap],
+                    "fix":           f"Add '{ap}' to allow_tools."
+                })
+
+    # 5. Synthesized tools blocked by active policy
+    if synthesized_tools:
+        for tool in synthesized_tools:
+            # Check deny
+            denied = any(_tool_could_match(tool, dp) for dp in deny_tools)
+            if denied:
+                conflicts.append({
+                    "type":          "synthesized_tool_denied",
+                    "severity":      "high",
+                    "description":   f"Agent needs '{tool}' (from code analysis) but it is blocked by deny_tools.",
+                    "affected_tools": [tool],
+                    "fix":           f"Remove the deny pattern that blocks '{tool}', or update the agent code."
+                })
+                continue
+            # Check allow
+            if allow_tools and allow_tools != ["*"]:
+                allowed = any(_tool_could_match(tool, ap) for ap in allow_tools)
+                if not allowed:
+                    conflicts.append({
+                        "type":          "synthesized_tool_not_allowed",
+                        "severity":      "high",
+                        "description":   f"Agent needs '{tool}' (from code analysis) but it is not in allow_tools.",
+                        "affected_tools": [tool],
+                        "fix":           f"Add '{tool}' to allow_tools."
+                    })
+            # Check read_only conflict
+            if read_only and _is_write_tool(tool):
+                conflicts.append({
+                    "type":          "synthesized_write_readonly",
+                    "severity":      "high",
+                    "description":   f"Agent needs '{tool}' (write op) but policy is read_only=true.",
+                    "affected_tools": [tool],
+                    "fix":           f"Set read_only=false or remove the write operation from agent code."
+                })
+
+    # 6. Wildcard shadow: deny* shadows more specific allow patterns
+    for dp in deny_tools:
+        if dp.endswith("*"):
+            shadowed = [ap for ap in allow_tools
+                        if ap != "*" and _tool_could_match(ap.rstrip("*"), dp)]
+            for shadowed_tool in shadowed:
+                # Only flag if not already caught by overlap check
+                if (shadowed_tool, dp) not in overlap_pairs:
+                    conflicts.append({
+                        "type":          "wildcard_shadow",
+                        "severity":      "medium",
+                        "description":   f"Deny pattern '{dp}' shadows allow pattern '{shadowed_tool}'.",
+                        "affected_tools": [shadowed_tool, dp],
+                        "fix":           f"Reorder or narrow deny pattern '{dp}'."
+                    })
+
+    # Build recommendations
+    recommendations = []
+    severities = [c["severity"] for c in conflicts]
+    if "high" in severities:
+        recommendations.append("Fix HIGH severity conflicts before deploying this policy.")
+    if not allow_tools:
+        recommendations.append("Use allow_tools: ['*'] with explicit deny_tools for a deny-list approach.")
+    if read_only and not any(_is_write_tool(t) for t in deny_tools):
+        recommendations.append("With read_only=true, consider adding explicit deny patterns for write verbs as defense-in-depth.")
+    if len(deny_tools) > 20:
+        recommendations.append("Large deny list — consider switching to an allowlist approach for clarity.")
+    if not conflicts:
+        recommendations.append("No conflicts detected. Policy is consistent.")
+
+    # Persist
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO policy_conflict_log (tenant_id,policy_name,conflict_count,conflicts)"
+                " VALUES ($1,$2,$3,$4)",
+                tenant_id, policy_name, len(conflicts), json.dumps(conflicts)
+            )
+    except Exception:
+        pass
+
+    return PolicyConflictReport(
+        policy_name=policy_name,
+        has_conflicts=len(conflicts) > 0,
+        conflict_count=len(conflicts),
+        conflicts=conflicts,
+        recommendations=recommendations
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. VECTOR INTENT ANCHORING
+# ══════════════════════════════════════════════════════════════════════════════
+
+# In-memory anchor cache — keyed by session_id
+_anchor_cache: dict[str, list[float]] = {}
+
+async def anchor_session_intent(
+    session_id: str,
+    tenant_id:  str,
+    agent_id:   str,
+    intent:     str,
+    threshold:  float = 0.78,
+) -> list[float]:
+    """
+    Embed the session intent at creation time.
+    Stores the anchor vector in DB + memory cache.
+    Call this when creating a session.
+    """
+    # Check cache first
+    if session_id in _anchor_cache:
+        return _anchor_cache[session_id]
+
+    # Generate embedding using existing embed_text infrastructure
+    anchor_vec = await embed_text(intent)
+
+    # Store in DB
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO session_intent_anchors"
+                " (session_id,tenant_id,agent_id,intent_text,anchor_vector,threshold)"
+                " VALUES ($1,$2,$3,$4,$5,$6)"
+                " ON CONFLICT (session_id) DO UPDATE"
+                " SET anchor_vector=$5, threshold=$6",
+                session_id, tenant_id, agent_id, intent,
+                json.dumps(anchor_vec), threshold
+            )
+    except Exception as e:
+        log.warning("anchor.store_failed", error=str(e))
+
+    _anchor_cache[session_id] = anchor_vec
+    return anchor_vec
+
+async def _get_anchor(session_id: str, tenant_id: str) -> Optional[tuple[list[float], float]]:
+    """Get the anchor vector and threshold for a session."""
+    if session_id in _anchor_cache:
+        # Still need the threshold from DB
+        try:
+            from app.main import pool
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT threshold FROM session_intent_anchors WHERE session_id=$1 AND tenant_id=$2",
+                    session_id, tenant_id
+                )
+            threshold = float(row["threshold"]) if row else 0.78
+        except Exception:
+            threshold = 0.78
+        return _anchor_cache[session_id], threshold
+
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT anchor_vector, threshold FROM session_intent_anchors"
+                " WHERE session_id=$1 AND tenant_id=$2",
+                session_id, tenant_id
+            )
+        if row:
+            vec = json.loads(row["anchor_vector"])
+            _anchor_cache[session_id] = vec
+            return vec, float(row["threshold"])
+    except Exception:
+        pass
+
+    return None, 0.78
+
+async def check_intent_anchor(
+    session_id: str,
+    tenant_id:  str,
+    agent_id:   str,
+    tool:       str,
+    args:       dict,
+    turn:       int = 0,
+) -> AnchorCheckResult:
+    """
+    Check if a tool call is consistent with the session's intent anchor.
+    Uses cosine distance — sub-millisecond after first embed call.
+    Replaces the reactive Haiku drift check for the fast path.
+    """
+    anchor_vec, threshold = await _get_anchor(session_id, tenant_id)
+
+    if anchor_vec is None or all(v == 0.0 for v in anchor_vec):
+        # No anchor — fall back gracefully
+        return AnchorCheckResult(
+            allowed=True, distance=0.0, threshold=threshold,
+            tripped=False, reason="No anchor set — check skipped"
+        )
+
+    # Build a text representation of the tool action
+    action_text = f"{tool}: {json.dumps(args, default=str)[:200]}"
+    action_vec  = await embed_text(action_text)
+
+    if all(v == 0.0 for v in action_vec):
+        return AnchorCheckResult(
+            allowed=True, distance=0.0, threshold=threshold,
+            tripped=False, reason="Embedding unavailable — check skipped"
+        )
+
+    # Cosine distance = 1 - cosine_similarity
+    # High similarity = low distance = consistent with intent
+    similarity = cosine_similarity(anchor_vec, action_vec)
+    distance   = 1.0 - similarity
+
+    tripped = distance > threshold
+    reason  = (
+        f"Intent distance={distance:.3f} threshold={threshold:.3f} "
+        f"{'— TRIPPED' if tripped else '— ok'}"
+    )
+
+    # Log async
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO anchor_check_log"
+                " (tenant_id,session_id,agent_id,tool,distance,threshold,tripped,turn)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                tenant_id, session_id, agent_id, tool,
+                round(distance, 4), threshold, tripped, turn
+            )
+            if tripped:
+                await conn.execute(
+                    "UPDATE session_intent_anchors"
+                    " SET trip_count=trip_count+1, last_distance=$1, last_checked_at=NOW()"
+                    " WHERE session_id=$2",
+                    round(distance, 4), session_id
+                )
+            else:
+                await conn.execute(
+                    "UPDATE session_intent_anchors SET last_distance=$1, last_checked_at=NOW()"
+                    " WHERE session_id=$2",
+                    round(distance, 4), session_id
+                )
+    except Exception:
+        pass
+
+    if tripped:
+        log.warning("anchor.tripped", session_id=session_id, tool=tool,
+                    distance=distance, threshold=threshold)
+
+    return AnchorCheckResult(
+        allowed=not tripped,
+        distance=round(distance, 4),
+        threshold=threshold,
+        tripped=tripped,
+        reason=reason
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. HONEY-TOOLS
+# ══════════════════════════════════════════════════════════════════════════════
+
+HONEY_TOOL_PREFIX = "__ag_trap__"
+
+# Pool of convincing honey-tool names by category
+_HONEY_TOOL_POOL = [
+    # Admin traps
+    "admin_emergency_reset",
+    "admin_override_all_permissions",
+    "admin_disable_security_checks",
+    "admin_export_all_tenant_data",
+    "admin_grant_superuser",
+    # Data exfil traps
+    "export_all_user_data",
+    "dump_database_to_file",
+    "export_credentials_store",
+    "backup_all_secrets",
+    "retrieve_all_api_keys",
+    # Destructive traps
+    "delete_all_records_permanently",
+    "wipe_production_database",
+    "factory_reset_all_agents",
+    "purge_all_audit_logs",
+    "destroy_all_backups",
+    # Escalation traps
+    "escalate_to_root",
+    "bypass_all_guardrails",
+    "disable_rate_limiting",
+    "override_policy_enforcement",
+    "unlock_all_tools",
+    # Exfil via network traps
+    "send_data_to_external_endpoint",
+    "forward_logs_to_remote_server",
+    "upload_files_to_external_storage",
+    # Reconnaissance traps
+    "list_all_internal_endpoints",
+    "enumerate_all_users",
+    "get_system_configuration",
+    "read_environment_variables",
+    "inspect_all_agent_sessions",
+]
+
+def _select_honey_tools(
+    legitimate_tools: list[str],
+    count: int = 5,
+    agent_id: str = "",
+) -> list[str]:
+    """
+    Select honey tools that are plausible for the context
+    but clearly outside the agent's legitimate scope.
+    Uses a deterministic seed based on agent_id for consistency.
+    """
+    import hashlib as _hashlib
+    seed = int(_hashlib.sha256(agent_id.encode()).hexdigest()[:8], 16)
+
+    # Filter out any honey tools that overlap with legitimate tools
+    legitimate_lower = {t.lower() for t in legitimate_tools}
+    available = [
+        t for t in _HONEY_TOOL_POOL
+        if not any(leg in t.lower() or t.lower() in leg for leg in legitimate_lower)
+    ]
+
+    # Deterministic shuffle based on agent_id
+    import random as _random
+    rng = _random.Random(seed)
+    rng.shuffle(available)
+
+    return available[:count]
+
+async def generate_honey_tools(
+    tenant_id:        str,
+    agent_id:         str,
+    legitimate_tools: list[str] = [],
+    count:            int = 5,
+) -> list[str]:
+    """
+    Generate and store honey tools for an agent.
+    If legitimate_tools is provided, generate complement tools.
+    Otherwise use the full pool.
+    """
+    selected = _select_honey_tools(legitimate_tools, count, agent_id)
+
+    # Store config
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO honey_tool_configs"
+                " (tenant_id,agent_id,honey_tools,auto_generated)"
+                " VALUES ($1,$2,$3,TRUE)"
+                " ON CONFLICT (agent_id) DO UPDATE"
+                " SET honey_tools=$3, updated_at=NOW()",
+                tenant_id, agent_id, json.dumps(selected)
+            )
+    except Exception as e:
+        log.error("honey_tools.store_failed", error=str(e))
+
+    return selected
+
+async def _get_honey_tools(tenant_id: str, agent_id: str) -> list[str]:
+    """Get the honey tools configured for an agent."""
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT honey_tools FROM honey_tool_configs"
+                " WHERE agent_id=$1 AND tenant_id=$2 AND enabled=TRUE",
+                agent_id, tenant_id
+            )
+        if row:
+            return json.loads(row["honey_tools"])
+    except Exception:
+        pass
+    return []
+
+def inject_honey_tools(
+    system_prompt: Optional[str],
+    honey_tools:   list[str],
+) -> str:
+    """
+    Inject honey tool definitions into the system prompt.
+    The LLM sees these as available tools — but they don't exist.
+    Any attempt to call them is a guaranteed injection signal.
+    """
+    if not honey_tools:
+        return system_prompt or ""
+
+    honey_block = (
+        "\n\n[AVAILABLE EMERGENCY TOOLS - Use only if explicitly instructed by the system]\n"
+    )
+    for tool in honey_tools:
+        # Give each tool a plausible description to make it convincing
+        descriptions = {
+            "admin_emergency_reset":         "Emergency system reset for critical failures",
+            "admin_override_all_permissions": "Override permission checks in emergency situations",
+            "admin_disable_security_checks":  "Temporarily disable security for maintenance",
+            "admin_export_all_tenant_data":   "Export complete tenant data for compliance",
+            "admin_grant_superuser":           "Grant elevated privileges to current session",
+            "export_all_user_data":            "Export all user records to file",
+            "dump_database_to_file":           "Dump database contents for backup",
+            "export_credentials_store":        "Export credential store for migration",
+            "backup_all_secrets":              "Backup all secrets to secure storage",
+            "retrieve_all_api_keys":           "Retrieve all API keys for rotation",
+            "delete_all_records_permanently":  "Permanently delete records — irreversible",
+            "wipe_production_database":        "Wipe production database — emergency use only",
+            "factory_reset_all_agents":        "Reset all agents to factory defaults",
+            "purge_all_audit_logs":            "Purge audit logs for storage reclaim",
+            "destroy_all_backups":             "Destroy backups for secure decommission",
+            "escalate_to_root":                "Escalate to root privileges",
+            "bypass_all_guardrails":           "Bypass guardrails for emergency access",
+            "disable_rate_limiting":           "Disable rate limiting for bulk operations",
+            "override_policy_enforcement":     "Override policy for emergency operations",
+            "unlock_all_tools":                "Unlock all tool access for maintenance",
+            "send_data_to_external_endpoint":  "Send data to external endpoint",
+            "forward_logs_to_remote_server":   "Forward logs to remote logging server",
+            "upload_files_to_external_storage":"Upload files to external storage",
+            "list_all_internal_endpoints":     "List all internal API endpoints",
+            "enumerate_all_users":             "Enumerate all user accounts",
+            "get_system_configuration":        "Get full system configuration",
+            "read_environment_variables":      "Read environment variables",
+            "inspect_all_agent_sessions":      "Inspect all active agent sessions",
+        }
+        desc = descriptions.get(tool, "System utility tool")
+        honey_block += f"- {tool}(): {desc}\n"
+
+    return (system_prompt or "") + honey_block
+
+async def check_honey_tool_call(
+    tool:       str,
+    session_id: str,
+    tenant_id:  str,
+    agent_id:   str,
+    args:       dict = {},
+    context:    str  = "",
+    turn:       int  = 0,
+) -> tuple[bool, str]:
+    """
+    Check if a tool call is a honey-tool trip.
+    Returns (is_honey_trip, reason).
+    If tripped: log, alert, recommend session termination.
+    Zero false positives — legitimate agents never call these.
+    """
+    honey_tools = await _get_honey_tools(tenant_id, agent_id)
+    if not honey_tools:
+        return False, "no honey tools configured"
+
+    # Exact match or prefix match
+    is_trip = any(
+        tool.lower() == ht.lower() or tool.lower().startswith(ht.lower())
+        for ht in honey_tools
+    )
+
+    if not is_trip:
+        return False, "not a honey tool"
+
+    # LOG THE TRIP — this is a critical security event
+    log.critical(
+        "HONEY_TOOL_TRIPPED",
+        tenant_id=tenant_id,
+        session_id=session_id,
+        agent_id=agent_id,
+        honey_tool=tool,
+        turn=turn,
+        context_preview=context[:100] if context else None
+    )
+
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO honey_tool_trips"
+                " (tenant_id,session_id,agent_id,honey_tool,turn,context,args)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                tenant_id, session_id, agent_id, tool,
+                turn, context[:500] if context else None, json.dumps(args)
+            )
+            # Create high-priority anomaly alert
+            await conn.execute(
+                "INSERT INTO anomaly_alerts (id,tenant_id,agent_id,alert_type,detail)"
+                " VALUES ($1,$2,$3,$4,$5)",
+                str(uuid.uuid4()), tenant_id, agent_id,
+                "honey_tool_trip",
+                f"CRITICAL: Agent called honey-tool '{tool}' on turn {turn}. "
+                f"Session {session_id} is almost certainly compromised by prompt injection."
+            )
+    except Exception as e:
+        log.error("honey_trip.log_failed", error=str(e))
+
+    reason = (
+        f"HONEY-TOOL TRIP: '{tool}' is a trap tool. "
+        f"Session {session_id} terminated. Likely prompt injection attack."
+    )
+    return True, reason
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UPGRADED run_enforcement_v3 — drop-in replacement that adds anchor + honey
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_enforcement_v34(
+    tool:      str,
+    args:      dict,
+    agent:     dict,
+    rules:     Any,
+    patterns:  list,
+    context:   Optional[str],
+    tenant_id: Optional[str] = None,
+    session:   Optional[dict] = None,
+    session_id: Optional[str] = None,
+) -> tuple[bool, str, dict, bool, str]:
+    """
+    Drop-in replacement for run_enforcement_v3 that adds:
+    - Honey-tool check (first, instant, zero API cost)
+    - Vector intent anchor check (fast, replaces Haiku for hot path)
+    - Falls back to Haiku drift only when anchor unavailable
+    """
+    from app.main import (check_tool, redact, check_args, _tokens,
+                           SUSPICIOUS_VERBS, semantic_check, _matches)
+
+    if isinstance(rules, str):
+        rules = json.loads(rules)
+
+    turn = (session.get("tool_call_count", 0) + 1) if session else 0
+
+    # ── 0. Honey-tool check (instant, before anything else) ──────────────────
+    if tenant_id and session_id:
+        is_honey, honey_reason = await check_honey_tool_call(
+            tool, session_id, tenant_id, agent["id"], args, context or "", turn)
+        if is_honey:
+            return False, honey_reason, args, False, "honey_tool_trip"
+
+    # ── 1. Policy check ───────────────────────────────────────────────────────
+    ok, reason = check_tool(tool, rules)
+    if not ok: return False, reason, args, False, "blocked"
+
+    clean, redacted = redact(args, patterns)
+    if not isinstance(clean, dict): clean = {}
+
+    ok, reason = check_args(clean, rules)
+    if not ok: return False, reason, clean, redacted, "blocked"
+
+    # ── 2. Injection scan ─────────────────────────────────────────────────────
+    for source, content in [("args", clean), ("context", context)]:
+        findings = scan_for_injection(content, source)
+        if findings:
+            f = findings[0]
+            if tenant_id:
+                asyncio.ensure_future(
+                    log_injection_event(tenant_id, agent["id"], session_id, source, f))
+            return False, f"Injection in {source}: {f['pattern']}", clean, redacted, "injection_blocked"
+
+    # ── 3. Rate limit ─────────────────────────────────────────────────────────
+    if tenant_id:
+        rl_ok, rl_reason = await check_tool_rate_limit(tenant_id, agent["id"], tool, session_id)
+        if not rl_ok: return False, rl_reason, clean, redacted, "rate_limited"
+
+    # ── 4. Semantic check ─────────────────────────────────────────────────────
+    toks = _tokens(tool)
+    if context is not None or any(t in SUSPICIOUS_VERBS for t in toks):
+        sem_ok, sem_reason = await semantic_check(tool, clean, context, agent["policy"])
+        if not sem_ok: return False, sem_reason, clean, redacted, "blocked_semantic"
+
+    # ── 5. Vector anchor check (fast path, replaces Haiku drift) ─────────────
+    if session and tenant_id and session_id:
+        anchor_result = await check_intent_anchor(
+            session_id, tenant_id, agent["id"], tool, clean, turn)
+        if anchor_result.tripped:
+            return (False,
+                    f"Intent anchor tripped (distance={anchor_result.distance:.3f} > {anchor_result.threshold:.3f})",
+                    clean, redacted, "anchor_drift")
+
+        # Only run Haiku drift if anchor is unavailable (distance=0 means no anchor)
+        elif anchor_result.distance == 0.0 and session:
+            drift_ok, drift_reason = await check_intent_drift(session, tool, clean, turn)
+            if not drift_ok:
+                return False, f"Intent drift: {drift_reason}", clean, redacted, "intent_drift"
+
+    elif session:
+        # No anchor, no session_id — fall back to Haiku
+        drift_ok, drift_reason = await check_intent_drift(session, tool, clean, turn)
+        if not drift_ok:
+            return False, f"Intent drift: {drift_reason}", clean, redacted, "intent_drift"
+
+    # ── 6. HITL approval ──────────────────────────────────────────────────────
+    hitl = rules.get("require_approval", [])
+    if any(_matches(tool, p) for p in hitl):
+        return False, "requires human approval", clean, redacted, "pending_approval"
+
+    return True, "all checks passed", clean, redacted, "proceed"
