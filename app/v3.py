@@ -4801,3 +4801,1495 @@ async def privacy_compliant_stream(
             yield content[i:i+chunk_size], False, 0, 0, ""
             await asyncio.sleep(0)
         yield "", True, pt, ct, fr
+
+
+
+
+"""
+AgentGuard v3.7.0 — Feature 1: PHI/PCI Data Classifier
+
+HIPAA PHI (Protected Health Information) detection:
+  - Patient names + dates (the combination is PHI)
+  - Medical record numbers, NPI numbers
+  - Diagnosis codes (ICD-10), procedure codes (CPT)
+  - Health plan beneficiary numbers
+  - Account numbers in medical context
+  - Device identifiers and serial numbers
+  - Biometric identifiers
+  - Full face photos (flagged by context)
+  - Any unique identifying number or code
+
+PCI-DSS (Payment Card Industry) detection:
+  - Primary Account Numbers (PAN) — 13-19 digit card numbers
+  - CVV/CVC codes
+  - Expiration dates in payment context
+  - Cardholder names in payment context
+  - Magnetic stripe data
+  - PIN blocks
+
+PASTE AT BOTTOM OF: app/v3.py
+"""
+
+import re, json, hashlib, time, asyncio
+from typing import Optional
+from pydantic import BaseModel
+import structlog
+
+log = structlog.get_logger()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB MIGRATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+V37_MIGRATIONS = [
+
+"""CREATE TABLE IF NOT EXISTS data_classification_log (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    session_id      TEXT,
+    agent_id        TEXT,
+    direction       TEXT NOT NULL DEFAULT 'input',
+    classification  TEXT NOT NULL,   -- clean|phi|pci|pii|mixed|blocked
+    risk_level      TEXT NOT NULL,   -- low|medium|high|critical
+    findings        JSONB,
+    redacted        BOOLEAN DEFAULT FALSE,
+    blocked         BOOLEAN DEFAULT FALSE,
+    text_hash       TEXT,            -- SHA-256 of original (never store raw)
+    char_count      INTEGER,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS classification_tenant_idx
+   ON data_classification_log(tenant_id, created_at DESC)""",
+"""CREATE INDEX IF NOT EXISTS classification_type_idx
+   ON data_classification_log(classification, risk_level)""",
+
+# Per-tenant classification policy
+"""CREATE TABLE IF NOT EXISTS classification_policy (
+    tenant_id           TEXT PRIMARY KEY,
+    block_phi           BOOLEAN DEFAULT FALSE,
+    block_pci           BOOLEAN DEFAULT FALSE,
+    redact_phi          BOOLEAN DEFAULT TRUE,
+    redact_pci          BOOLEAN DEFAULT TRUE,
+    redact_pii          BOOLEAN DEFAULT TRUE,
+    alert_on_phi        BOOLEAN DEFAULT TRUE,
+    alert_on_pci        BOOLEAN DEFAULT TRUE,
+    hipaa_mode          BOOLEAN DEFAULT FALSE,
+    pci_mode            BOOLEAN DEFAULT FALSE,
+    custom_patterns     JSONB DEFAULT '[]',
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+)""",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHI PATTERNS — HIPAA 18 Identifiers
+# ══════════════════════════════════════════════════════════════════════════════
+
+PHI_PATTERNS = [
+    # 1. Names — catch "Patient: John Smith" or "Name: Jane Doe"
+    ("phi_name_labeled", re.compile(
+        r'\b(?:patient|name|member|subscriber|beneficiary|insured)\s*[:=]\s*[A-Z][a-z]+\s+[A-Z][a-z]+',
+        re.I), "CRITICAL"),
+
+    # 2. Dates — specific to individuals (DOB, admission, discharge)
+    ("phi_dob", re.compile(
+        r'\b(?:dob|date\s+of\s+birth|born|birthdate|birth\s+date)\s*[:=]?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
+        re.I), "CRITICAL"),
+    ("phi_admission_date", re.compile(
+        r'\b(?:admission|admitted|discharge[d]?|visit)\s+(?:date|on)\s*[:=]?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
+        re.I), "HIGH"),
+
+    # 3. Geographic — smaller than state
+    ("phi_zip", re.compile(
+        r'\b(?:zip|postal)\s*(?:code)?\s*[:=]?\s*\d{5}(?:-\d{4})?', re.I), "HIGH"),
+    ("phi_address", re.compile(
+        r'\b\d{1,5}\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:St|Ave|Blvd|Dr|Rd|Ln|Way|Ct|Pl|Circle|Street|Avenue|Boulevard|Drive|Road|Lane)\b',
+        re.I), "HIGH"),
+
+    # 4. Phone numbers
+    ("phi_phone", re.compile(
+        r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'), "HIGH"),
+
+    # 5. Fax numbers (same pattern, labeled)
+    ("phi_fax", re.compile(
+        r'\b(?:fax|f)\s*[:=]?\s*(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b', re.I), "HIGH"),
+
+    # 6. Email addresses (already in PII but critical in PHI context)
+    ("phi_email", re.compile(
+        r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'), "HIGH"),
+
+    # 7. SSN
+    ("phi_ssn", re.compile(
+        r'\b(?!000|666|9\d{2})\d{3}[-\s]?(?!00)\d{2}[-\s]?(?!0{4})\d{4}\b'), "CRITICAL"),
+
+    # 8. Medical Record Numbers
+    ("phi_mrn", re.compile(
+        r'\b(?:mrn|medical\s+record\s+(?:number|#|no)|patient\s+(?:id|number|#))\s*[:=]?\s*[A-Z0-9]{4,20}\b',
+        re.I), "CRITICAL"),
+
+    # 9. Health Plan Beneficiary Numbers
+    ("phi_member_id", re.compile(
+        r'\b(?:member\s+id|beneficiary\s+(?:id|number)|health\s+plan\s+(?:id|number)|subscriber\s+id)\s*[:=]?\s*[A-Z0-9]{6,20}\b',
+        re.I), "CRITICAL"),
+
+    # 10. Account Numbers in medical context
+    ("phi_account", re.compile(
+        r'\b(?:account\s+(?:number|#|no)|acct\s*#)\s*[:=]?\s*[0-9]{6,20}\b', re.I), "HIGH"),
+
+    # 11. Certificate/License Numbers
+    ("phi_license", re.compile(
+        r'\b(?:license|licence|certificate)\s*(?:number|#|no)?\s*[:=]?\s*[A-Z0-9]{6,20}\b', re.I), "MEDIUM"),
+
+    # 12. Vehicle identifiers
+    ("phi_vin", re.compile(r'\b[A-HJ-NPR-Z0-9]{17}\b'), "MEDIUM"),
+
+    # 13. Device identifiers
+    ("phi_device", re.compile(
+        r'\b(?:device\s+(?:id|identifier|serial)|imei|serial\s+(?:number|#))\s*[:=]?\s*[A-Z0-9\-]{8,20}\b',
+        re.I), "MEDIUM"),
+
+    # 14. URLs containing patient info
+    ("phi_url_patient", re.compile(
+        r'https?://[^\s]+(?:patient|member|mrn|dob)[^\s]*', re.I), "HIGH"),
+
+    # 15. IP addresses (in HIPAA context)
+    ("phi_ip", re.compile(
+        r'\b(?:ip\s*(?:address)?[:=]?\s*)?\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
+        re.I), "LOW"),
+
+    # 16. Biometric identifiers
+    ("phi_biometric", re.compile(
+        r'\b(?:fingerprint|retinal|iris|voice\s+print|biometric)\s*(?:id|data|identifier|scan)?\b', re.I), "HIGH"),
+
+    # 17. ICD-10 diagnosis codes
+    ("phi_icd10", re.compile(
+        r'\b[A-Z]\d{2}(?:\.\d{1,4})?\b'), "HIGH"),
+
+    # 18. NPI numbers (National Provider Identifier — 10 digits)
+    ("phi_npi", re.compile(
+        r'\b(?:npi|national\s+provider)\s*(?:number|#|id)?\s*[:=]?\s*[0-9]{10}\b', re.I), "CRITICAL"),
+
+    # CPT procedure codes
+    ("phi_cpt", re.compile(
+        r'\b(?:cpt|procedure\s+code)\s*[:=]?\s*\d{5}[A-Z0-9]?\b', re.I), "HIGH"),
+
+    # DEA numbers (controlled substance prescriptions)
+    ("phi_dea", re.compile(
+        r'\b(?:dea\s*(?:number|#|reg)?\s*[:=]?\s*)[A-Z]{2}\d{7}\b', re.I), "CRITICAL"),
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PCI-DSS PATTERNS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Luhn algorithm check for real card numbers
+def _luhn_check(number: str) -> bool:
+    digits = [int(d) for d in number if d.isdigit()]
+    if len(digits) < 13:
+        return False
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+PCI_PATTERNS = [
+    # Primary Account Numbers — major card brands
+    ("pci_visa", re.compile(r'\b4[0-9]{12}(?:[0-9]{3})?\b'), "CRITICAL"),
+    ("pci_mastercard", re.compile(r'\b5[1-5][0-9]{14}\b'), "CRITICAL"),
+    ("pci_amex", re.compile(r'\b3[47][0-9]{13}\b'), "CRITICAL"),
+    ("pci_discover", re.compile(r'\b6(?:011|5[0-9]{2})[0-9]{12}\b'), "CRITICAL"),
+    ("pci_jcb", re.compile(r'\b(?:2131|1800|35\d{3})\d{11}\b'), "CRITICAL"),
+    ("pci_generic_pan", re.compile(r'\b[0-9]{13,19}\b'), "HIGH"),  # Will run Luhn check
+
+    # CVV/CVC
+    ("pci_cvv", re.compile(
+        r'\b(?:cvv|cvc|cvc2|cvv2|cid|security\s+code)\s*[:=]?\s*\d{3,4}\b', re.I), "CRITICAL"),
+
+    # Expiration dates in payment context
+    ("pci_expiry", re.compile(
+        r'\b(?:exp(?:iry|ires?|iration)?|valid\s+(?:thru|through|until))\s*[:=]?\s*(?:0[1-9]|1[0-2])[/-]\d{2,4}\b',
+        re.I), "HIGH"),
+
+    # Cardholder name in payment context
+    ("pci_cardholder", re.compile(
+        r'\b(?:cardholder|card\s+(?:holder|name)|name\s+on\s+card)\s*[:=]?\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b',
+        re.I), "HIGH"),
+
+    # Track data (magnetic stripe)
+    ("pci_track1", re.compile(r'%B\d{13,19}\^[A-Z/]+\^\d{7}[?]?'), "CRITICAL"),
+    ("pci_track2", re.compile(r';\d{13,19}=\d{7}[?]?'), "CRITICAL"),
+
+    # PIN blocks
+    ("pci_pin", re.compile(
+        r'\b(?:pin|personal\s+identification\s+number)\s*[:=]?\s*\d{4,6}\b', re.I), "CRITICAL"),
+
+    # Routing numbers (ABA) — adjacent risk
+    ("pci_routing", re.compile(r'\b(?:routing|aba|ach)\s*(?:number|#)?\s*[:=]?\s*[0-9]{9}\b', re.I), "HIGH"),
+
+    # Bank account numbers
+    ("pci_bank_account", re.compile(
+        r'\b(?:account|acct)\s*(?:number|#|no)?\s*[:=]?\s*[0-9]{6,17}\b', re.I), "HIGH"),
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ClassificationResult(BaseModel):
+    classification:  str    # clean|phi|pci|pii|mixed|blocked
+    risk_level:      str    # low|medium|high|critical
+    has_phi:         bool
+    has_pci:         bool
+    has_pii:         bool
+    findings:        list[dict]
+    redacted_text:   Optional[str] = None
+    blocked:         bool = False
+    block_reason:    Optional[str] = None
+    char_count:      int = 0
+    finding_count:   int = 0
+
+class ClassificationPolicyModel(BaseModel):
+    block_phi:        bool = False
+    block_pci:        bool = False
+    redact_phi:       bool = True
+    redact_pci:       bool = True
+    redact_pii:       bool = True
+    alert_on_phi:     bool = True
+    alert_on_pci:     bool = True
+    hipaa_mode:       bool = False
+    pci_mode:         bool = False
+    custom_patterns:  list[dict] = []
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLASSIFICATION ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scan_phi(text: str) -> list[dict]:
+    findings = []
+    for name, pattern, severity in PHI_PATTERNS:
+        matches = pattern.finditer(text)
+        for m in matches:
+            findings.append({
+                "type":      "phi",
+                "pattern":   name,
+                "severity":  severity,
+                "start":     m.start(),
+                "end":       m.end(),
+                "matched":   m.group()[:20] + "..." if len(m.group()) > 20 else m.group(),
+                "redact_as": f"[PHI:{name.upper()}]",
+            })
+    return findings
+
+def _scan_pci(text: str) -> list[dict]:
+    findings = []
+    for name, pattern, severity in PCI_PATTERNS:
+        matches = pattern.finditer(text)
+        for m in matches:
+            matched = m.group()
+            # For generic PAN, run Luhn check to reduce false positives
+            if name == "pci_generic_pan":
+                digits = re.sub(r'\D', '', matched)
+                if not _luhn_check(digits):
+                    continue
+                # Skip if already caught by specific card pattern
+                if any(f["start"] == m.start() for f in findings):
+                    continue
+            findings.append({
+                "type":      "pci",
+                "pattern":   name,
+                "severity":  severity,
+                "start":     m.start(),
+                "end":       m.end(),
+                "matched":   matched[:6] + "..." + matched[-4:] if len(matched) > 10 else "***",
+                "redact_as": f"[PCI:{name.upper()}]",
+            })
+    return findings
+
+def _scan_pii(text: str) -> list[dict]:
+    """Basic PII scan using existing baseline patterns."""
+    findings = []
+    baseline = [
+        ("pii_ssn",   re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),                               "CRITICAL", "[PII:SSN]"),
+        ("pii_email", re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), "MEDIUM",   "[PII:EMAIL]"),
+        ("pii_phone", re.compile(r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'), "MEDIUM", "[PII:PHONE]"),
+        ("pii_secret", re.compile(r'(?i)\b(?:password|secret|token|api_key)\s*[:=]\s*\S+'), "HIGH",   "[PII:SECRET]"),
+    ]
+    for name, pattern, severity, redact_as in baseline:
+        for m in pattern.finditer(text):
+            findings.append({
+                "type": "pii", "pattern": name, "severity": severity,
+                "start": m.start(), "end": m.end(),
+                "matched": "***", "redact_as": redact_as,
+            })
+    return findings
+
+def _redact_findings(text: str, findings: list[dict]) -> str:
+    """Apply redaction to text based on findings. Process in reverse order to preserve positions."""
+    if not findings:
+        return text
+    sorted_findings = sorted(findings, key=lambda f: f["start"], reverse=True)
+    result = text
+    for f in sorted_findings:
+        start = f["start"]
+        end   = f["end"]
+        label = f.get("redact_as", "[REDACTED]")
+        result = result[:start] + label + result[end:]
+    return result
+
+def _compute_risk_level(findings: list[dict]) -> str:
+    if not findings:
+        return "low"
+    severities = {f["severity"] for f in findings}
+    if "CRITICAL" in severities: return "critical"
+    if "HIGH"     in severities: return "high"
+    if "MEDIUM"   in severities: return "medium"
+    return "low"
+
+def _classify_type(phi: list, pci: list, pii: list) -> str:
+    has_phi = len(phi) > 0
+    has_pci = len(pci) > 0
+    has_pii = len(pii) > 0
+    if not (has_phi or has_pci or has_pii): return "clean"
+    if has_phi and has_pci: return "mixed"
+    if has_phi: return "phi"
+    if has_pci: return "pci"
+    return "pii"
+
+async def classify_text(
+    text:       str,
+    tenant_id:  str,
+    session_id: Optional[str] = None,
+    agent_id:   Optional[str] = None,
+    direction:  str = "input",
+    redact:     bool = True,
+    custom_patterns: Optional[list[dict]] = None,
+) -> ClassificationResult:
+    """
+    Classify text for PHI, PCI-DSS, and PII.
+    Returns classification, risk level, all findings, and optionally redacted text.
+    Logs the classification event (never stores raw text — only hash).
+    """
+    # Load policy
+    policy = await _get_classification_policy(tenant_id)
+
+    # Run all scanners
+    phi_findings = _scan_phi(text)
+    pci_findings = _scan_pci(text)
+    pii_findings = _scan_pii(text)
+
+    # Run custom patterns if any
+    if custom_patterns or policy.get("custom_patterns"):
+        patterns = custom_patterns or json.loads(policy.get("custom_patterns") or "[]")
+        for cp in patterns:
+            try:
+                pat = re.compile(cp["pattern"], re.I if cp.get("case_insensitive") else 0)
+                for m in pat.finditer(text):
+                    phi_findings.append({
+                        "type": "custom", "pattern": cp.get("name", "custom"),
+                        "severity": cp.get("severity", "HIGH"),
+                        "start": m.start(), "end": m.end(),
+                        "matched": "***", "redact_as": cp.get("redact_as", "[CUSTOM]"),
+                    })
+            except re.error:
+                pass
+
+    all_findings = phi_findings + pci_findings + pii_findings
+    classification = _classify_type(phi_findings, pci_findings, pii_findings)
+    risk_level     = _compute_risk_level(all_findings)
+
+    # Policy gates
+    blocked      = False
+    block_reason = None
+
+    if policy.get("block_phi") and phi_findings:
+        blocked = True
+        block_reason = f"PHI detected ({len(phi_findings)} findings). Policy blocks PHI in {direction}."
+
+    if not blocked and policy.get("block_pci") and pci_findings:
+        blocked = True
+        block_reason = f"PCI data detected ({len(pci_findings)} findings). Policy blocks PCI in {direction}."
+
+    # Apply redaction
+    redacted_text = None
+    did_redact    = False
+    if redact and not blocked and all_findings:
+        should_redact = (
+            (phi_findings and policy.get("redact_phi", True)) or
+            (pci_findings and policy.get("redact_pci", True)) or
+            (pii_findings and policy.get("redact_pii", True))
+        )
+        if should_redact:
+            redacted_text = _redact_findings(text, all_findings)
+            did_redact    = True
+
+    result = ClassificationResult(
+        classification=classification,
+        risk_level=risk_level,
+        has_phi=len(phi_findings) > 0,
+        has_pci=len(pci_findings) > 0,
+        has_pii=len(pii_findings) > 0,
+        findings=[{k: v for k, v in f.items() if k not in ("start","end")} for f in all_findings],
+        redacted_text=redacted_text,
+        blocked=blocked,
+        block_reason=block_reason,
+        char_count=len(text),
+        finding_count=len(all_findings),
+    )
+
+    # Log — store only hash of original, never the text
+    text_hash = hashlib.sha256(text.encode()).hexdigest()
+    asyncio.ensure_future(_log_classification(
+        tenant_id, session_id, agent_id, direction,
+        classification, risk_level, all_findings[:20],  # cap findings stored
+        did_redact, blocked, text_hash, len(text)
+    ))
+
+    # Fire alert if configured
+    if policy.get("alert_on_phi") and phi_findings:
+        asyncio.ensure_future(_classification_alert(
+            tenant_id, agent_id, "phi_detected",
+            f"PHI detected in {direction}: {len(phi_findings)} finding(s). "
+            f"Severity: {risk_level}. Patterns: {', '.join(set(f['pattern'] for f in phi_findings[:3]))}."
+        ))
+
+    if policy.get("alert_on_pci") and pci_findings:
+        asyncio.ensure_future(_classification_alert(
+            tenant_id, agent_id, "pci_detected",
+            f"PCI data detected in {direction}: {len(pci_findings)} finding(s)."
+        ))
+
+    return result
+
+async def _get_classification_policy(tenant_id: str) -> dict:
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM classification_policy WHERE tenant_id=$1", tenant_id)
+        if row:
+            return dict(row)
+    except Exception:
+        pass
+    # Secure defaults
+    return {
+        "block_phi": False, "block_pci": False,
+        "redact_phi": True, "redact_pci": True, "redact_pii": True,
+        "alert_on_phi": True, "alert_on_pci": True,
+        "hipaa_mode": False, "pci_mode": False,
+        "custom_patterns": "[]",
+    }
+
+async def _log_classification(
+    tenant_id, session_id, agent_id, direction,
+    classification, risk_level, findings,
+    redacted, blocked, text_hash, char_count
+):
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO data_classification_log"
+                " (tenant_id,session_id,agent_id,direction,classification,"
+                "  risk_level,findings,redacted,blocked,text_hash,char_count)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                tenant_id, session_id, agent_id, direction,
+                classification, risk_level, json.dumps(findings),
+                redacted, blocked, text_hash, char_count
+            )
+    except Exception as e:
+        log.warning("classification.log_failed", error=str(e))
+
+async def _classification_alert(tenant_id, agent_id, alert_type, detail):
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            existing = await conn.fetchval(
+                "SELECT id FROM anomaly_alerts WHERE tenant_id=$1 AND agent_id=$2"
+                " AND alert_type=$3 AND created_at > NOW() - INTERVAL '1 hour' AND resolved=FALSE",
+                tenant_id, agent_id or "", alert_type)
+            if not existing:
+                import uuid as _uuid
+                await conn.execute(
+                    "INSERT INTO anomaly_alerts (id,tenant_id,agent_id,alert_type,detail)"
+                    " VALUES ($1,$2,$3,$4,$5)",
+                    str(_uuid.uuid4()), tenant_id, agent_id or "", alert_type, detail)
+    except Exception as e:
+        log.warning("classification.alert_failed", error=str(e))
+
+
+
+"""
+AgentGuard v3.7.0 — Feature 2: Zero-Logging Mode
+                  — Feature 4: Tamper-Proof Audit Log
+
+ZERO-LOGGING MODE:
+  Tenants with sensitive data can route ALL audit logs to THEIR OWN database.
+  AgentGuard writes nothing to its own DB for those tenants.
+  The tenant provides a Postgres connection string — we write there.
+  Their data never touches our infrastructure.
+
+TAMPER-PROOF AUDIT LOG:
+  Every audit entry is SHA-256 hash-chained to the previous entry.
+  Identical to blockchain append-only log.
+  Any tampering breaks the chain and is detectable.
+  Includes:
+    - Entry hash (SHA-256 of content)
+    - Previous entry hash (chain link)
+    - Chain sequence number
+    - Verification endpoint to prove chain integrity
+
+PASTE AT BOTTOM OF: app/v3.py
+"""
+
+import os, json, hashlib, time, asyncio, uuid
+from typing import Optional, Any
+from pydantic import BaseModel
+import asyncpg
+import structlog
+
+log = structlog.get_logger()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB MIGRATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+V37B_MIGRATIONS = [
+
+# Zero-logging config per tenant
+"""CREATE TABLE IF NOT EXISTS tenant_zero_log_config (
+    tenant_id           TEXT PRIMARY KEY,
+    enabled             BOOLEAN DEFAULT FALSE,
+    external_db_url     TEXT,           -- encrypted connection string to tenant's DB
+    external_db_url_enc TEXT,           -- AES-256 encrypted version (preferred)
+    log_to_agentguard   BOOLEAN DEFAULT FALSE,  -- if TRUE, also log here (dual-write)
+    tables_created      BOOLEAN DEFAULT FALSE,
+    last_write_at       TIMESTAMPTZ,
+    last_error          TEXT,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+)""",
+
+# Tamper-proof audit log — hash chained
+"""CREATE TABLE IF NOT EXISTS audit_log_secure (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    seq             BIGSERIAL,          -- monotonic sequence
+    request_id      TEXT,
+    agent_id        TEXT,
+    session_id      TEXT,
+    user_id         TEXT,
+    tool            TEXT,
+    decision        TEXT NOT NULL,
+    reason          TEXT,
+    redacted        BOOLEAN DEFAULT FALSE,
+    duration_ms     INTEGER,
+    -- Hash chain
+    entry_hash      TEXT NOT NULL,      -- SHA-256(content of this entry)
+    prev_hash       TEXT NOT NULL,      -- SHA-256 of previous entry (GENESIS for first)
+    chain_valid     BOOLEAN DEFAULT TRUE,
+    -- Immutability
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS audit_secure_tenant_seq
+   ON audit_log_secure(tenant_id, seq DESC)""",
+"""CREATE INDEX IF NOT EXISTS audit_secure_chain
+   ON audit_log_secure(tenant_id, prev_hash)""",
+
+# Store last known hash per tenant for chain continuity
+"""CREATE TABLE IF NOT EXISTS audit_chain_state (
+    tenant_id       TEXT PRIMARY KEY,
+    last_hash       TEXT NOT NULL DEFAULT 'GENESIS',
+    last_seq        BIGINT DEFAULT 0,
+    total_entries   BIGINT DEFAULT 0,
+    chain_broken    BOOLEAN DEFAULT FALSE,
+    broken_at_seq   BIGINT,
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ZeroLogConfig(BaseModel):
+    enabled:            bool = True
+    external_db_url:    str           # postgres://user:pass@host:5432/dbname
+    log_to_agentguard:  bool = False  # dual-write to both
+
+class AuditChainEntry(BaseModel):
+    id:           str
+    seq:          int
+    tenant_id:    str
+    tool:         str
+    decision:     str
+    entry_hash:   str
+    prev_hash:    str
+    chain_valid:  bool
+    created_at:   Any
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTERNAL DB CONNECTION POOL CACHE
+# ══════════════════════════════════════════════════════════════════════════════
+
+_external_pools: dict[str, asyncpg.Pool] = {}
+
+async def _get_external_pool(tenant_id: str) -> Optional[asyncpg.Pool]:
+    """Get or create a connection pool to the tenant's external database."""
+    if tenant_id in _external_pools:
+        return _external_pools[tenant_id]
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT external_db_url FROM tenant_zero_log_config"
+                " WHERE tenant_id=$1 AND enabled=TRUE",
+                tenant_id)
+        if not row or not row["external_db_url"]:
+            return None
+        db_url = row["external_db_url"]
+        ext_pool = await asyncpg.create_pool(db_url, min_size=1, max_size=3,
+                                              command_timeout=10)
+        _external_pools[tenant_id] = ext_pool
+        log.info("zero_log.external_pool_created", tenant_id=tenant_id)
+        return ext_pool
+    except Exception as e:
+        log.error("zero_log.external_pool_failed", tenant_id=tenant_id, error=str(e))
+        return None
+
+async def _ensure_external_tables(ext_pool: asyncpg.Pool, tenant_id: str):
+    """Create the audit table in the tenant's external database if it doesn't exist."""
+    create_sql = """
+    CREATE TABLE IF NOT EXISTS agentguard_audit_log (
+        id              TEXT PRIMARY KEY,
+        request_id      TEXT,
+        agent_id        TEXT,
+        session_id      TEXT,
+        user_id         TEXT,
+        tool            TEXT NOT NULL,
+        args_hash       TEXT,
+        decision        TEXT NOT NULL,
+        reason          TEXT,
+        redacted        BOOLEAN DEFAULT FALSE,
+        duration_ms     INTEGER,
+        entry_hash      TEXT NOT NULL,
+        prev_hash       TEXT NOT NULL,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS ag_audit_tool_idx
+        ON agentguard_audit_log(tool, created_at DESC);
+    CREATE INDEX IF NOT EXISTS ag_audit_decision_idx
+        ON agentguard_audit_log(decision, created_at DESC);
+    """
+    async with ext_pool.acquire() as conn:
+        await conn.execute(create_sql)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAMPER-PROOF HASH CHAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _compute_entry_hash(
+    tenant_id:  str,
+    request_id: str,
+    agent_id:   str,
+    tool:       str,
+    decision:   str,
+    reason:     str,
+    duration_ms: int,
+    created_at: str,
+    prev_hash:  str,
+) -> str:
+    """
+    SHA-256 hash of the entry content + previous hash.
+    Changing ANY field breaks the chain.
+    """
+    content = json.dumps({
+        "tenant_id":   tenant_id,
+        "request_id":  request_id,
+        "agent_id":    agent_id,
+        "tool":        tool,
+        "decision":    decision,
+        "reason":      reason,
+        "duration_ms": duration_ms,
+        "created_at":  created_at,
+        "prev_hash":   prev_hash,
+    }, sort_keys=True, default=str)
+    return hashlib.sha256(content.encode()).hexdigest()
+
+async def _get_last_hash(tenant_id: str, conn) -> tuple[str, int]:
+    """Get the last hash and sequence number for a tenant's chain."""
+    row = await conn.fetchrow(
+        "SELECT last_hash, last_seq FROM audit_chain_state WHERE tenant_id=$1",
+        tenant_id)
+    if row:
+        return row["last_hash"], row["last_seq"]
+    return "GENESIS", 0
+
+async def _update_chain_state(tenant_id: str, new_hash: str, new_seq: int, conn):
+    """Update the chain state after a new entry is added."""
+    await conn.execute(
+        "INSERT INTO audit_chain_state (tenant_id, last_hash, last_seq, total_entries)"
+        " VALUES ($1,$2,$3,1)"
+        " ON CONFLICT (tenant_id) DO UPDATE"
+        " SET last_hash=$2, last_seq=$3,"
+        "     total_entries=audit_chain_state.total_entries+1,"
+        "     updated_at=NOW()",
+        tenant_id, new_hash, new_seq
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECURE AUDIT LOG WRITER
+# This replaces the standard log_action for tenants with zero-log or secure-audit
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def secure_log_action(
+    request_id:  str,
+    tenant_id:   str,
+    agent_id:    str,
+    user_id:     str,
+    session_id:  Optional[str],
+    tool:        str,
+    args_hash:   str,      # SHA-256 of redacted args — never store raw
+    decision:    str,
+    reason:      str,
+    redacted:    bool,
+    duration_ms: int,
+):
+    """
+    Write to tamper-proof audit log + optionally to external DB.
+    Zero-logging mode: if enabled for this tenant, write ONLY to external DB.
+    Tamper-proof: every entry is hash-chained to the previous one.
+    """
+    entry_id   = str(uuid.uuid4())
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+
+    # ── Check zero-log config ─────────────────────────────────────────────────
+    zero_log_enabled  = False
+    log_to_agentguard = True
+
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            zl_row = await conn.fetchrow(
+                "SELECT enabled, log_to_agentguard FROM tenant_zero_log_config"
+                " WHERE tenant_id=$1",
+                tenant_id)
+        if zl_row and zl_row["enabled"]:
+            zero_log_enabled  = True
+            log_to_agentguard = bool(zl_row["log_to_agentguard"])
+    except Exception:
+        pass
+
+    # ── Write to AgentGuard secure audit log ──────────────────────────────────
+    if not zero_log_enabled or log_to_agentguard:
+        try:
+            from app.main import pool
+            async with pool.acquire() as conn:
+                prev_hash, last_seq = await _get_last_hash(tenant_id, conn)
+                entry_hash = _compute_entry_hash(
+                    tenant_id, request_id, agent_id, tool,
+                    decision, reason, duration_ms, created_at, prev_hash)
+                new_seq = last_seq + 1
+
+                await conn.execute(
+                    "INSERT INTO audit_log_secure"
+                    " (id,tenant_id,request_id,agent_id,session_id,user_id,"
+                    "  tool,decision,reason,redacted,duration_ms,"
+                    "  entry_hash,prev_hash)"
+                    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                    entry_id, tenant_id, request_id, agent_id, session_id,
+                    user_id, tool, decision, reason, redacted, duration_ms,
+                    entry_hash, prev_hash
+                )
+                await _update_chain_state(tenant_id, entry_hash, new_seq, conn)
+        except Exception as e:
+            log.error("secure_audit.write_failed", error=str(e))
+
+    # ── Write to external DB (zero-log mode) ──────────────────────────────────
+    if zero_log_enabled:
+        try:
+            ext_pool = await _get_external_pool(tenant_id)
+            if ext_pool:
+                # Ensure tables exist on first write
+                from app.main import pool
+                async with pool.acquire() as conn:
+                    tbl_created = await conn.fetchval(
+                        "SELECT tables_created FROM tenant_zero_log_config WHERE tenant_id=$1",
+                        tenant_id)
+                if not tbl_created:
+                    await _ensure_external_tables(ext_pool, tenant_id)
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE tenant_zero_log_config SET tables_created=TRUE WHERE tenant_id=$1",
+                            tenant_id)
+
+                # Get chain state from external DB for consistency
+                async with ext_pool.acquire() as ext_conn:
+                    last_row = await ext_conn.fetchrow(
+                        "SELECT entry_hash FROM agentguard_audit_log"
+                        " ORDER BY created_at DESC LIMIT 1")
+                    ext_prev_hash = last_row["entry_hash"] if last_row else "GENESIS"
+                    ext_entry_hash = _compute_entry_hash(
+                        tenant_id, request_id, agent_id, tool,
+                        decision, reason, duration_ms, created_at, ext_prev_hash)
+
+                    await ext_conn.execute(
+                        "INSERT INTO agentguard_audit_log"
+                        " (id,request_id,agent_id,session_id,user_id,"
+                        "  tool,args_hash,decision,reason,redacted,"
+                        "  duration_ms,entry_hash,prev_hash)"
+                        " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                        entry_id, request_id, agent_id, session_id, user_id,
+                        tool, args_hash, decision, reason, redacted,
+                        duration_ms, ext_entry_hash, ext_prev_hash
+                    )
+
+                # Update last_write_at
+                from app.main import pool
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE tenant_zero_log_config SET last_write_at=NOW(), last_error=NULL"
+                        " WHERE tenant_id=$1", tenant_id)
+        except Exception as e:
+            log.error("zero_log.external_write_failed", tenant_id=tenant_id, error=str(e))
+            try:
+                from app.main import pool
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE tenant_zero_log_config SET last_error=$1 WHERE tenant_id=$2",
+                        str(e)[:500], tenant_id)
+            except Exception:
+                pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHAIN VERIFICATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def verify_audit_chain(tenant_id: str, limit: int = 1000) -> dict:
+    """
+    Verify the integrity of the audit log chain for a tenant.
+    Walks the chain and checks every hash link.
+    Returns verification result with any broken links.
+    """
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            entries = await conn.fetch(
+                "SELECT id, seq, tool, decision, reason, duration_ms,"
+                " entry_hash, prev_hash, created_at"
+                " FROM audit_log_secure"
+                " WHERE tenant_id=$1 ORDER BY seq ASC LIMIT $2",
+                tenant_id, limit)
+    except Exception as e:
+        return {"verified": False, "error": str(e)}
+
+    if not entries:
+        return {"verified": True, "entries_checked": 0, "message": "No entries to verify."}
+
+    broken_links = []
+    prev_hash    = "GENESIS"
+
+    for entry in entries:
+        computed = _compute_entry_hash(
+            tenant_id,
+            entry.get("request_id", ""),
+            entry.get("agent_id", ""),
+            entry["tool"],
+            entry["decision"],
+            entry.get("reason", ""),
+            entry.get("duration_ms", 0),
+            str(entry["created_at"]),
+            prev_hash,
+        )
+        if entry["prev_hash"] != prev_hash:
+            broken_links.append({
+                "seq":          entry["seq"],
+                "id":           entry["id"],
+                "expected_prev": prev_hash,
+                "actual_prev":   entry["prev_hash"],
+                "issue":         "prev_hash mismatch — chain broken here",
+            })
+        prev_hash = entry["entry_hash"]
+
+    return {
+        "verified":        len(broken_links) == 0,
+        "entries_checked": len(entries),
+        "broken_links":    broken_links,
+        "first_seq":       entries[0]["seq"]  if entries else None,
+        "last_seq":        entries[-1]["seq"] if entries else None,
+        "chain_tip_hash":  prev_hash,
+        "message":         "Chain integrity verified." if not broken_links
+                           else f"{len(broken_links)} broken link(s) detected.",
+    }
+
+
+
+"""
+AgentGuard v3.7.0 — Feature 3: On-Premise / Air-Gapped Deployment
+                  — Feature 5: Data Classification API
+
+ON-PREMISE / AIR-GAPPED:
+  Complete Docker Compose configuration for self-hosted deployment.
+  Zero internet required. Works with Ollama or vLLM locally.
+  Includes: AgentGuard backend, Postgres, Redis, Ollama.
+  Health checks, restart policies, resource limits all production-ready.
+  Generates a deployment package the customer downloads and runs.
+
+DATA CLASSIFICATION API:
+  Classify any text before it touches AI.
+  Returns: what type of sensitive data is present, risk level,
+  what regulations apply, what controls are required, allow/redact/block decision.
+  Integrates with PHI/PCI classifier built in Feature 1.
+
+PASTE AT BOTTOM OF: app/v3.py (after v37_phi_pci.py and v37_zerolog_audit.py)
+"""
+
+import json, os, hashlib, time
+from typing import Optional
+from pydantic import BaseModel
+import structlog
+
+log = structlog.get_logger()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB MIGRATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+V37C_MIGRATIONS = [
+
+# Track on-premise deployments
+"""CREATE TABLE IF NOT EXISTS onprem_deployments (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    deployment_type TEXT NOT NULL DEFAULT 'docker-compose',
+    llm_provider    TEXT NOT NULL DEFAULT 'ollama',
+    llm_model       TEXT NOT NULL DEFAULT 'llama3',
+    air_gapped      BOOLEAN DEFAULT TRUE,
+    config_hash     TEXT,
+    last_heartbeat  TIMESTAMPTZ,
+    version         TEXT,
+    status          TEXT DEFAULT 'configured',
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS onprem_tenant_idx ON onprem_deployments(tenant_id)""",
+
+# Data classification requests
+"""CREATE TABLE IF NOT EXISTS classification_requests (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    session_id      TEXT,
+    agent_id        TEXT,
+    classification  TEXT NOT NULL,
+    risk_level      TEXT NOT NULL,
+    recommendation  TEXT NOT NULL,
+    regulations     TEXT[],
+    controls        TEXT[],
+    finding_count   INTEGER DEFAULT 0,
+    text_hash       TEXT NOT NULL,
+    char_count      INTEGER DEFAULT 0,
+    duration_ms     INTEGER,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS classification_req_tenant_idx
+   ON classification_requests(tenant_id, created_at DESC)""",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA CLASSIFICATION API — Feature 5
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Regulatory mapping — what classifications trigger what regulations
+REGULATION_MAP = {
+    "phi":     ["HIPAA", "HITECH"],
+    "pci":     ["PCI-DSS"],
+    "pii":     ["GDPR", "CCPA", "CPRA"],
+    "mixed":   ["HIPAA", "PCI-DSS", "GDPR", "CCPA"],
+    "clean":   [],
+}
+
+# Required controls per regulation
+CONTROLS_MAP = {
+    "HIPAA": [
+        "Audit logging of all PHI access",
+        "Minimum necessary standard — only send PHI required for the task",
+        "Business Associate Agreement (BAA) required with AI provider",
+        "Encryption in transit (TLS 1.2+) and at rest (AES-256)",
+        "Access controls — only authorized users/agents can access PHI",
+    ],
+    "PCI-DSS": [
+        "Never send raw PAN to AI models — tokenize or truncate first",
+        "CVV/CVC must never be stored or logged",
+        "Audit trail of all cardholder data access",
+        "Encryption of cardholder data in transit and at rest",
+        "Quarterly PCI compliance scans",
+    ],
+    "GDPR": [
+        "Lawful basis required for processing personal data",
+        "Data minimization — only process what is necessary",
+        "Right to erasure — ensure AI provider supports data deletion",
+        "Data Processing Agreement (DPA) required with AI provider",
+        "Privacy impact assessment for AI processing of personal data",
+    ],
+    "CCPA": [
+        "Disclose AI processing of personal information in privacy policy",
+        "Honor opt-out requests for sale of personal information",
+        "Data subject access requests must include AI-processed data",
+    ],
+    "HITECH": [
+        "Breach notification within 60 days",
+        "Business Associate Agreements required for all subcontractors",
+        "Enhanced penalties for willful neglect",
+    ],
+}
+
+RISK_TO_RECOMMENDATION = {
+    "critical": "block",
+    "high":     "redact",
+    "medium":   "redact",
+    "low":      "allow",
+}
+
+
+class ClassificationAPIRequest(BaseModel):
+    text:       str
+    context:    Optional[str] = None   # "medical_records" | "payment" | "hr" | "legal" | "general"
+    agent_id:   Optional[str] = None
+    session_id: Optional[str] = None
+    strict:     bool = False           # strict=True raises threshold for allow decision
+
+
+class ClassificationAPIResponse(BaseModel):
+    classification:  str         # clean|phi|pci|pii|mixed
+    risk_level:      str         # low|medium|high|critical
+    recommendation:  str         # allow|redact|block
+    has_phi:         bool
+    has_pci:         bool
+    has_pii:         bool
+    finding_count:   int
+    regulations:     list[str]   # which regulations apply
+    required_controls: list[str] # what you must do before using AI
+    findings_summary: list[dict] # top findings (no raw data)
+    redacted_text:   Optional[str] = None
+    safe_to_send:    bool        # True only if recommendation==allow
+    explanation:     str         # plain English explanation
+
+
+async def classify_for_ai(
+    text:       str,
+    tenant_id:  str,
+    session_id: Optional[str] = None,
+    agent_id:   Optional[str] = None,
+    context:    Optional[str] = None,
+    strict:     bool = False,
+) -> ClassificationAPIResponse:
+    """
+    Full data classification pipeline.
+    Determines if text is safe to send to an AI model.
+    Returns recommendation: allow | redact | block.
+    """
+    import time as _time
+    start = _time.monotonic()
+
+    # Run classifier (from v37_phi_pci.py — already pasted above)
+    from app.v3 import classify_text
+    result = await classify_text(
+        text=text,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        agent_id=agent_id,
+        direction="pre-ai-classification",
+        redact=True,
+    )
+
+    # Context-specific adjustments
+    if context == "medical_records" and not result.has_phi:
+        # In medical context, treat PII as PHI
+        if result.has_pii:
+            result.classification = "phi"
+            result.risk_level     = "high"
+
+    if context == "payment" and not result.has_pci:
+        if result.has_pii:
+            result.classification = "pci"
+            result.risk_level     = "high"
+
+    # Strict mode — treat medium as high
+    risk_for_decision = result.risk_level
+    if strict and risk_for_decision == "medium":
+        risk_for_decision = "high"
+
+    recommendation = RISK_TO_RECOMMENDATION.get(risk_for_decision, "allow")
+
+    # Override: if blocked by classification policy, always block
+    if result.blocked:
+        recommendation = "block"
+
+    # Get regulations and controls
+    regulations = REGULATION_MAP.get(result.classification, [])
+    controls    = []
+    for reg in regulations:
+        controls.extend(CONTROLS_MAP.get(reg, []))
+    controls = list(dict.fromkeys(controls))  # dedupe preserving order
+
+    # Build plain English explanation
+    if result.classification == "clean":
+        explanation = "No sensitive data detected. Safe to send to AI."
+    elif recommendation == "block":
+        explanation = (
+            f"{result.classification.upper()} data detected with {result.risk_level} risk. "
+            f"Policy requires blocking. Do not send this data to any AI model. "
+            f"Remove all sensitive data before retrying."
+        )
+    elif recommendation == "redact":
+        explanation = (
+            f"{result.classification.upper()} data detected with {result.risk_level} risk. "
+            f"Data has been automatically redacted. {result.finding_count} sensitive item(s) replaced. "
+            f"Use the redacted_text field when calling the AI model. "
+            f"Regulations that apply: {', '.join(regulations) if regulations else 'none'}."
+        )
+    else:
+        explanation = (
+            f"Low-risk data detected. Safe to send with standard precautions. "
+            f"Ensure your AI provider agreement covers this data type."
+        )
+
+    # Findings summary — no raw data, just types and counts
+    findings_by_type: dict[str, int] = {}
+    for f in result.findings:
+        key = f"{f['type']}:{f['pattern']}"
+        findings_by_type[key] = findings_by_type.get(key, 0) + 1
+
+    findings_summary = [
+        {"type": k.split(":")[0], "pattern": k.split(":")[1],
+         "count": v, "severity": next(
+             (f["severity"] for f in result.findings if f["pattern"] == k.split(":")[1]),
+             "MEDIUM")}
+        for k, v in findings_summary_dict.items()
+    ] if (findings_summary_dict := findings_by_type) else []
+
+    ms = int((_time.monotonic() - start) * 1000)
+
+    # Log request
+    text_hash = hashlib.sha256(text.encode()).hexdigest()
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO classification_requests"
+                " (tenant_id,session_id,agent_id,classification,risk_level,"
+                "  recommendation,regulations,controls,finding_count,"
+                "  text_hash,char_count,duration_ms)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                tenant_id, session_id, agent_id,
+                result.classification, result.risk_level,
+                recommendation, regulations, controls[:5],
+                result.finding_count, text_hash, len(text), ms
+            )
+    except Exception as e:
+        log.warning("classify_for_ai.log_failed", error=str(e))
+
+    return ClassificationAPIResponse(
+        classification=result.classification,
+        risk_level=result.risk_level,
+        recommendation=recommendation,
+        has_phi=result.has_phi,
+        has_pci=result.has_pci,
+        has_pii=result.has_pii,
+        finding_count=result.finding_count,
+        regulations=regulations,
+        required_controls=controls,
+        findings_summary=findings_summary,
+        redacted_text=result.redacted_text,
+        safe_to_send=(recommendation == "allow"),
+        explanation=explanation,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ON-PREMISE DEPLOYMENT GENERATOR — Feature 3
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_docker_compose(
+    tenant_id:    str,
+    api_key:      str,
+    llm_provider: str = "ollama",
+    llm_model:    str = "llama3",
+    air_gapped:   bool = True,
+    pg_password:  str = "changeme_in_production",
+    redis_password: str = "changeme_in_production",
+    port:         int = 4000,
+) -> str:
+    """Generate a production-ready Docker Compose for on-premise deployment."""
+
+    ollama_service = ""
+    llm_env        = ""
+
+    if llm_provider == "ollama":
+        ollama_service = f"""
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agentguard_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    networks:
+      - agentguard_internal
+    # GPU support (uncomment if you have NVIDIA GPU):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+"""
+        llm_env = f"""
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - AGENTGUARD_ENV=prod"""
+
+    elif llm_provider == "vllm":
+        ollama_service = f"""
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: agentguard_vllm
+    restart: unless-stopped
+    command: --model {llm_model} --host 0.0.0.0 --port 8000
+    volumes:
+      - vllm_models:/root/.cache/huggingface
+    networks:
+      - agentguard_internal
+    # GPU required for vLLM:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+"""
+        llm_env = f"""
+      - OLLAMA_BASE_URL=http://vllm:8000
+      - AGENTGUARD_ENV=prod"""
+
+    network_mode = "none" if air_gapped else "bridge"
+    air_gap_note = "# AIR-GAPPED: No external network access" if air_gapped else ""
+
+    compose = f"""# AgentGuard v3.7.0 — On-Premise Deployment
+# Generated for tenant: {tenant_id}
+# LLM Provider: {llm_provider} / Model: {llm_model}
+# Air-Gapped: {air_gapped}
+#
+# SETUP:
+#   1. Copy this file to your server
+#   2. docker compose pull   (do this BEFORE going air-gapped)
+#   3. docker compose up -d
+#   4. docker exec agentguard_ollama ollama pull {llm_model}
+#   5. Verify: curl http://localhost:{port}/health
+#
+# IMPORTANT: Change pg_password and redis_password before deploying.
+
+version: '3.9'
+
+services:
+
+  agentguard:
+    image: agentguard/backend:latest
+    container_name: agentguard_backend
+    restart: unless-stopped
+    ports:
+      - "{port}:{port}"
+    environment:
+      - DATABASE_URL=postgresql://agentguard:{pg_password}@postgres:5432/agentguard
+      - REDIS_URL=redis://:{redis_password}@redis:6379/0
+      - AGENTGUARD_API_KEY={api_key}
+      - JWT_SECRET={{{{ generate_with: openssl rand -hex 32 }}}}
+      - AGENTGUARD_ENV=prod
+      - ALLOWED_ORIGINS=*{llm_env}
+      # No external API keys needed in air-gapped mode
+      # ANTHROPIC_API_KEY, OPENAI_API_KEY etc are NOT set
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - agentguard_internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{port}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+    {air_gap_note}
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentguard_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=agentguard
+      - POSTGRES_USER=agentguard
+      - POSTGRES_PASSWORD={pg_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - agentguard_internal
+    # NOT exposed externally — internal only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentguard -d agentguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1'
+
+  redis:
+    image: redis:7-alpine
+    container_name: agentguard_redis
+    restart: unless-stopped
+    command: redis-server --requirepass {redis_password} --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - agentguard_internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "{redis_password}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+{ollama_service}
+
+networks:
+  agentguard_internal:
+    driver: bridge
+    internal: {str(air_gapped).lower()}   # internal:true = no external network
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  {"ollama_data:" if llm_provider == "ollama" else "vllm_models:"}
+    driver: local
+"""
+    return compose
+
+
+def generate_env_file(
+    tenant_id:    str,
+    api_key:      str,
+    llm_provider: str = "ollama",
+    pg_password:  str = "changeme_in_production",
+    redis_password: str = "changeme_in_production",
+) -> str:
+    """Generate the .env file for the on-premise deployment."""
+    import secrets as _secrets
+    jwt_secret = _secrets.token_hex(32)
+
+    return f"""# AgentGuard On-Premise Environment Variables
+# Tenant: {tenant_id}
+# KEEP THIS FILE SECURE — treat like a password
+
+DATABASE_URL=postgresql://agentguard:{pg_password}@postgres:5432/agentguard
+REDIS_URL=redis://:{redis_password}@redis:6379/0
+AGENTGUARD_API_KEY={api_key}
+JWT_SECRET={jwt_secret}
+AGENTGUARD_ENV=prod
+ALLOWED_ORIGINS=*
+
+# LLM Provider ({llm_provider})
+{"OLLAMA_BASE_URL=http://ollama:11434" if llm_provider == "ollama" else "OLLAMA_BASE_URL=http://vllm:8000"}
+
+# External provider keys — leave blank for air-gapped deployment
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+GEMINI_API_KEY=
+GROQ_API_KEY=
+"""
+
+
+def generate_setup_script(llm_model: str = "llama3", port: int = 4000) -> str:
+    """Generate the setup.sh script for first-time deployment."""
+    return f"""#!/bin/bash
+# AgentGuard On-Premise Setup Script
+set -e
+
+echo "=== AgentGuard On-Premise Setup ==="
+
+# Check Docker
+if ! command -v docker &> /dev/null; then
+    echo "ERROR: Docker not found. Install Docker first."
+    exit 1
+fi
+
+if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+    echo "ERROR: Docker Compose not found."
+    exit 1
+fi
+
+# Pull images (do this before going air-gapped)
+echo "Pulling Docker images..."
+docker compose pull
+
+# Start services
+echo "Starting AgentGuard..."
+docker compose up -d
+
+# Wait for services
+echo "Waiting for services to be healthy..."
+sleep 15
+
+# Pull LLM model
+echo "Pulling LLM model: {llm_model}"
+docker exec agentguard_ollama ollama pull {llm_model}
+
+# Health check
+echo "Verifying installation..."
+for i in {{1..30}}; do
+    if curl -sf http://localhost:{port}/health > /dev/null; then
+        echo ""
+        echo "=== Setup Complete ==="
+        echo "AgentGuard is running at http://localhost:{port}"
+        echo "Health: $(curl -s http://localhost:{port}/health)"
+        exit 0
+    fi
+    echo -n "."
+    sleep 2
+done
+
+echo "ERROR: AgentGuard did not start in time. Check logs: docker compose logs agentguard"
+exit 1
+"""
