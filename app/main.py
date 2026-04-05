@@ -1,5 +1,5 @@
 """
-AgentGuard v3.4.0
+AgentGuard v3.5.0
 """
 import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio, secrets
 from collections import OrderedDict
@@ -29,6 +29,10 @@ from pydantic import BaseModel
 import asyncpg
 
 # ── v3 imports (all versions) ─────────────────────────────────────────────────
+from app.model_router import (
+    route_completion, route_stream, validate_model,
+    list_ollama_models, PROVIDER_MAP, detect_provider,
+)
 from app.v3 import (
     # v3.0 — sessions, HITL, injection, rate limits, enforcement
     SESSION_MIGRATIONS,
@@ -69,6 +73,12 @@ from app.v3 import (
     check_honey_tool_call, HONEY_TOOL_PREFIX,
     run_enforcement_v34,
     _get_honey_tools,
+    # v3.5 — streaming + multi-model
+    V35_MIGRATIONS,
+    StreamProxyRequest,
+    build_sse_event, sse_token, sse_done, sse_error, sse_blocked, sse_guardrail,
+    run_streaming_guardrails,
+    _log_model_usage,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -126,7 +136,7 @@ async def lifespan(app: FastAPI):
     elif IS_PROD:
         raise RuntimeError("REDIS_URL required in prod")
     await init_db()
-    log.info("agentguard.started", version="3.4.0", env=AGENTGUARD_ENV)
+    log.info("agentguard.started", version="3.5.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
     if redis_conn:
@@ -235,6 +245,9 @@ async def init_db():
             await conn.execute(_sql)
         # v3.4 — citation grounding, conflict detection, vector anchoring, honey-tools
         for _sql in V34_MIGRATIONS:
+            await conn.execute(_sql)
+        # v3.5 — multi-model support + streaming
+        for _sql in V35_MIGRATIONS:
             await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -601,7 +614,7 @@ async def load_agent_and_policy(agent_id, tenant_id):
     return agent, policy
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AgentGuard", version="3.4.0", lifespan=lifespan)
+app = FastAPI(title="AgentGuard", version="3.5.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS","*").split(",") if o.strip()]
@@ -1971,6 +1984,386 @@ async def proxy_chat_v4(req: ProxyRequestV31, request: Request,
                                        "summary": citation_result.summary}
     return response_body
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-MODEL + STREAMING v3.5
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/models")
+async def list_models(tenant=Depends(get_tenant)):
+    """List all supported models by provider."""
+    ollama_available = await list_ollama_models()
+    result = {}
+    for provider, models in PROVIDER_MAP.items():
+        env_map = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai":    "OPENAI_API_KEY",
+            "gemini":    "GEMINI_API_KEY",
+            "groq":      "GROQ_API_KEY",
+            "ollama":    "OLLAMA_BASE_URL",
+        }
+        env_key = env_map.get(provider, "")
+        result[provider] = {
+            "models":    models if provider != "ollama" else ollama_available,
+            "configured": bool(os.environ.get(env_key)) if env_key else True,
+            "env_var":   env_key,
+        }
+    return result
+
+@app.get("/models/ollama/available")
+async def get_ollama_models(tenant=Depends(get_tenant)):
+    """List models currently available in the local Ollama instance."""
+    models = await list_ollama_models()
+    base   = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    return {"base_url": base, "models": models, "count": len(models),
+            "reachable": len(models) > 0 or models is not None}
+
+@app.get("/models/{model:path}/validate")
+async def validate_model_endpoint(model: str, tenant=Depends(get_tenant)):
+    """Validate a model string — returns provider, env var needed, and readiness."""
+    return await validate_model(model)
+
+@app.get("/models/usage/stats")
+async def model_usage_stats(tenant=Depends(get_tenant), days: int=30):
+    """Token usage and request counts broken down by provider and model."""
+    async with pool.acquire() as conn:
+        by_provider = await conn.fetch(
+            "SELECT provider, model,"
+            " COUNT(*) AS requests,"
+            " SUM(prompt_tokens) AS prompt_tokens,"
+            " SUM(completion_tokens) AS completion_tokens,"
+            " SUM(total_tokens) AS total_tokens,"
+            " ROUND(AVG(duration_ms)) AS avg_ms,"
+            " COUNT(*) FILTER (WHERE streaming=TRUE) AS streaming_requests,"
+            " COUNT(*) FILTER (WHERE guardrail_blocked=TRUE) AS blocked_requests"
+            " FROM model_usage_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " GROUP BY provider, model ORDER BY requests DESC",
+            tenant["id"], str(days))
+        totals = await conn.fetchrow(
+            "SELECT SUM(total_tokens) AS total_tokens,"
+            " COUNT(*) AS total_requests,"
+            " COUNT(*) FILTER (WHERE streaming=TRUE) AS streaming_requests"
+            " FROM model_usage_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+    return {"totals": dict(totals), "by_provider_model": [dict(r) for r in by_provider]}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NON-STREAMING MULTI-MODEL PROXY (replaces existing v2/v3/v4 for all providers)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/proxy/chat")
+@limiter.limit("300/minute;30/second")
+async def proxy_chat(req: ProxyRequestV31, request: Request,
+                     bg: BackgroundTasks, tenant=Depends(get_tenant)):
+    """
+    Universal non-streaming proxy. Supports all providers via model string.
+    Runs full semantic guardrail pipeline (equivalent to v3 but multi-model).
+    Use /proxy/chat/v4 for the full v3.4 pipeline with honey-tools + anchoring.
+    """
+    start = time.monotonic()
+    tid   = tenant["id"]
+
+    # Input guardrails
+    safe_messages, safe_system, input_report = await run_semantic_guardrails(
+        req.messages, req.system, tid, req.agent_id, req.session_id,
+        tokenize=req.tokenize_pii)
+
+    if input_report.get("blocked"):
+        ms = int((time.monotonic()-start)*1000)
+        return JSONResponse(status_code=400, content={
+            "allowed": False, "blocked_at": "input",
+            "reason": input_report.get("reason"), "layer": input_report.get("layer"),
+            "duration_ms": ms})
+
+    if req.dry_run:
+        provider = detect_provider(req.model)
+        return {"dry_run": True, "input_report": input_report,
+                "model": req.model, "provider": provider}
+
+    # Route to provider
+    try:
+        response = await route_completion(
+            model=req.model, messages=safe_messages, system=safe_system,
+            max_tokens=req.max_tokens)
+    except Exception as e:
+        log.error("proxy_chat.llm_error", model=req.model, error=str(e))
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+    # Output guardrails
+    safe_response, output_report = await run_output_semantic_guardrails(
+        response.content, tid, req.agent_id, req.session_id,
+        detokenize_pii=req.tokenize_pii,
+        check_ground=req.check_grounding,
+        grounding_threshold=req.grounding_threshold)
+
+    ms = int((time.monotonic()-start)*1000)
+    LATENCY.labels(endpoint="proxy_chat").observe(ms/1000)
+
+    bg.add_task(_log_model_usage, tid, req.session_id, req.agent_id,
+                response.model, response.provider,
+                response.prompt_tokens, response.completion_tokens,
+                False, ms, response.finish_reason, False)
+
+    return {"content": safe_response, "model": response.model,
+            "provider": response.provider,
+            "usage": {"prompt_tokens": response.prompt_tokens,
+                      "completion_tokens": response.completion_tokens,
+                      "total_tokens": response.total_tokens},
+            "guardrails": {"input": input_report, "output": output_report},
+            "duration_ms": ms}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STREAMING PROXY ENDPOINTS
+# All return Server-Sent Events (SSE) stream.
+# Client reads: event: token / data: {"delta": "..."}
+#               event: done  / data: {"usage": {...}, "guardrails": {...}}
+#               event: blocked / data: {"reason": "...", "layer": "..."}
+#               event: error / data: {"message": "..."}
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _stream_with_guardrails(
+    req:        StreamProxyRequest,
+    tid:        str,
+    pipeline:   str,           # "v2" | "v3" | "v4"
+    bg:         BackgroundTasks,
+) -> AsyncIterator[str]:
+    """
+    Core streaming generator. Handles all three pipeline tiers.
+    Yields SSE-formatted strings.
+
+    Pipeline:
+      v2 — keyword + PII + binary grounding
+      v3 — keyword + semantic + PII + grounding
+      v4 — honey injection + semantic + anchor + citation grounding
+    """
+    start = time.monotonic()
+
+    # ── Pre-stream: inject honey tools (v4 only) ──────────────────────────────
+    honey_tools  = []
+    active_system = req.system
+
+    if pipeline == "v4" and req.agent_id:
+        honey_tools = await _get_honey_tools(tid, req.agent_id)
+        if honey_tools:
+            active_system = inject_honey_tools(req.system, honey_tools)
+
+    # ── Input guardrails ──────────────────────────────────────────────────────
+    if pipeline == "v2":
+        safe_messages, safe_system, input_report = await run_input_guardrails(
+            req.messages, active_system, tid, req.agent_id, req.session_id,
+            tokenize=req.tokenize_pii)
+    else:
+        # v3 and v4 both use semantic guardrails
+        safe_messages, safe_system, input_report = await run_semantic_guardrails(
+            req.messages, active_system, tid, req.agent_id, req.session_id,
+            tokenize=req.tokenize_pii)
+
+    if input_report.get("blocked"):
+        yield sse_blocked(
+            reason=input_report.get("reason", "blocked"),
+            layer=input_report.get("layer", "input"),
+        )
+        return
+
+    if req.stream_guardrail_events:
+        yield sse_guardrail("input_passed", {"pipeline": pipeline,
+                                              "pii_tokenized": req.tokenize_pii})
+
+    if req.dry_run:
+        provider = detect_provider(req.model)
+        yield build_sse_event({"type": "dry_run", "input_report": input_report,
+                                "model": req.model, "provider": provider,
+                                "honey_tools_injected": len(honey_tools)}, event="dry_run")
+        return
+
+    # ── Stream from LLM ───────────────────────────────────────────────────────
+    buffer        = []
+    prompt_toks   = 0
+    compl_toks    = 0
+    finish_reason = "stop"
+    provider      = detect_provider(req.model)
+
+    try:
+        async for chunk in route_stream(
+            model=req.model, messages=safe_messages, system=safe_system,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+        ):
+            if chunk.finish_reason:
+                finish_reason = chunk.finish_reason
+                prompt_toks   = chunk.prompt_tokens
+                compl_toks    = chunk.completion_tokens
+
+            if chunk.delta:
+                buffer.append(chunk.delta)
+
+                if req.buffer_output:
+                    # Buffer mode — don't forward until we have the full response
+                    # (guardrails run on complete text)
+                    pass
+                else:
+                    # Passthrough mode — forward immediately, scan async after
+                    yield sse_token(chunk.delta, req.model, provider)
+
+    except Exception as e:
+        log.error("stream.llm_failed", model=req.model, error=str(e))
+        yield sse_error(f"LLM error: {type(e).__name__}: {str(e)[:200]}", "llm_error")
+        return
+
+    full_response = "".join(buffer)
+
+    # ── Honey-tool scan on output (v4) ────────────────────────────────────────
+    honey_tripped = False
+    if pipeline == "v4" and req.agent_id and req.session_id and honey_tools:
+        for ht in honey_tools:
+            if ht.lower() in full_response.lower():
+                is_honey, honey_reason = await check_honey_tool_call(
+                    ht, req.session_id, tid, req.agent_id,
+                    {}, full_response[:200], 0)
+                if is_honey:
+                    honey_tripped = True
+                    full_response = f"[SESSION TERMINATED: {honey_reason}]"
+                    yield sse_blocked(honey_reason, "honey_tool", "honey_tool_trip")
+                    break
+
+    # ── Output guardrails ─────────────────────────────────────────────────────
+    citation_level = (pipeline == "v4")
+    safe_response, guardrail_report = await run_streaming_guardrails(
+        full_response, tid, req.agent_id, req.session_id,
+        detokenize_pii=req.tokenize_pii,
+        check_ground=req.check_grounding and not honey_tripped,
+        grounding_threshold=req.grounding_threshold,
+        citation_level=citation_level,
+    )
+
+    output_blocked = guardrail_report.get("output", {}).get("blocked", False)
+    if output_blocked:
+        yield sse_blocked(
+            reason=guardrail_report.get("output", {}).get("reason", "output blocked"),
+            layer=guardrail_report.get("output", {}).get("layer", "output_gate"),
+        )
+        # Still send done so client knows stream ended
+        ms = int((time.monotonic()-start)*1000)
+        bg.add_task(_log_model_usage, tid, req.session_id, req.agent_id,
+                    req.model, provider, prompt_toks, compl_toks, True, ms, finish_reason, True)
+        yield sse_done(req.model, provider, prompt_toks, compl_toks,
+                       {"input": input_report, **guardrail_report,
+                        "honey_tool_tripped": honey_tripped})
+        return
+
+    # ── Stream buffered tokens to client ─────────────────────────────────────
+    if req.buffer_output:
+        # Send the safe response in chunks of ~20 chars to feel like streaming
+        CHUNK_SIZE = 20
+        for i in range(0, len(safe_response), CHUNK_SIZE):
+            yield sse_token(safe_response[i:i+CHUNK_SIZE], req.model, provider)
+            await asyncio.sleep(0)  # yield control between chunks
+
+    # ── Done event ────────────────────────────────────────────────────────────
+    ms = int((time.monotonic()-start)*1000)
+    LATENCY.labels(endpoint=f"proxy_stream_{pipeline}").observe(ms/1000)
+
+    guardrail_report["input"] = input_report
+    if pipeline == "v4":
+        guardrail_report["honey_tool_tripped"] = honey_tripped
+
+    yield sse_done(req.model, provider, prompt_toks, compl_toks, guardrail_report)
+
+    # Log async
+    bg.add_task(_log_model_usage, tid, req.session_id, req.agent_id,
+                req.model, provider, prompt_toks, compl_toks,
+                True, ms, finish_reason, False)
+
+
+@app.post("/proxy/chat/v2/stream")
+@limiter.limit("200/minute;20/second")
+async def proxy_chat_v2_stream(req: StreamProxyRequest, request: Request,
+                                bg: BackgroundTasks, tenant=Depends(get_tenant)):
+    """
+    Streaming v2: keyword firewall + PII + output gate + binary grounding.
+    Supports all providers (Anthropic, OpenAI, Gemini, Groq, Ollama).
+    Returns Server-Sent Events stream.
+    """
+    tid = tenant["id"]
+    return StreamingResponse(
+        _stream_with_guardrails(req, tid, "v2", bg),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
+        },
+    )
+
+
+@app.post("/proxy/chat/v3/stream")
+@limiter.limit("200/minute;20/second")
+async def proxy_chat_v3_stream(req: StreamProxyRequest, request: Request,
+                                bg: BackgroundTasks, tenant=Depends(get_tenant)):
+    """
+    Streaming v3: full semantic pipeline + all providers.
+    keyword + semantic classifier + PII + injection scan + grounding.
+    Returns Server-Sent Events stream.
+    """
+    tid = tenant["id"]
+    return StreamingResponse(
+        _stream_with_guardrails(req, tid, "v3", bg),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
+        },
+    )
+
+
+@app.post("/proxy/chat/v4/stream")
+@limiter.limit("200/minute;20/second")
+async def proxy_chat_v4_stream(req: StreamProxyRequest, request: Request,
+                                bg: BackgroundTasks, tenant=Depends(get_tenant)):
+    """
+    Streaming v4: complete pipeline + all providers.
+    honey injection → semantic → anchor check → citation grounding.
+    Returns Server-Sent Events stream.
+
+    SSE Event types:
+      token    — {"delta": "...", "model": "...", "provider": "..."}
+      done     — {"usage": {...}, "guardrails": {...}}
+      blocked  — {"reason": "...", "layer": "..."}
+      guardrail — {"event": "input_passed", ...}
+      error    — {"message": "..."}
+    """
+    tid = tenant["id"]
+    return StreamingResponse(
+        _stream_with_guardrails(req, tid, "v4", bg),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
+        },
+    )
+
+
+@app.get("/proxy/stream/stats")
+async def stream_stats(tenant=Depends(get_tenant), days: int=30):
+    """Streaming session stats."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_requests,"
+            " COUNT(*) FILTER (WHERE streaming=TRUE) AS streaming_requests,"
+            " COUNT(*) FILTER (WHERE streaming=FALSE) AS sync_requests,"
+            " SUM(total_tokens) FILTER (WHERE streaming=TRUE) AS streaming_tokens,"
+            " COUNT(DISTINCT model) AS unique_models,"
+            " COUNT(DISTINCT provider) AS unique_providers"
+            " FROM model_usage_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+    return dict(row)
+
+
 @app.get("/health")
 async def health():
     checks = {"postgres": False, "redis": None}
@@ -1984,4 +2377,4 @@ async def health():
     all_ok = checks["postgres"] and checks.get("redis") is not False
     return JSONResponse(status_code=200 if all_ok else 503,
         content={"status":"ok" if all_ok else "degraded",
-                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.4.0"})
+                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.5.0"})
