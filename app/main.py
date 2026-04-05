@@ -53,6 +53,14 @@ from app.v3 import (
     embed_text, cosine_similarity,
     BUILTIN_SEMANTIC_POLICIES, _get_policy_embedding,
     _embedding_cache,
+
+    CERT_MIGRATIONS,
+    mint_session_cert, verify_session_cert, revoke_session_cert,
+    get_session_cert, log_cert_request,
+    synthesize_policy_from_code,
+    PolicySynthesisRequest, PolicySynthesisResult,
+    CertVerifyRequest,
+
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
