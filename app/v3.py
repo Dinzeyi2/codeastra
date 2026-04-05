@@ -1222,6 +1222,8 @@ async def run_output_semantic_guardrails(response_text, tenant_id, agent_id, ses
                 f"response may not be supported by source documents. {reason}]\n\n"
                 + safe_response)
     return safe_response, report
+
+
 """
 AgentGuard v3.3.0 — Ephemeral Session Certificates + AST Policy Synthesis
 
@@ -2198,6 +2200,7 @@ async def delete_synthesized_policy(policy_id: str, tenant=Depends(get_tenant)):
         raise HTTPException(404, "Synthesized policy not found")
     return {"deleted": policy_id}
 '''
+
 
 """
 AgentGuard v3.4.0 — Four Advanced Security Features
@@ -3238,7 +3241,6 @@ async def run_enforcement_v34(
     return True, "all checks passed", clean, redacted, "proceed"
 
 
-
 """
 AgentGuard v3.5.0 — Multi-Model + Streaming additions
 
@@ -3394,12 +3396,8 @@ async def run_streaming_guardrails(
     Identical to run_output_semantic_guardrails but returns a
     structured report suitable for embedding in the SSE done event.
     """
-    # Import from existing v3 functions (already defined above this file in v3.py)
-    from app.v3 import (
-        run_output_semantic_guardrails,
-        check_grounding_with_citations,
-    )
-
+    # run_output_semantic_guardrails and check_grounding_with_citations
+    # are already in scope — this file is pasted into v3.py
     safe_text, output_report = await run_output_semantic_guardrails(
         response_text, tenant_id, agent_id, session_id,
         detokenize_pii=detokenize_pii,
@@ -3455,7 +3453,6 @@ async def _log_model_usage(
             )
     except Exception as e:
         log.warning("model_usage.log_failed", error=str(e))
-
 
 
 """
@@ -3925,10 +3922,9 @@ async def proxy_stream_generator(
     if buffer_for_gate and scan_output and buffer:
         full_text = "".join(buffer)
 
-        # Import scan functions from existing v3.py
+        # scan_output is already in scope (this file is pasted into v3.py)
         try:
-            from app.v3 import scan_output as _scan_output
-            safe_text, findings, modified = await _scan_output(
+            safe_text, findings, modified = await scan_output(
                 full_text, tenant_id, agent_id, session_id)
 
             if findings:
@@ -3971,8 +3967,6 @@ async def proxy_stream_generator(
                 injection_found, output_blocked, ms)
     except Exception as e:
         log.warning("passthrough.log_failed", error=str(e))
-
-
 
 
 """
@@ -4803,8 +4797,6 @@ async def privacy_compliant_stream(
         yield "", True, pt, ct, fr
 
 
-
-
 """
 AgentGuard v3.7.0 — Feature 1: PHI/PCI Data Classifier
 
@@ -5321,28 +5313,10 @@ async def _classification_alert(tenant_id, agent_id, alert_type, detail):
 
 
 
-"""
-AgentGuard v3.7.0 — Feature 2: Zero-Logging Mode
-                  — Feature 4: Tamper-Proof Audit Log
 
-ZERO-LOGGING MODE:
-  Tenants with sensitive data can route ALL audit logs to THEIR OWN database.
-  AgentGuard writes nothing to its own DB for those tenants.
-  The tenant provides a Postgres connection string — we write there.
-  Their data never touches our infrastructure.
-
-TAMPER-PROOF AUDIT LOG:
-  Every audit entry is SHA-256 hash-chained to the previous entry.
-  Identical to blockchain append-only log.
-  Any tampering breaks the chain and is detectable.
-  Includes:
-    - Entry hash (SHA-256 of content)
-    - Previous entry hash (chain link)
-    - Chain sequence number
-    - Verification endpoint to prove chain integrity
-
-PASTE AT BOTTOM OF: app/v3.py
-"""
+# ══════════════════════════════════════════════════════════════════════════════
+# v3.7 Feature 2 — Zero-Logging Mode + Feature 4 — Tamper-Proof Audit Log
+# ══════════════════════════════════════════════════════════════════════════════
 
 import os, json, hashlib, time, asyncio, uuid
 from typing import Optional, Any
@@ -5521,7 +5495,7 @@ def _compute_entry_hash(
 async def _get_last_hash(tenant_id: str, conn) -> tuple[str, int]:
     """Get the last hash and sequence number for a tenant's chain."""
     row = await conn.fetchrow(
-        "SELECT last_hash, last_seq FROM audit_chain_state WHERE tenant_id=$1",
+        "SELECT last_hash, last_seq FROM audit_chain_state WHERE tenant_id=$1 FOR UPDATE",
         tenant_id)
     if row:
         return row["last_hash"], row["last_seq"]
@@ -5654,12 +5628,30 @@ async def secure_log_action(
                         " WHERE tenant_id=$1", tenant_id)
         except Exception as e:
             log.error("zero_log.external_write_failed", tenant_id=tenant_id, error=str(e))
+            # On external DB failure: write to AgentGuard as fallback
+            # so there is never an audit gap
             try:
                 from app.main import pool
                 async with pool.acquire() as conn:
+                    prev_hash_fb, last_seq_fb = await _get_last_hash(tenant_id, conn)
+                    entry_hash_fb = _compute_entry_hash(
+                        tenant_id, request_id, agent_id, tool,
+                        decision, reason, duration_ms, created_at, prev_hash_fb)
+                    await conn.execute(
+                        "INSERT INTO audit_log_secure"
+                        " (id,tenant_id,request_id,agent_id,session_id,user_id,"
+                        "  tool,decision,reason,redacted,duration_ms,"
+                        "  entry_hash,prev_hash)"
+                        " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+                        " ON CONFLICT (id) DO NOTHING",
+                        entry_id, tenant_id, request_id, agent_id, session_id,
+                        user_id, tool, decision, reason, redacted, duration_ms,
+                        entry_hash_fb, prev_hash_fb
+                    )
+                    await _update_chain_state(tenant_id, entry_hash_fb, last_seq_fb + 1, conn)
                     await conn.execute(
                         "UPDATE tenant_zero_log_config SET last_error=$1 WHERE tenant_id=$2",
-                        str(e)[:500], tenant_id)
+                        f"FALLBACK: {str(e)[:400]}", tenant_id)
             except Exception:
                 pass
 
@@ -5724,27 +5716,9 @@ async def verify_audit_chain(tenant_id: str, limit: int = 1000) -> dict:
                            else f"{len(broken_links)} broken link(s) detected.",
     }
 
-
-
-"""
-AgentGuard v3.7.0 — Feature 3: On-Premise / Air-Gapped Deployment
-                  — Feature 5: Data Classification API
-
-ON-PREMISE / AIR-GAPPED:
-  Complete Docker Compose configuration for self-hosted deployment.
-  Zero internet required. Works with Ollama or vLLM locally.
-  Includes: AgentGuard backend, Postgres, Redis, Ollama.
-  Health checks, restart policies, resource limits all production-ready.
-  Generates a deployment package the customer downloads and runs.
-
-DATA CLASSIFICATION API:
-  Classify any text before it touches AI.
-  Returns: what type of sensitive data is present, risk level,
-  what regulations apply, what controls are required, allow/redact/block decision.
-  Integrates with PHI/PCI classifier built in Feature 1.
-
-PASTE AT BOTTOM OF: app/v3.py (after v37_phi_pci.py and v37_zerolog_audit.py)
-"""
+# ══════════════════════════════════════════════════════════════════════════════
+# v3.7 Feature 3 — On-Premise / Air-Gapped + Feature 5 — Data Classification API
+# ══════════════════════════════════════════════════════════════════════════════
 
 import json, os, hashlib, time
 from typing import Optional
@@ -5893,8 +5867,7 @@ async def classify_for_ai(
     import time as _time
     start = _time.monotonic()
 
-    # Run classifier (from v37_phi_pci.py — already pasted above)
-    from app.v3 import classify_text
+    # Run classifier — classify_text is already in scope (pasted above in v3.py)
     result = await classify_text(
         text=text,
         tenant_id=tenant_id,
@@ -5967,8 +5940,8 @@ async def classify_for_ai(
          "count": v, "severity": next(
              (f["severity"] for f in result.findings if f["pattern"] == k.split(":")[1]),
              "MEDIUM")}
-        for k, v in findings_summary_dict.items()
-    ] if (findings_summary_dict := findings_by_type) else []
+        for k, v in findings_by_type.items()
+    ]
 
     ms = int((_time.monotonic() - start) * 1000)
 
@@ -6291,5 +6264,160 @@ for i in {{1..30}}; do
 done
 
 echo "ERROR: AgentGuard did not start in time. Check logs: docker compose logs agentguard"
+exit 1
+"""
+
+
+def generate_systemd_service(port: int = 4000, user: str = "agentguard") -> str:
+    """Generate a systemd service file for bare-metal deployment."""
+    return f"""[Unit]
+Description=AgentGuard AI Security Gateway
+After=network.target postgresql.service redis.service
+Wants=postgresql.service redis.service
+
+[Service]
+Type=simple
+User={user}
+Group={user}
+WorkingDirectory=/opt/agentguard
+Environment=PATH=/opt/agentguard/venv/bin:/usr/bin:/bin
+EnvironmentFile=/opt/agentguard/.env
+ExecStart=/opt/agentguard/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port {port} --workers 2 --loop uvloop
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentguard
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/agentguard
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def generate_bare_metal_setup(
+    port:         int = 4000,
+    pg_host:      str = "localhost",
+    pg_port:      int = 5432,
+    pg_db:        str = "agentguard",
+    pg_user:      str = "agentguard",
+    pg_password:  str = "changeme_in_production",
+    redis_host:   str = "localhost",
+    redis_port:   int = 6379,
+    redis_password: str = "changeme_in_production",
+    api_key:      str = "sk-guard-YOUR_KEY",
+    llm_base_url: str = "http://localhost:11434",
+    air_gapped:   bool = True,
+) -> str:
+    """
+    Generate a bare-metal / systemd setup script.
+    No Docker required. Customer uses their own Postgres and Redis.
+    Works completely air-gapped with Ollama or vLLM.
+    """
+    import secrets as _secrets
+    jwt_secret = _secrets.token_hex(32)
+
+    return f"""#!/bin/bash
+# AgentGuard v3.7.0 — Bare Metal / Air-Gapped Setup
+# No Docker required. Runs as a systemd service.
+# Requires: Python 3.11+, PostgreSQL 14+, Redis 7+
+# LLM: Ollama or vLLM running at {llm_base_url}
+set -e
+
+echo "=== AgentGuard Bare Metal Setup ==="
+
+# ── Prerequisites check ────────────────────────────────────────────────────────
+command -v python3.11 >/dev/null 2>&1 || {{ echo "ERROR: Python 3.11+ required"; exit 1; }}
+command -v psql >/dev/null 2>&1 || {{ echo "ERROR: PostgreSQL client required"; exit 1; }}
+
+# ── Create system user ─────────────────────────────────────────────────────────
+if ! id agentguard &>/dev/null; then
+    useradd --system --shell /bin/false --home /opt/agentguard --create-home agentguard
+fi
+
+# ── Install code ───────────────────────────────────────────────────────────────
+mkdir -p /opt/agentguard
+# Copy your AgentGuard source code here:
+# git clone https://your-private-repo/agentguard.git /opt/agentguard
+# OR: tar -xzf agentguard.tar.gz -C /opt/agentguard
+
+# ── Python virtual environment ─────────────────────────────────────────────────
+python3.11 -m venv /opt/agentguard/venv
+/opt/agentguard/venv/bin/pip install --upgrade pip
+/opt/agentguard/venv/bin/pip install -r /opt/agentguard/requirements.txt
+{"# Air-gapped: pre-download wheels with: pip download -r requirements.txt -d wheels/" if air_gapped else ""}
+
+# ── Environment file ──────────────────────────────────────────────────────────
+cat > /opt/agentguard/.env << 'ENV'
+DATABASE_URL=postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}
+REDIS_URL=redis://:{redis_password}@{redis_host}:{redis_port}/0
+AGENTGUARD_API_KEY={api_key}
+JWT_SECRET={jwt_secret}
+AGENTGUARD_ENV=prod
+ALLOWED_ORIGINS=*
+OLLAMA_BASE_URL={llm_base_url}
+# No external API keys — air-gapped
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+GEMINI_API_KEY=
+ENV
+chmod 600 /opt/agentguard/.env
+chown agentguard:agentguard /opt/agentguard/.env
+
+# ── PostgreSQL database ───────────────────────────────────────────────────────
+sudo -u postgres psql -c "CREATE USER {pg_user} WITH PASSWORD '{pg_password}';" 2>/dev/null || true
+sudo -u postgres psql -c "CREATE DATABASE {pg_db} OWNER {pg_user};" 2>/dev/null || true
+
+# ── systemd service ────────────────────────────────────────────────────────────
+cat > /etc/systemd/system/agentguard.service << 'SVC'
+[Unit]
+Description=AgentGuard AI Security Gateway
+After=network.target postgresql.service redis.service
+
+[Service]
+Type=simple
+User=agentguard
+WorkingDirectory=/opt/agentguard
+EnvironmentFile=/opt/agentguard/.env
+ExecStart=/opt/agentguard/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port {port} --workers 2 --loop uvloop
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+systemctl daemon-reload
+systemctl enable agentguard
+systemctl start agentguard
+
+# ── Verify ─────────────────────────────────────────────────────────────────────
+echo "Waiting for AgentGuard to start..."
+sleep 5
+for i in {{1..12}}; do
+    if curl -sf http://localhost:{port}/health > /dev/null; then
+        echo ""
+        echo "=== Setup Complete ==="
+        echo "AgentGuard running at http://localhost:{port}"
+        echo "Health: $(curl -s http://localhost:{port}/health)"
+        echo ""
+        echo "Next steps:"
+        echo "  1. Sign up: curl -X POST http://localhost:{port}/auth/signup -H 'Content-Type: application/json' -d '{{\"name\":\"Admin\",\"email\":\"admin@yourcompany.com\",\"password\":\"yourpassword\"}}'"
+        echo "  2. Point your agents at http://localhost:{port} instead of app.agentguard.io"
+        echo "  3. View logs: journalctl -u agentguard -f"
+        exit 0
+    fi
+    echo -n "."
+    sleep 5
+done
+echo "ERROR: Check logs: journalctl -u agentguard -n 50"
 exit 1
 """
