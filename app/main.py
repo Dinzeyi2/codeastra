@@ -1,5 +1,5 @@
 """
-AgentGuard v3.5.0
+AgentGuard v3.6.0
 """
 import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio, secrets
 from collections import OrderedDict
@@ -84,6 +84,14 @@ from app.v3 import (
     SecurityModelConfig, StreamPassthroughRequest,
     get_tenant_security_model, call_security_llm,
     proxy_stream_generator, invalidate_security_cache,
+    # v3.6 — no-training headers + ZDR + data privacy
+    V36_MIGRATIONS,
+    DataPrivacyConfig, PrivacyAuditEntry,
+    get_tenant_privacy_config, enforce_privacy_headers,
+    wrap_anthropic_with_privacy, wrap_openai_with_privacy,
+    wrap_gemini_with_privacy, privacy_compliant_call,
+    privacy_compliant_stream, invalidate_privacy_cache,
+    PROVIDER_PRIVACY_FACTS, _compute_compliance_score,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -141,7 +149,7 @@ async def lifespan(app: FastAPI):
     elif IS_PROD:
         raise RuntimeError("REDIS_URL required in prod")
     await init_db()
-    log.info("agentguard.started", version="3.5.0", env=AGENTGUARD_ENV)
+    log.info("agentguard.started", version="3.6.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
     if redis_conn:
@@ -253,6 +261,9 @@ async def init_db():
             await conn.execute(_sql)
         # v3.5 — multi-model support + streaming
         for _sql in V35_MIGRATIONS:
+            await conn.execute(_sql)
+        # v3.6 — no-training headers + ZDR + data privacy enforcement
+        for _sql in V36_MIGRATIONS:
             await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -619,7 +630,7 @@ async def load_agent_and_policy(agent_id, tenant_id):
     return agent, policy
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AgentGuard", version="3.5.0", lifespan=lifespan)
+app = FastAPI(title="AgentGuard", version="3.6.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS","*").split(",") if o.strip()]
@@ -2672,6 +2683,230 @@ async def passthrough_stats(tenant=Depends(get_tenant), days: int=30):
     return {**dict(row), "recent_sessions": [dict(r) for r in recent]}
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA PRIVACY + NO-TRAINING ENFORCEMENT v3.6
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/privacy")
+async def get_privacy_overview(tenant=Depends(get_tenant)):
+    """
+    Privacy overview for this tenant.
+    Shows what protections are active, provider compliance facts,
+    and a compliance score across all providers used.
+    """
+    config = await get_tenant_privacy_config(tenant["id"])
+
+    providers_status = {}
+    for provider, facts in PROVIDER_PRIVACY_FACTS.items():
+        no_train_key = f"{provider}_no_train"
+        zdr_key      = f"{provider}_zdr"
+        no_train     = config.get("enforce_no_training", True) and config.get(no_train_key, True)
+        zdr          = config.get("enforce_zdr", False) and config.get(zdr_key, False)
+
+        from app.v3 import _compute_compliance_score
+        score = _compute_compliance_score(provider, config, no_train, zdr)
+
+        providers_status[provider] = {
+            "no_training_enforced": no_train,
+            "zdr_enforced":         zdr,
+            "compliance_score":     score,
+            "provider_trains_on_api": facts.get("trains_on_api", True),
+            "soc2":                 facts.get("soc2", False),
+            "gdpr":                 facts.get("gdpr", False),
+            "hipaa":                facts.get("hipaa", False),
+            "zdr_available":        facts.get("zdr_available", False),
+            "zdr_note":             facts.get("zdr_note", ""),
+            "policy_source":        facts.get("trains_on_api_source", ""),
+        }
+
+    avg_score = int(sum(p["compliance_score"] for p in providers_status.values())
+                    / len(providers_status)) if providers_status else 0
+
+    return {
+        "tenant_id":           tenant["id"],
+        "overall_score":       avg_score,
+        "enforce_no_training": config.get("enforce_no_training", True),
+        "enforce_zdr":         config.get("enforce_zdr", False),
+        "require_soc2":        config.get("require_soc2", False),
+        "require_gdpr":        config.get("require_gdpr", False),
+        "require_hipaa":       config.get("require_hipaa", False),
+        "block_non_compliant": config.get("block_non_compliant", False),
+        "providers":           providers_status,
+        "summary": (
+            f"No-training enforcement is {'ACTIVE' if config.get('enforce_no_training') else 'INACTIVE'}. "
+            f"ZDR is {'ACTIVE' if config.get('enforce_zdr') else 'INACTIVE'}. "
+            f"Overall privacy score: {avg_score}/100."
+        ),
+    }
+
+@app.get("/privacy/config")
+async def get_privacy_config(tenant=Depends(get_tenant)):
+    """Get the full privacy configuration for this tenant."""
+    config = await get_tenant_privacy_config(tenant["id"])
+    config.pop("_ts", None)
+    return config
+
+@app.put("/privacy/config")
+async def update_privacy_config(body: DataPrivacyConfig, tenant=Depends(get_tenant)):
+    """
+    Update privacy configuration.
+
+    Key settings:
+      enforce_no_training: true   — inject opt-out headers on every LLM call (default: true)
+      enforce_zdr: false          — require ZDR endpoints (needs provider agreement)
+      block_non_compliant: false  — block calls to providers missing required certs
+      require_soc2: false         — only allow SOC2-certified providers
+      require_hipaa: false        — only allow HIPAA-BAA providers (OpenAI + Gemini via Vertex)
+
+    Note: enforce_no_training=true is the default and recommended for all YC startups.
+    Setting block_non_compliant=true + require_hipaa=true will restrict you to
+    OpenAI (with BAA) and Gemini via Vertex AI only.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO tenant_privacy_config ("
+            "  tenant_id, enforce_no_training, enforce_zdr,"
+            "  anthropic_no_train, openai_no_train, openai_zdr,"
+            "  gemini_no_train, gemini_use_vertex, groq_acknowledged,"
+            "  require_soc2, require_gdpr, require_hipaa,"
+            "  block_non_compliant, preferred_data_region"
+            ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
+            " ON CONFLICT (tenant_id) DO UPDATE SET"
+            "  enforce_no_training=$2, enforce_zdr=$3,"
+            "  anthropic_no_train=$4, openai_no_train=$5, openai_zdr=$6,"
+            "  gemini_no_train=$7, gemini_use_vertex=$8, groq_acknowledged=$9,"
+            "  require_soc2=$10, require_gdpr=$11, require_hipaa=$12,"
+            "  block_non_compliant=$13, preferred_data_region=$14,"
+            "  updated_at=NOW()",
+            tenant["id"],
+            body.enforce_no_training, body.enforce_zdr,
+            body.anthropic_no_train, body.openai_no_train, body.openai_zdr,
+            body.gemini_no_train, body.gemini_use_vertex, body.groq_acknowledged,
+            body.require_soc2, body.require_gdpr, body.require_hipaa,
+            body.block_non_compliant, body.preferred_data_region,
+        )
+
+    invalidate_privacy_cache(tenant["id"])
+    return {"updated": True, "message": "Privacy configuration updated. Takes effect immediately."}
+
+@app.get("/privacy/providers")
+async def list_provider_privacy_facts(tenant=Depends(get_tenant)):
+    """
+    Full privacy facts for every supported provider.
+    Includes whether they train on API data, ZDR availability,
+    compliance certifications, and policy source URLs.
+    """
+    return {
+        provider: {
+            **facts,
+            "agentguard_enforces": True,
+            "enforcement_method":  facts.get("opt_out_method", "none"),
+        }
+        for provider, facts in PROVIDER_PRIVACY_FACTS.items()
+    }
+
+@app.get("/privacy/audit")
+async def list_privacy_audit(
+    tenant=Depends(get_tenant),
+    provider: Optional[str] = None,
+    days: int = 30,
+    limit: int = 100,
+):
+    """
+    Privacy audit log — proof that no-training was enforced on every LLM call.
+    Every entry shows which headers were injected, the compliance score, and
+    whether the call was blocked for privacy reasons.
+    """
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2||' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if provider:
+        where += " AND provider=$3"; vals.append(provider)
+    vals.append(min(limit, 500))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT * FROM privacy_audit_log {where}"
+            f" ORDER BY created_at DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/privacy/audit/stats")
+async def privacy_audit_stats(tenant=Depends(get_tenant), days: int=30):
+    """
+    Privacy audit statistics.
+    Shows enforcement rates, compliance scores, and blocked calls by provider.
+    Use this as your data privacy compliance dashboard.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_calls,"
+            " COUNT(*) FILTER (WHERE no_train_enforced=TRUE) AS no_train_enforced,"
+            " COUNT(*) FILTER (WHERE zdr_enforced=TRUE) AS zdr_enforced,"
+            " COUNT(*) FILTER (WHERE blocked=TRUE) AS blocked_calls,"
+            " ROUND(AVG(compliance_score)) AS avg_compliance_score,"
+            " COUNT(DISTINCT provider) AS providers_used"
+            " FROM privacy_audit_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        by_provider = await conn.fetch(
+            "SELECT provider,"
+            " COUNT(*) AS calls,"
+            " COUNT(*) FILTER (WHERE no_train_enforced=TRUE) AS no_train_calls,"
+            " COUNT(*) FILTER (WHERE zdr_enforced=TRUE) AS zdr_calls,"
+            " ROUND(AVG(compliance_score)) AS avg_score"
+            " FROM privacy_audit_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " GROUP BY provider ORDER BY calls DESC",
+            tenant["id"], str(days))
+    return {
+        **dict(row),
+        "enforcement_rate": (
+            round(row["no_train_enforced"] / row["total_calls"] * 100, 1)
+            if row["total_calls"] else 0
+        ),
+        "by_provider": [dict(r) for r in by_provider],
+    }
+
+@app.post("/privacy/test")
+async def test_privacy_enforcement(body: dict, tenant=Depends(get_tenant)):
+    """
+    Test privacy enforcement for a specific provider without making a real LLM call.
+    Returns exactly which headers would be injected and what compliance score
+    would be recorded.
+
+    Body: { "provider": "openai" }
+    """
+    provider = body.get("provider", "anthropic")
+    if provider not in PROVIDER_PRIVACY_FACTS:
+        raise HTTPException(400, f"Unknown provider. Valid: {list(PROVIDER_PRIVACY_FACTS.keys())}")
+
+    headers, no_train, zdr, block_reason = await enforce_privacy_headers(
+        provider, tenant["id"], session_id=None, agent_id=None)
+
+    config = await get_tenant_privacy_config(tenant["id"])
+    from app.v3 import _compute_compliance_score
+    score  = _compute_compliance_score(provider, config, no_train, zdr)
+    facts  = PROVIDER_PRIVACY_FACTS[provider]
+
+    return {
+        "provider":            provider,
+        "would_be_blocked":    bool(block_reason),
+        "block_reason":        block_reason,
+        "headers_injected":    headers,
+        "no_train_enforced":   no_train,
+        "zdr_enforced":        zdr,
+        "compliance_score":    score,
+        "provider_facts": {
+            "trains_on_api":   facts.get("trains_on_api"),
+            "zdr_available":   facts.get("zdr_available"),
+            "soc2":            facts.get("soc2"),
+            "gdpr":            facts.get("gdpr"),
+            "hipaa":           facts.get("hipaa"),
+            "policy_source":   facts.get("trains_on_api_source"),
+            "note":            facts.get("zdr_note"),
+        },
+    }
+
+
 @app.get("/health")
 async def health():
     checks = {"postgres": False, "redis": None}
@@ -2685,4 +2920,4 @@ async def health():
     all_ok = checks["postgres"] and checks.get("redis") is not False
     return JSONResponse(status_code=200 if all_ok else 503,
         content={"status":"ok" if all_ok else "degraded",
-                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.5.0"})
+                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.6.0"})
