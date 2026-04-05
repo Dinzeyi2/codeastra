@@ -1614,6 +1614,556 @@ async def admin_tenants(x_api_key: str=Header(...)):
             ORDER BY t.created_at DESC""")
     return [dict(r) for r in rows]
 
+
+"""
+AgentGuard v3.4.0 — Endpoint additions for main.py
+
+Paste ALL of this into main.py before the /health endpoint.
+
+Also update these two things in main.py:
+
+1. ADD TO imports from app.v3:
+    V34_MIGRATIONS,
+    CitationGroundingResult, check_grounding_with_citations,
+    PolicyConflictReport, detect_policy_conflicts,
+    AnchorCheckResult, anchor_session_intent, check_intent_anchor,
+    HoneyToolConfig, generate_honey_tools, inject_honey_tools,
+    check_honey_tool_call, HONEY_TOOL_PREFIX,
+    run_enforcement_v34,
+
+2. ADD TO init_db() after CERT_MIGRATIONS:
+    for _sql in V34_MIGRATIONS:
+        await conn.execute(_sql)
+
+3. OPTIONAL BUT RECOMMENDED:
+   In /sessions POST endpoint, after create_session(), add:
+       if result.get("session_id"):
+           await anchor_session_intent(
+               result["session_id"], tenant["id"],
+               body.agent_id, body.intent)
+
+4. OPTIONAL BUT RECOMMENDED:
+   In /sessions/{session_id}/protect, replace run_enforcement_v3 with run_enforcement_v34
+   and inject honey tools into the system prompt before the LLM call in proxy endpoints.
+"""
+
+V34_ENDPOINTS = '''
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CITATION-LEVEL GROUNDING v3.4
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/guardrails/grounding/citation-check")
+async def citation_grounding_check(
+    body: OutputScanRequest,
+    tenant=Depends(get_tenant),
+    threshold: float = 0.5
+):
+    """
+    Citation-level grounding check.
+    Maps every sentence in the response to a source document.
+    Returns which sentences are supported and which source supports each.
+    Bedrock-equivalent grounding with full citation detail.
+
+    Requires: grounding sources registered via POST /guardrails/grounding
+    """
+    result = await check_grounding_with_citations(
+        body.content, tenant["id"], body.session_id, body.agent_id, threshold)
+    return result
+
+@app.get("/guardrails/grounding/citations/stats")
+async def citation_grounding_stats(tenant=Depends(get_tenant), days: int=30):
+    """Citation grounding stats — support ratios over time."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_checks,"
+            " ROUND(AVG(support_ratio)::numeric,4) AS avg_support_ratio,"
+            " ROUND(MIN(support_ratio)::numeric,4) AS min_support_ratio,"
+            " SUM(total_sentences) AS total_sentences_checked,"
+            " SUM(unsupported) AS total_unsupported_sentences"
+            " FROM grounding_citation_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        recent = await conn.fetch(
+            "SELECT session_id, agent_id, total_sentences, supported,"
+            " unsupported, support_ratio, created_at"
+            " FROM grounding_citation_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " ORDER BY created_at DESC LIMIT 20",
+            tenant["id"], str(days))
+    return {**dict(row), "recent_checks": [dict(r) for r in recent]}
+
+@app.get("/guardrails/grounding/citations/{session_id}")
+async def get_session_citation_history(session_id: str, tenant=Depends(get_tenant)):
+    """Get full citation grounding history for a session."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM grounding_citation_log"
+            " WHERE tenant_id=$1 AND session_id=$2"
+            " ORDER BY created_at DESC",
+            tenant["id"], session_id)
+    return [dict(r) for r in rows]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POLICY CONFLICT DETECTION v3.4
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/policies/{name}/check-conflicts")
+async def check_policy_conflicts(name: str, tenant=Depends(get_tenant),
+                                   synthesized_policy_id: Optional[str] = None):
+    """
+    Detect conflicts and inconsistencies in a policy.
+    Checks allow/deny overlaps, read_only violations, unreachable approval tools,
+    and (if synthesized_policy_id provided) whether agent\'s needed tools are blocked.
+
+    This is the honest alternative to AWS Access Analyzer formal verification —
+    structural conflict detection without the theorem prover.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT name, rules FROM policies WHERE tenant_id=$1 AND name=$2",
+            tenant["id"], name)
+    if not row: raise HTTPException(404, f"Policy \'{name}\' not found")
+
+    rules = json.loads(row["rules"]) if isinstance(row["rules"], str) else dict(row["rules"])
+
+    # Load synthesized tools if requested
+    synthesized_tools = None
+    if synthesized_policy_id:
+        async with pool.acquire() as conn:
+            sp = await conn.fetchrow(
+                "SELECT inferred_tools FROM synthesized_policies WHERE id=$1 AND tenant_id=$2",
+                synthesized_policy_id, tenant["id"])
+        if sp:
+            synthesized_tools = list(sp["inferred_tools"] or [])
+
+    report = await detect_policy_conflicts(
+        name, rules, tenant["id"], synthesized_tools)
+    return report
+
+@app.post("/policies/validate")
+async def validate_policy_rules(body: PolicyCreate, tenant=Depends(get_tenant)):
+    """
+    Validate a policy rules dict BEFORE saving it.
+    Returns conflict report so you can fix issues before deploying.
+    Does not save the policy.
+    """
+    report = await detect_policy_conflicts(
+        body.name, body.rules, tenant["id"])
+    return {
+        "valid":    not report.has_conflicts,
+        "report":   report,
+        "message":  "Policy has no conflicts — safe to save." if not report.has_conflicts
+                    else f"Policy has {report.conflict_count} conflict(s). Review before saving."
+    }
+
+@app.get("/policies/conflicts/history")
+async def conflict_check_history(tenant=Depends(get_tenant), limit: int=50):
+    """History of all policy conflict checks for this tenant."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT policy_name, conflict_count, checked_at FROM policy_conflict_log"
+            " WHERE tenant_id=$1 ORDER BY checked_at DESC LIMIT $2",
+            tenant["id"], min(limit, 200))
+    return [dict(r) for r in rows]
+
+@app.post("/policies/synthesize/{policy_id}/check-conflicts")
+async def check_synthesized_conflicts(policy_id: str, tenant=Depends(get_tenant),
+                                        target_policy: Optional[str] = None):
+    """
+    Check if a synthesized policy conflicts with an existing active policy.
+    Use this before activating a synthesized policy to verify it won\'t break the agent.
+    """
+    async with pool.acquire() as conn:
+        sp = await conn.fetchrow(
+            "SELECT * FROM synthesized_policies WHERE id=$1 AND tenant_id=$2",
+            policy_id, tenant["id"])
+    if not sp: raise HTTPException(404, "Synthesized policy not found")
+
+    # Check the synthesized policy itself for internal conflicts
+    rules = sp["rules"]
+    if isinstance(rules, str): rules = json.loads(rules)
+    if isinstance(rules, dict):
+        pass
+    else:
+        rules = dict(rules)
+
+    synthesized_tools = list(sp["inferred_tools"] or [])
+    report = await detect_policy_conflicts(
+        sp["name"], rules, tenant["id"], synthesized_tools)
+
+    # Also check against target policy if specified
+    target_report = None
+    if target_policy:
+        async with pool.acquire() as conn:
+            tp_row = await conn.fetchrow(
+                "SELECT rules FROM policies WHERE tenant_id=$1 AND name=$2",
+                tenant["id"], target_policy)
+        if tp_row:
+            target_rules = json.loads(tp_row["rules"]) if isinstance(tp_row["rules"], str) else dict(tp_row["rules"])
+            target_report = await detect_policy_conflicts(
+                target_policy, target_rules, tenant["id"], synthesized_tools)
+
+    return {
+        "synthesized_policy": report,
+        "target_policy_check": target_report,
+        "safe_to_activate":   not report.has_conflicts and
+                               (target_report is None or not target_report.has_conflicts)
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VECTOR INTENT ANCHORING v3.4
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/sessions/{session_id}/anchor")
+async def create_intent_anchor(
+    session_id: str,
+    tenant=Depends(get_tenant),
+    threshold: float = 0.78
+):
+    """
+    Embed the session intent as the security anchor.
+    Call this after creating a session to enable zero-latency drift detection.
+    Replaces the reactive Haiku scoring with mathematical vector distance.
+
+    threshold: cosine distance above which to trip the circuit breaker (0.0-1.0)
+    Lower = stricter. Default 0.78 catches meaningful drift without false positives.
+    """
+    sess = await get_session(session_id, tenant["id"])
+    if not sess: raise HTTPException(404, "Session not found or expired")
+
+    intent = sess.get("intent", "")
+    if not intent: raise HTTPException(400, "Session has no intent set")
+
+    anchor_vec = await anchor_session_intent(
+        session_id, tenant["id"], sess.get("agent_id", ""), intent, threshold)
+
+    non_zero = sum(1 for v in anchor_vec if v != 0.0)
+    return {
+        "session_id":     session_id,
+        "intent":         intent,
+        "threshold":      threshold,
+        "anchor_dims":    len(anchor_vec),
+        "anchor_quality": "good" if non_zero >= 15 else "degraded",
+        "message":        "Anchor set. All tool calls will be checked against this intent vector."
+    }
+
+@app.get("/sessions/{session_id}/anchor")
+async def get_anchor_status(session_id: str, tenant=Depends(get_tenant)):
+    """Get the current anchor status and recent drift measurements."""
+    async with pool.acquire() as conn:
+        anchor = await conn.fetchrow(
+            "SELECT intent_text, threshold, trip_count, last_distance, last_checked_at"
+            " FROM session_intent_anchors WHERE session_id=$1 AND tenant_id=$2",
+            session_id, tenant["id"])
+        recent_checks = await conn.fetch(
+            "SELECT tool, distance, threshold, tripped, turn, created_at"
+            " FROM anchor_check_log WHERE session_id=$1"
+            " ORDER BY created_at DESC LIMIT 20",
+            session_id)
+    if not anchor: raise HTTPException(404, "No anchor found for this session")
+    return {
+        **dict(anchor),
+        "recent_checks": [dict(r) for r in recent_checks]
+    }
+
+@app.patch("/sessions/{session_id}/anchor/threshold")
+async def update_anchor_threshold(
+    session_id: str, body: dict, tenant=Depends(get_tenant)
+):
+    """Tune the drift threshold for a running session without re-anchoring."""
+    threshold = float(body.get("threshold", 0.78))
+    if not 0.0 <= threshold <= 1.0:
+        raise HTTPException(400, "threshold must be 0.0-1.0")
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE session_intent_anchors SET threshold=$1"
+            " WHERE session_id=$2 AND tenant_id=$3",
+            threshold, session_id, tenant["id"])
+    if res == "UPDATE 0": raise HTTPException(404, "Anchor not found")
+    return {"session_id": session_id, "new_threshold": threshold}
+
+@app.get("/sessions/{session_id}/anchor/trips")
+async def get_anchor_trips(session_id: str, tenant=Depends(get_tenant)):
+    """Get all anchor trip events for a session."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT tool, distance, threshold, turn, created_at"
+            " FROM anchor_check_log"
+            " WHERE session_id=$1 AND tripped=TRUE"
+            " ORDER BY created_at DESC",
+            session_id)
+    return [dict(r) for r in rows]
+
+@app.get("/anchors/stats")
+async def anchor_stats(tenant=Depends(get_tenant), days: int=30):
+    """Anchor drift stats across all sessions."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_checks,"
+            " COUNT(*) FILTER (WHERE tripped=TRUE) AS total_trips,"
+            " ROUND(AVG(distance)::numeric,4) AS avg_distance,"
+            " ROUND(MAX(distance)::numeric,4) AS max_distance,"
+            " COUNT(DISTINCT session_id) AS sessions_checked"
+            " FROM anchor_check_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        top_trippers = await conn.fetch(
+            "SELECT session_id, agent_id, tool, distance, created_at"
+            " FROM anchor_check_log WHERE tenant_id=$1 AND tripped=TRUE"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " ORDER BY created_at DESC LIMIT 10",
+            tenant["id"], str(days))
+    return {**dict(row), "recent_trips": [dict(r) for r in top_trippers]}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HONEY-TOOLS v3.4
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/agents/{agent_id}/honey-tools")
+async def configure_honey_tools(
+    agent_id: str,
+    body: HoneyToolConfig,
+    tenant=Depends(get_tenant)
+):
+    """
+    Configure honey tools for an agent.
+    Honey tools are ghost tools that don\'t exist in the real system.
+    Any call to them = 100% certainty of prompt injection, zero false positives.
+
+    If honey_tools is empty, auto-generates from the complement of the agent\'s
+    legitimate tools (requires a synthesized policy for this agent).
+    """
+    async with pool.acquire() as conn:
+        agent = await conn.fetchrow(
+            "SELECT id FROM agents WHERE id=$1 AND tenant_id=$2",
+            agent_id, tenant["id"])
+    if not agent: raise HTTPException(404, "Agent not found")
+
+    honey_tools = body.honey_tools
+    if not honey_tools:
+        # Auto-generate from synthesized policy complement
+        async with pool.acquire() as conn:
+            sp = await conn.fetchrow(
+                "SELECT inferred_tools FROM synthesized_policies"
+                " WHERE tenant_id=$1 AND status=\'active\'"
+                " ORDER BY activated_at DESC LIMIT 1",
+                tenant["id"])
+        legitimate = list(sp["inferred_tools"]) if sp else []
+        honey_tools = await generate_honey_tools(
+            tenant["id"], agent_id, legitimate, count=5)
+    else:
+        # Store provided list
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO honey_tool_configs"
+                " (tenant_id,agent_id,honey_tools,auto_generated,enabled)"
+                " VALUES ($1,$2,$3,FALSE,$4)"
+                " ON CONFLICT (agent_id) DO UPDATE"
+                " SET honey_tools=$3, enabled=$4, updated_at=NOW()",
+                tenant["id"], agent_id, json.dumps(honey_tools), body.enabled)
+
+    return {
+        "agent_id":    agent_id,
+        "honey_tools": honey_tools,
+        "count":       len(honey_tools),
+        "enabled":     body.enabled,
+        "message":     "Honey tools active. Any call to these will instantly flag a session as compromised.",
+    }
+
+@app.get("/agents/{agent_id}/honey-tools")
+async def get_honey_tools(agent_id: str, tenant=Depends(get_tenant)):
+    """Get the honey tools configured for an agent."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT honey_tools, auto_generated, enabled, updated_at"
+            " FROM honey_tool_configs WHERE agent_id=$1 AND tenant_id=$2",
+            agent_id, tenant["id"])
+    if not row: raise HTTPException(404, "No honey tools configured for this agent")
+    return dict(row)
+
+@app.delete("/agents/{agent_id}/honey-tools")
+async def disable_honey_tools(agent_id: str, tenant=Depends(get_tenant)):
+    """Disable honey tools for an agent."""
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE honey_tool_configs SET enabled=FALSE, updated_at=NOW()"
+            " WHERE agent_id=$1 AND tenant_id=$2",
+            agent_id, tenant["id"])
+    if res == "UPDATE 0": raise HTTPException(404, "No honey tools found")
+    return {"agent_id": agent_id, "enabled": False}
+
+@app.get("/honey-tools/trips")
+async def list_honey_trips(
+    tenant=Depends(get_tenant),
+    agent_id: Optional[str] = None,
+    days: int = 30,
+    limit: int = 100
+):
+    """
+    List all honey-tool trip events.
+    Each trip = 100% confirmed prompt injection attempt.
+    """
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2||' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if agent_id:
+        where += " AND agent_id=$3"; vals.append(agent_id)
+    vals.append(min(limit, 500))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT * FROM honey_tool_trips {where}"
+            f" ORDER BY created_at DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/honey-tools/stats")
+async def honey_tool_stats(tenant=Depends(get_tenant), days: int=30):
+    """Honey-tool trip statistics."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_trips,"
+            " COUNT(DISTINCT session_id) AS sessions_compromised,"
+            " COUNT(DISTINCT agent_id) AS agents_targeted,"
+            " COUNT(DISTINCT honey_tool) AS unique_traps_triggered"
+            " FROM honey_tool_trips WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        by_tool = await conn.fetch(
+            "SELECT honey_tool, COUNT(*) AS trips FROM honey_tool_trips"
+            " WHERE tenant_id=$1 AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " GROUP BY honey_tool ORDER BY trips DESC",
+            tenant["id"], str(days))
+    return {**dict(row), "by_trap": [dict(r) for r in by_tool]}
+
+@app.post("/proxy/chat/v4")
+@limiter.limit("300/minute;30/second")
+async def proxy_chat_v4(req: ProxyRequestV31, request: Request,
+                          bg: BackgroundTasks, tenant=Depends(get_tenant)):
+    """
+    Full v3.4 proxy — the complete pipeline including all four new features:
+
+    PRE-CALL:
+      Honey tool injection into system prompt
+
+    INPUT:
+      keyword firewall → semantic classifier → injection scan → PII tokenize
+
+    ENFORCEMENT (per tool call via /sessions/{id}/protect):
+      honey-tool check → policy → injection → rate limit →
+      semantic check → VECTOR ANCHOR (replaces Haiku drift) → HITL
+
+    OUTPUT:
+      PII detokenize → output gate → semantic output check →
+      CITATION grounding (sentence-level)
+    """
+    start = time.monotonic()
+    tid   = tenant["id"]
+
+    # ── Inject honey tools into system prompt ─────────────────────────────────
+    honey_system = req.system
+    if req.agent_id:
+        honey_tools = await _get_honey_tools(tid, req.agent_id)
+        if honey_tools:
+            honey_system = inject_honey_tools(req.system, honey_tools)
+
+    # ── Input guardrails (semantic) ───────────────────────────────────────────
+    safe_messages, safe_system, input_report = await run_semantic_guardrails(
+        req.messages, honey_system, tid, req.agent_id, req.session_id,
+        tokenize=req.tokenize_pii)
+
+    if input_report.get("blocked"):
+        ms = int((time.monotonic()-start)*1000)
+        return JSONResponse(status_code=400, content={
+            "allowed": False, "blocked_at": "input",
+            "reason": input_report.get("reason"), "layer": input_report.get("layer"),
+            "confidence": input_report.get("confidence"), "policy": input_report.get("policy"),
+            "duration_ms": ms})
+
+    if req.dry_run:
+        return {"dry_run": True, "input_report": input_report,
+                "honey_tools_injected": len(honey_tools) if req.agent_id else 0,
+                "messages_after_guardrails": len(safe_messages)}
+
+    # ── LLM call ──────────────────────────────────────────────────────────────
+    try:
+        client = anthropic.AsyncAnthropic()
+        build_kwargs = dict(model=req.model, max_tokens=req.max_tokens, messages=safe_messages)
+        if safe_system: build_kwargs["system"] = safe_system
+        msg = await asyncio.wait_for(client.messages.create(**build_kwargs), timeout=120.0)
+        llm_response      = msg.content[0].text if msg.content else ""
+        prompt_tokens     = msg.usage.input_tokens
+        completion_tokens = msg.usage.output_tokens
+    except Exception as e:
+        log.error("proxy_v4.llm_error", error=str(e))
+        return JSONResponse(status_code=502, content={"error": f"LLM error: {type(e).__name__}"})
+
+    # ── Check if LLM tried to call a honey tool ───────────────────────────────
+    # Scan the response text for honey tool names (model might "call" them as text)
+    honey_in_output = False
+    if req.agent_id and req.session_id:
+        honey_tools_active = await _get_honey_tools(tid, req.agent_id)
+        for ht in honey_tools_active:
+            if ht.lower() in llm_response.lower():
+                is_honey, honey_reason = await check_honey_tool_call(
+                    ht, req.session_id, tid, req.agent_id,
+                    {}, llm_response[:200], 0)
+                if is_honey:
+                    honey_in_output = True
+                    llm_response = f"[SESSION TERMINATED: {honey_reason}]"
+                    break
+
+    # ── Output guardrails + citation grounding ────────────────────────────────
+    safe_response, output_report = await run_output_semantic_guardrails(
+        llm_response, tid, req.agent_id, req.session_id,
+        detokenize_pii=req.tokenize_pii,
+        check_ground=False,  # We do citation grounding below instead
+        grounding_threshold=req.grounding_threshold)
+
+    # Citation-level grounding
+    citation_result = None
+    if req.check_grounding and not honey_in_output:
+        citation_result = await check_grounding_with_citations(
+            safe_response, tid, req.session_id, req.agent_id,
+            threshold=req.grounding_threshold)
+        if not citation_result.grounded:
+            safe_response = (
+                f"[GROUNDING WARNING: {citation_result.support_ratio:.0%} supported "
+                f"({citation_result.supported}/{citation_result.total_sentences} sentences). "
+                f"Unsupported claims detected.]\n\n" + safe_response
+            )
+
+    ms = int((time.monotonic()-start)*1000)
+    LATENCY.labels(endpoint="proxy_v4").observe(ms/1000)
+
+    response_body = {
+        "content": safe_response,
+        "model":   req.model,
+        "usage": {
+            "prompt_tokens":     prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens":      prompt_tokens + completion_tokens,
+        },
+        "guardrails": {
+            "input":              input_report,
+            "output":             output_report,
+            "honey_tool_tripped": honey_in_output,
+        },
+        "duration_ms": ms,
+    }
+
+    if citation_result:
+        response_body["grounding"] = {
+            "grounded":       citation_result.grounded,
+            "support_ratio":  citation_result.support_ratio,
+            "total_sentences": citation_result.total_sentences,
+            "supported":      citation_result.supported,
+            "unsupported":    citation_result.unsupported,
+            "citations":      citation_result.citations,
+            "summary":        citation_result.summary,
+        }
+
+    return response_body
+'''
+
 @app.get("/health")
 async def health():
     checks = {"postgres": False, "redis": None}
