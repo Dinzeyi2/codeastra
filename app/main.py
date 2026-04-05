@@ -1,5 +1,5 @@
 """
-AgentGuard v2.0.0 — Multi-tenant, Compliance-ready, Enterprise AI Governance API
+AgentGuard v3.0.0 — Multi-tenant, Compliance-ready, Enterprise AI Governance API
 """
 import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio, secrets
 from collections import OrderedDict
@@ -27,8 +27,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
 from pydantic import BaseModel, EmailStr
-from app.v3 import *
 import asyncpg
+from app.v3 import *
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 structlog.configure(
@@ -61,7 +61,6 @@ SEMANTIC_CALLS   = Counter("agentguard_semantic_calls_total", "Semantic checks",
 ANTHROPIC_ERRORS = Counter("agentguard_anthropic_errors_total", "Anthropic errors")
 REDIS_ERRORS     = Counter("agentguard_redis_errors_total", "Redis errors")
 
-
 bearer   = HTTPBearer(auto_error=False)
 limiter  = Limiter(key_func=get_remote_address)
 
@@ -87,19 +86,14 @@ async def lifespan(app: FastAPI):
     elif IS_PROD:
         raise RuntimeError("REDIS_URL required in prod")
     await init_db()
-    log.info("agentguard.started", version="2.0.0", env=AGENTGUARD_ENV)
+    log.info("agentguard.started", version="3.0.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
     if redis_conn:
         await redis_conn.aclose()
-# v3 migrations — sessions, HITL, injection, rate limits
-for _sql in SESSION_MIGRATIONS:
-    await conn.execute(_sql)
+
 async def init_db():
     async with pool.acquire() as conn:
-        # Create each table separately so IF NOT EXISTS works correctly
-        # even when migrating from older schema versions
-
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS tenants (
             id            TEXT PRIMARY KEY,
@@ -125,7 +119,6 @@ async def init_db():
             updated_at    TIMESTAMPTZ DEFAULT NOW()
         )""")
 
-        # Migrate: add tenant_id to agents if missing
         await conn.execute("""
         DO $$ BEGIN
             IF NOT EXISTS (
@@ -157,7 +150,6 @@ async def init_db():
             created_at TIMESTAMPTZ DEFAULT NOW()
         )""")
 
-        # Migrate: add id column to policies if missing
         await conn.execute("""
         DO $$ BEGIN
             IF NOT EXISTS (
@@ -169,7 +161,6 @@ async def init_db():
             END IF;
         END $$""")
 
-        # Migrate: add tenant_id to policies if missing
         await conn.execute("""
         DO $$ BEGIN
             IF NOT EXISTS (
@@ -199,7 +190,6 @@ async def init_db():
             created_at  TIMESTAMPTZ DEFAULT NOW()
         )""")
 
-        # Migrate: add tenant_id to audit_logs if missing
         await conn.execute("""
         DO $$ BEGIN
             IF NOT EXISTS (
@@ -233,7 +223,6 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS anomaly_tenant_idx
         ON anomaly_alerts(tenant_id, created_at DESC) WHERE tenant_id IS NOT NULL""")
 
-        # CRITICAL: migrate policies table — fix old schema where name was PK
         await conn.execute("""
         DO $$ BEGIN
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns
@@ -245,6 +234,7 @@ async def init_db():
             THEN ALTER TABLE policies ADD COLUMN tenant_id TEXT;
             END IF;
         END $$""")
+
         await conn.execute("""
         DO $$ BEGIN
             IF EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_class t ON c.conrelid=t.oid
@@ -257,7 +247,6 @@ async def init_db():
         EXCEPTION WHEN others THEN NULL;
         END $$""")
 
-        # Migrate: add retention_days, api_call_count, last_seen_at to tenants
         await conn.execute("""
         DO $$ BEGIN
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns
@@ -274,18 +263,20 @@ async def init_db():
             END IF;
         END $$""")
 
-        # Migrate: create policy_history table
         await conn.execute("""CREATE TABLE IF NOT EXISTS policy_history (
             id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
             policy_name TEXT NOT NULL, rules JSONB NOT NULL,
             changed_at TIMESTAMPTZ DEFAULT NOW())""")
 
-        # Migrate: create webhooks table
         await conn.execute("""CREATE TABLE IF NOT EXISTS webhooks (
             id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
             url TEXT NOT NULL, events TEXT[] NOT NULL,
             secret TEXT NOT NULL, active BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMPTZ DEFAULT NOW())""")
+
+        # ── v3 migrations — CORRECT LOCATION: inside init_db, inside conn block ──
+        for _sql in SESSION_MIGRATIONS:
+            await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class TenantSignup(BaseModel):
@@ -364,7 +355,6 @@ async def get_tenant(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
     x_api_key: Optional[str] = Header(None),
 ) -> asyncpg.Record:
-    """Resolve tenant from JWT bearer token OR api key header."""
     tenant = None
     async with pool.acquire() as conn:
         if creds:
@@ -377,9 +367,7 @@ async def get_tenant(
                     "UPDATE tenants SET api_call_count = COALESCE(api_call_count,0)+1, last_seen_at=NOW() WHERE id=$1",
                     tenant["id"]
                 )
-        # Admin bypass
         if not tenant and x_api_key == ADMIN_API_KEY:
-            # Return a fake tenant row that works everywhere
             class AdminTenant(dict):
                 def __getitem__(self, k):
                     defaults = {"id": "__admin__", "plan": "enterprise", "tenant_id": "__admin__",
@@ -419,20 +407,17 @@ DEFAULT_POLICIES = [
 async def seed_tenant_policies(tenant_id: str, conn):
     for pol_name, rules in DEFAULT_POLICIES:
         try:
-            # Check if this tenant already has this policy
             existing = await conn.fetchval(
                 "SELECT name FROM policies WHERE tenant_id=$1 AND name=$2", tenant_id, pol_name
             )
             if existing:
                 continue
-            # Try insert with id column
             try:
                 await conn.execute(
                     "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)",
                     str(uuid.uuid4()), tenant_id, pol_name, json.dumps(rules)
                 )
             except Exception:
-                # Fallback: old schema where name is PK, no id column
                 await conn.execute(
                     "INSERT INTO policies (name,rules) VALUES ($1,$2) ON CONFLICT (name) DO NOTHING",
                     pol_name, json.dumps(rules)
@@ -465,7 +450,7 @@ async def _redis_ok() -> bool:
 async def is_nonce_fresh(nonce: str) -> bool:
     if redis_conn:
         if not await _redis_ok():
-            return not IS_PROD  # dev: allow; prod: deny
+            return not IS_PROD
         result = await redis_conn.set(f"ag:n:{nonce}", "1", ex=REPLAY_WINDOW_SECS, nx=True)
         return result is not None
     now = time.time()
@@ -480,10 +465,6 @@ async def is_nonce_fresh(nonce: str) -> bool:
     return True
 
 async def verify_request(agent, body, sig, ts, nonce) -> tuple[bool, str]:
-    # Signatures are OPTIONAL unless agent has a public key registered
-    # If agent has no public key, skip signature check entirely
-    # If agent has a public key AND signature is provided, verify it
-    # This allows gradual adoption — start without signing, add signing later
     if ts is not None and abs(int(time.time()) - ts) > REPLAY_WINDOW_SECS:
         return False, "Request expired"
     if nonce is not None and not await is_nonce_fresh(nonce):
@@ -494,8 +475,6 @@ async def verify_request(agent, body, sig, ts, nonce) -> tuple[bool, str]:
         ok, reason = verify_ed25519(agent["public_key"], body, sig)
         if not ok:
             return False, reason
-    # If agent HAS a public key and NO signature provided, still allow (optional signing)
-    # To enforce signing, set REQUIRE_SIGNATURES=true in Railway env vars
     if os.environ.get("REQUIRE_SIGNATURES") == "true":
         if sig is None and agent.get("public_key"):
             return False, "Signature required — set x-agent-signature header"
@@ -687,7 +666,6 @@ async def check_anomalies(tenant_id: str, agent_id: str, tool: str, bg: Backgrou
 async def _run_anomaly_checks(tenant_id: str, agent_id: str, tool: str):
     try:
         async with pool.acquire() as conn:
-            # Check 1: sudden spike — 3x normal rate in last 5 min
             recent = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_logs WHERE agent_id=$1 AND created_at > NOW() - INTERVAL '5 minutes'",
                 agent_id
@@ -703,7 +681,6 @@ async def _run_anomaly_checks(tenant_id: str, agent_id: str, tool: str):
                 await _create_alert(conn, tenant_id, agent_id, "rate_spike",
                     f"Agent made {recent} calls in 5min (baseline: {baseline:.0f}/min)")
 
-            # Check 2: high deny rate — >50% denied in last 10 min
             total = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_logs WHERE agent_id=$1 AND created_at > NOW() - INTERVAL '10 minutes'",
                 agent_id
@@ -716,7 +693,6 @@ async def _run_anomaly_checks(tenant_id: str, agent_id: str, tool: str):
                 await _create_alert(conn, tenant_id, agent_id, "high_deny_rate",
                     f"{denied}/{total} requests denied in last 10min ({100*denied//total}%)")
 
-            # Check 3: new tool never seen before
             seen_before = await conn.fetchval(
                 "SELECT COUNT(*) FROM audit_logs WHERE agent_id=$1 AND tool=$2 AND created_at < NOW() - INTERVAL '1 hour'",
                 agent_id, tool
@@ -733,7 +709,6 @@ async def _run_anomaly_checks(tenant_id: str, agent_id: str, tool: str):
         log.error("anomaly.check_failed", error=str(e))
 
 async def _create_alert(conn, tenant_id, agent_id, alert_type, detail):
-    # Deduplicate: don't create same alert type twice in 1 hour
     existing = await conn.fetchval(
         "SELECT id FROM anomaly_alerts WHERE agent_id=$1 AND alert_type=$2 "
         "AND created_at > NOW() - INTERVAL '1 hour' AND resolved=FALSE",
@@ -762,23 +737,6 @@ async def log_action(request_id, tenant_id, agent_id, user_id, tool, args,
         )
     REQUESTS_TOTAL.labels(endpoint="protect", decision=decision, tenant=(tenant_id or "")[:8]).inc()
 
-async def run_enforcement(tool, args, agent, rules, patterns, context):
-    if isinstance(rules, str): rules = json.loads(rules)
-    ok, reason = check_tool(tool, rules)
-    if not ok: return False, reason, args, False, "blocked"
-    clean, redacted = redact(args, patterns)
-    if not isinstance(clean, dict): clean = {}
-    ok, reason = check_args(clean, rules)
-    if not ok: return False, reason, clean, redacted, "blocked"
-    toks = _tokens(tool)
-    if context is not None or any(t in SUSPICIOUS_VERBS for t in toks):
-        sem_ok, sem_reason = await semantic_check(tool, clean, context, agent["policy"])
-        if not sem_ok: return False, sem_reason, clean, redacted, "blocked_semantic"
-    hitl = rules.get("require_approval", [])
-    if any(_matches(tool, p) for p in hitl):
-        return False, "requires human approval", clean, redacted, "pending_approval"
-    return True, "all checks passed", clean, redacted, "proceed"
-
 async def load_agent_and_policy(agent_id: str, tenant_id: str):
     async with pool.acquire() as conn:
         agent = await conn.fetchrow(
@@ -796,7 +754,7 @@ async def load_agent_and_policy(agent_id: str, tenant_id: str):
     return agent, policy
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AgentGuard", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="AgentGuard", version="3.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS","*").split(",") if o.strip()]
@@ -813,7 +771,7 @@ def rid(request: Request) -> str:
     return request.headers.get("x-request-id") or str(uuid.uuid4())
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AUTH ENDPOINTS
+# AUTH
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/auth/signup")
 async def signup(body: TenantSignup):
@@ -838,10 +796,7 @@ async def signup(body: TenantSignup):
         })
     except Exception as e:
         log.error("signup.insert_failed", error=str(e), error_type=type(e).__name__)
-        return JSONResponse(status_code=500, content={
-            "error": "signup_failed",
-            "detail": str(e)
-        })
+        return JSONResponse(status_code=500, content={"error": "signup_failed", "detail": str(e)})
     token = create_jwt(tenant_id)
     log.info("tenant.created", tenant_id=tenant_id, email=body.email)
     return {"token": token, "api_key": api_key, "tenant_id": tenant_id,
@@ -867,7 +822,7 @@ async def me(tenant = Depends(get_tenant)):
     return dict(row)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PROTECT + INVOKE  (the core product)
+# PROTECT + INVOKE
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/protect")
 @limiter.limit("120/minute;20/second")
@@ -880,13 +835,11 @@ async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
     tenant_id = tenant["id"] if tenant["id"] != "__admin__" else "__admin__"
     structlog.contextvars.bind_contextvars(request_id=request_id, tenant_id=tenant_id,
                                            agent_id=req.agent_id, tool=req.tool)
-    # Admin key can access any agent
     if tenant_id == "__admin__":
         async with pool.acquire() as conn:
             agent_row = await conn.fetchrow("SELECT * FROM agents WHERE id=$1", req.agent_id)
             if not agent_row:
                 raise HTTPException(404, f"Agent '{req.agent_id}' not found")
-            # Look up policy by tenant + name, fall back to any matching name
             policy_row = await conn.fetchrow(
                 "SELECT * FROM policies WHERE tenant_id=$1 AND name=$2",
                 agent_row["tenant_id"], agent_row["policy"]
@@ -896,12 +849,11 @@ async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
                     "SELECT * FROM policies WHERE name=$1 LIMIT 1", agent_row["policy"]
                 )
             if not policy_row:
-                # Use a permissive fallback so admin can always test
                 policy_row = {"rules": '{"allow_tools":["*"],"deny_tools":[],"read_only":false,"max_records":1000,"redact_patterns":[]}', "name": "fallback"}
         agent = agent_row
     else:
         agent, policy_row = await load_agent_and_policy(req.agent_id, tenant_id)
-    # Skip signature check for admin key — admin can always test
+
     if tenant_id != "__admin__":
         ok, reason = await verify_request(agent, body, x_agent_signature, req.timestamp, req.nonce)
         if not ok:
@@ -909,10 +861,13 @@ async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
 
     rules    = policy_row["rules"]
     patterns = build_patterns(rules)
-    allowed, reason, clean, redacted, action = await run_enforcement(
+
+    # ── FIXED: use run_enforcement_v3 (from app.v3 import *) ──
+    allowed, reason, clean, redacted, action = await run_enforcement_v3(
         req.tool, req.args, agent, rules, patterns, req.context,
         tenant_id=tenant_id
     )
+
     decision = "allow" if allowed else ("pending" if action=="pending_approval" else "deny")
     ms = int((time.monotonic()-start)*1000)
 
@@ -954,8 +909,9 @@ async def invoke(req: InvokeRequest, request: Request, bg: BackgroundTasks,
     if not url_ok:
         return JSONResponse(status_code=400, content={"allowed": False, "reason": url_reason, "action": "ssrf_blocked"})
 
-    allowed, reason, clean, redacted, action = await run_enforcement(
-        req.tool, req.args, agent, rules, patterns, req.context
+    allowed, reason, clean, redacted, action = await run_enforcement_v3(
+        req.tool, req.args, agent, rules, patterns, req.context,
+        tenant_id=tenant["id"]
     )
     ms = int((time.monotonic()-start)*1000)
     if not allowed:
@@ -1144,13 +1100,9 @@ async def audit_stats(tenant = Depends(get_tenant), agent_id: Optional[str]=None
         """, *vals)
     return dict(row)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COMPLIANCE REPORT EXPORT
-# ══════════════════════════════════════════════════════════════════════════════
 @app.get("/audit/export/json")
 async def export_json(tenant = Depends(get_tenant),
                       days: int = 30, agent_id: Optional[str] = None):
-    """Export full audit log as JSON for GDPR/SOC2/HIPAA compliance."""
     where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
     vals  = [tenant["id"], str(days)]
     if agent_id:
@@ -1158,22 +1110,18 @@ async def export_json(tenant = Depends(get_tenant),
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM audit_logs {where} ORDER BY created_at DESC", *vals)
     data = {
-        "export_date":  datetime.now(timezone.utc).isoformat(),
-        "tenant_id":    tenant["id"],
-        "period_days":  days,
+        "export_date":   datetime.now(timezone.utc).isoformat(),
+        "tenant_id":     tenant["id"],
+        "period_days":   days,
         "total_records": len(rows),
-        "records": [dict(r) for r in rows],
+        "records":       [dict(r) for r in rows],
     }
     content = json.dumps(data, default=str, indent=2).encode()
-    return StreamingResponse(
-        iter([content]),
-        media_type="application/json",
-        headers={"Content-Disposition": f"attachment; filename=agentguard-audit-{days}d.json"}
-    )
+    return StreamingResponse(iter([content]), media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename=agentguard-audit-{days}d.json"})
 
 @app.get("/audit/export/csv")
 async def export_csv(tenant = Depends(get_tenant), days: int = 30):
-    """Export audit log as CSV."""
     import csv, io
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1189,13 +1137,85 @@ async def export_csv(tenant = Depends(get_tenant), days: int = 30):
                          r["tool"],r["decision"],r["reason"],r["redacted"],
                          r["duration_ms"],r["created_at"]])
     content = output.getvalue().encode()
-    return StreamingResponse(
-        iter([content]), media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=agentguard-audit-{days}d.csv"}
-    )
+    return StreamingResponse(iter([content]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=agentguard-audit-{days}d.csv"})
+
+@app.get("/audit/stats/timeseries")
+async def stats_timeseries(tenant = Depends(get_tenant), interval: str = "hour",
+                            days: int = 30, agent_id: Optional[str] = None):
+    trunc = {"hour":"hour","day":"day","week":"week"}.get(interval, "hour")
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if agent_id:
+        where += " AND agent_id=$3"; vals.append(agent_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT date_trunc('{trunc}', created_at) AS period,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE decision='allow') AS allowed,
+                COUNT(*) FILTER (WHERE decision='deny')  AS denied,
+                ROUND(AVG(duration_ms)) AS avg_ms
+            FROM audit_logs {where}
+            GROUP BY period ORDER BY period ASC
+        """, *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/audit/stats/by-tool")
+async def stats_by_tool(tenant = Depends(get_tenant), days: int = 30,
+                         agent_id: Optional[str] = None, limit: int = 20):
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if agent_id:
+        where += " AND agent_id=$3"; vals.append(agent_id)
+    vals.append(min(limit, 100))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT tool, COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE decision='allow') AS allowed,
+                COUNT(*) FILTER (WHERE decision='deny')  AS denied,
+                ROUND(AVG(duration_ms)) AS avg_ms,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE decision='deny') / NULLIF(COUNT(*),0), 1) AS deny_rate_pct
+            FROM audit_logs {where}
+            GROUP BY tool ORDER BY total DESC LIMIT ${len(vals)}
+        """, *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/audit/anomalies")
+async def audit_anomalies(tenant = Depends(get_tenant), days: int = 7,
+                           agent_id: Optional[str] = None):
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if agent_id:
+        where += " AND agent_id=$3"; vals.append(agent_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            WITH hourly AS (
+                SELECT date_trunc('hour', created_at) AS hour, agent_id,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE decision='deny') AS denied
+                FROM audit_logs {where}
+                GROUP BY hour, agent_id
+            ),
+            stats AS (
+                SELECT agent_id, AVG(total) AS avg_total, STDDEV(total) AS std_total
+                FROM hourly GROUP BY agent_id
+            )
+            SELECT h.hour, h.agent_id, h.total, h.denied,
+                ROUND(100.0*h.denied/NULLIF(h.total,0),1) AS deny_rate_pct,
+                CASE
+                    WHEN s.std_total > 0 AND h.total > s.avg_total + (2*s.std_total) THEN 'volume_spike'
+                    WHEN h.total >= 5 AND h.denied::float/NULLIF(h.total,0) > 0.5 THEN 'high_deny_rate'
+                    ELSE NULL
+                END AS anomaly_type
+            FROM hourly h JOIN stats s ON h.agent_id = s.agent_id
+            WHERE (s.std_total > 0 AND h.total > s.avg_total + (2*s.std_total))
+               OR (h.total >= 5 AND h.denied::float/NULLIF(h.total,0) > 0.5)
+            ORDER BY h.hour DESC
+        """, *vals)
+    return [dict(r) for r in rows]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ANOMALY ALERTS
+# ALERTS
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/alerts")
 async def list_alerts(tenant = Depends(get_tenant), resolved: Optional[bool] = None, limit: int = 50):
@@ -1232,96 +1252,6 @@ async def metrics(x_api_key: str = Header(...)):
     from fastapi.responses import Response
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TIME-SERIES STATS
-# ══════════════════════════════════════════════════════════════════════════════
-@app.get("/audit/stats/timeseries")
-async def stats_timeseries(
-    tenant = Depends(get_tenant),
-    interval: str = "hour",
-    days: int = 30,
-    agent_id: Optional[str] = None,
-):
-    valid = {"hour": "hour", "day": "day", "week": "week"}
-    trunc = valid.get(interval, "hour")
-    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
-    vals  = [tenant["id"], str(days)]
-    if agent_id:
-        where += " AND agent_id=$3"; vals.append(agent_id)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(f"""
-            SELECT date_trunc('{trunc}', created_at) AS period,
-                COUNT(*) AS total,
-                COUNT(*) FILTER (WHERE decision='allow') AS allowed,
-                COUNT(*) FILTER (WHERE decision='deny')  AS denied,
-                ROUND(AVG(duration_ms)) AS avg_ms
-            FROM audit_logs {where}
-            GROUP BY period ORDER BY period ASC
-        """, *vals)
-    return [dict(r) for r in rows]
-
-@app.get("/audit/stats/by-tool")
-async def stats_by_tool(
-    tenant = Depends(get_tenant),
-    days: int = 30,
-    agent_id: Optional[str] = None,
-    limit: int = 20,
-):
-    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
-    vals  = [tenant["id"], str(days)]
-    if agent_id:
-        where += " AND agent_id=$3"; vals.append(agent_id)
-    vals.append(min(limit, 100))
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(f"""
-            SELECT tool,
-                COUNT(*) AS total,
-                COUNT(*) FILTER (WHERE decision='allow') AS allowed,
-                COUNT(*) FILTER (WHERE decision='deny')  AS denied,
-                ROUND(AVG(duration_ms)) AS avg_ms,
-                ROUND(100.0 * COUNT(*) FILTER (WHERE decision='deny') / NULLIF(COUNT(*),0), 1) AS deny_rate_pct
-            FROM audit_logs {where}
-            GROUP BY tool ORDER BY total DESC LIMIT ${len(vals)}
-        """, *vals)
-    return [dict(r) for r in rows]
-
-@app.get("/audit/anomalies")
-async def audit_anomalies(
-    tenant = Depends(get_tenant),
-    days: int = 7,
-    agent_id: Optional[str] = None,
-):
-    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2 || ' days')::INTERVAL"
-    vals  = [tenant["id"], str(days)]
-    if agent_id:
-        where += " AND agent_id=$3"; vals.append(agent_id)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(f"""
-            WITH hourly AS (
-                SELECT date_trunc('hour', created_at) AS hour, agent_id,
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE decision='deny') AS denied
-                FROM audit_logs {where}
-                GROUP BY hour, agent_id
-            ),
-            stats AS (
-                SELECT agent_id, AVG(total) AS avg_total, STDDEV(total) AS std_total
-                FROM hourly GROUP BY agent_id
-            )
-            SELECT h.hour, h.agent_id, h.total, h.denied,
-                ROUND(100.0*h.denied/NULLIF(h.total,0),1) AS deny_rate_pct,
-                CASE
-                    WHEN s.std_total > 0 AND h.total > s.avg_total + (2*s.std_total) THEN 'volume_spike'
-                    WHEN h.total >= 5 AND h.denied::float/NULLIF(h.total,0) > 0.5 THEN 'high_deny_rate'
-                    ELSE NULL
-                END AS anomaly_type
-            FROM hourly h JOIN stats s ON h.agent_id = s.agent_id
-            WHERE (s.std_total > 0 AND h.total > s.avg_total + (2*s.std_total))
-               OR (h.total >= 5 AND h.denied::float/NULLIF(h.total,0) > 0.5)
-            ORDER BY h.hour DESC
-        """, *vals)
-    return [dict(r) for r in rows]
-
 @app.get("/settings/retention")
 async def get_retention(tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
@@ -1335,13 +1265,6 @@ async def set_retention(body: dict, tenant = Depends(get_tenant)):
     if not 7 <= days <= 3650:
         raise HTTPException(400, "Retention must be 7-3650 days")
     async with pool.acquire() as conn:
-        await conn.execute("""
-            DO $$ BEGIN
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                    WHERE table_name='tenants' AND column_name='retention_days')
-                THEN ALTER TABLE tenants ADD COLUMN retention_days INTEGER DEFAULT 90;
-                END IF;
-            END $$""")
         await conn.execute("UPDATE tenants SET retention_days=$1 WHERE id=$2", days, tenant["id"])
         deleted = await conn.fetchval(
             "WITH d AS (DELETE FROM audit_logs WHERE tenant_id=$1 "
@@ -1353,10 +1276,6 @@ async def set_retention(body: dict, tenant = Depends(get_tenant)):
 @app.get("/policies/{name}/history")
 async def policy_history(name: str, tenant = Depends(get_tenant)):
     async with pool.acquire() as conn:
-        await conn.execute("""CREATE TABLE IF NOT EXISTS policy_history (
-            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
-            policy_name TEXT NOT NULL, rules JSONB NOT NULL,
-            changed_at TIMESTAMPTZ DEFAULT NOW())""")
         rows = await conn.fetch(
             "SELECT * FROM policy_history WHERE tenant_id=$1 AND policy_name=$2 ORDER BY changed_at DESC",
             tenant["id"], name
@@ -1370,11 +1289,6 @@ async def create_webhook(body: dict, tenant = Depends(get_tenant)):
     if not url:
         raise HTTPException(400, "url is required")
     async with pool.acquire() as conn:
-        await conn.execute("""CREATE TABLE IF NOT EXISTS webhooks (
-            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
-            url TEXT NOT NULL, events TEXT[] NOT NULL,
-            secret TEXT NOT NULL, active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMPTZ DEFAULT NOW())""")
         wh_id  = str(uuid.uuid4())
         secret = secrets.token_hex(24)
         await conn.execute(
@@ -1402,7 +1316,6 @@ async def delete_webhook(webhook_id: str, tenant = Depends(get_tenant)):
 
 @app.get("/admin/tenants")
 async def admin_tenants(x_api_key: str = Header(...)):
-    """Admin only — see all tenants and their usage."""
     if x_api_key != ADMIN_API_KEY:
         raise HTTPException(401, "Admin key required")
     async with pool.acquire() as conn:
@@ -1435,5 +1348,5 @@ async def health():
     return JSONResponse(
         status_code=200 if all_ok else 503,
         content={"status":"ok" if all_ok else "degraded",
-                 "checks": checks, "env": AGENTGUARD_ENV, "version": "2.0.0"}
+                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.0.0"}
     )
