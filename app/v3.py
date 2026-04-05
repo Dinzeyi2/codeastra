@@ -3455,3 +3455,519 @@ async def _log_model_usage(
             )
     except Exception as e:
         log.warning("model_usage.log_failed", error=str(e))
+
+
+
+"""
+AgentGuard v3.5.0 — Option C
+  1. Proxy passthrough streaming (CLI proxy transparently forwards streaming agent responses)
+  2. Internal model config per tenant (tenants configure which model AgentGuard uses internally)
+
+PASTE AT BOTTOM OF: app/v3.py
+
+DB MIGRATIONS: V35_MIGRATIONS
+  - Adds security_model + security_provider columns to tenants
+  - Adds tenant_security_config table for granular per-check model overrides
+  - Adds proxy_stream_log for streaming session tracking
+
+NEW EXPORTS:
+  get_tenant_security_model()   — resolves which model to use for internal checks
+  call_security_llm()           — unified internal LLM caller (replaces all hardcoded Haiku calls)
+  proxy_stream_generator()      — async generator for passthrough streaming with guardrails
+  StreamPassthroughRequest      — Pydantic model for passthrough proxy
+  V35_MIGRATIONS                — DB migrations list
+"""
+
+import os, json, time, asyncio, uuid, re
+from typing import Optional, AsyncIterator, Any
+from dataclasses import dataclass
+from pydantic import BaseModel
+import httpx
+import structlog
+
+log = structlog.get_logger()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB MIGRATIONS v3.5
+# ══════════════════════════════════════════════════════════════════════════════
+
+V35_MIGRATIONS = [
+
+# Add security model config columns to tenants
+"""DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+        WHERE table_name='tenants' AND column_name='security_model')
+    THEN ALTER TABLE tenants
+        ADD COLUMN security_model    TEXT DEFAULT 'claude-haiku-4-5-20251001',
+        ADD COLUMN security_provider TEXT DEFAULT 'anthropic';
+    END IF;
+END $$""",
+
+# Granular per-check model overrides per tenant
+"""CREATE TABLE IF NOT EXISTS tenant_security_config (
+    tenant_id         TEXT PRIMARY KEY,
+    -- per-check model overrides (null = use security_model default)
+    semantic_model    TEXT,
+    embedding_model   TEXT,
+    grounding_model   TEXT,
+    drift_model       TEXT,
+    citation_model    TEXT,
+    -- provider API keys stored encrypted (optional — tenants can bring own keys)
+    openai_key_enc    TEXT,
+    gemini_key_enc    TEXT,
+    groq_key_enc      TEXT,
+    ollama_base_url   TEXT,
+    -- config
+    max_tokens_check  INTEGER DEFAULT 300,
+    check_timeout_s   NUMERIC(5,2) DEFAULT 8.0,
+    updated_at        TIMESTAMPTZ DEFAULT NOW()
+)""",
+
+# Proxy stream session log
+"""CREATE TABLE IF NOT EXISTS proxy_stream_log (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    agent_id        TEXT,
+    session_id      TEXT,
+    target_url      TEXT NOT NULL,
+    method          TEXT NOT NULL DEFAULT 'POST',
+    status_code     INTEGER,
+    was_streaming   BOOLEAN DEFAULT FALSE,
+    chunks_forwarded INTEGER DEFAULT 0,
+    bytes_forwarded  BIGINT DEFAULT 0,
+    injection_found  BOOLEAN DEFAULT FALSE,
+    output_blocked   BOOLEAN DEFAULT FALSE,
+    duration_ms     INTEGER,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS proxy_stream_tenant_idx
+   ON proxy_stream_log(tenant_id, created_at DESC)""",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SecurityModelConfig(BaseModel):
+    """Tenant security model configuration."""
+    security_model:    str = "claude-haiku-4-5-20251001"
+    security_provider: str = "anthropic"
+    semantic_model:    Optional[str] = None
+    embedding_model:   Optional[str] = None
+    grounding_model:   Optional[str] = None
+    drift_model:       Optional[str] = None
+    citation_model:    Optional[str] = None
+    max_tokens_check:  int = 300
+    check_timeout_s:   float = 8.0
+
+class StreamPassthroughRequest(BaseModel):
+    """Request body for the passthrough streaming proxy."""
+    target_url:          str
+    method:              str = "POST"
+    headers:             dict = {}
+    body:                Optional[dict] = None
+    agent_id:            Optional[str] = None
+    session_id:          Optional[str] = None
+    # What to check
+    scan_input:          bool = True
+    scan_output:         bool = True
+    scan_chunks:         bool = True   # scan each chunk for injection patterns
+    buffer_for_gate:     bool = True   # buffer full response for output gate scan
+    # Passthrough behavior
+    strip_sensitive_headers: bool = True
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERNAL MODEL RESOLUTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# In-memory cache for tenant security config — invalidated on update
+_security_config_cache: dict[str, dict] = {}
+_SECURITY_CACHE_TTL = 300  # 5 minutes
+
+async def get_tenant_security_model(
+    tenant_id: str,
+    check_type: str = "default",  # semantic | embedding | grounding | drift | citation
+) -> tuple[str, str]:
+    """
+    Return (model, provider) for a given tenant and check type.
+    Falls back cleanly: check-specific → tenant default → system default.
+    check_type: "semantic" | "embedding" | "grounding" | "drift" | "citation" | "default"
+    """
+    now = time.time()
+    cached = _security_config_cache.get(tenant_id)
+    if cached and now - cached.get("_ts", 0) < _SECURITY_CACHE_TTL:
+        config = cached
+    else:
+        try:
+            from app.main import pool
+            async with pool.acquire() as conn:
+                tenant_row = await conn.fetchrow(
+                    "SELECT security_model, security_provider FROM tenants WHERE id=$1",
+                    tenant_id)
+                override_row = await conn.fetchrow(
+                    "SELECT * FROM tenant_security_config WHERE tenant_id=$1",
+                    tenant_id)
+            config = {
+                "default_model":    (tenant_row["security_model"]    if tenant_row else None)
+                                    or "claude-haiku-4-5-20251001",
+                "default_provider": (tenant_row["security_provider"] if tenant_row else None)
+                                    or "anthropic",
+                "semantic_model":   override_row["semantic_model"]   if override_row else None,
+                "embedding_model":  override_row["embedding_model"]  if override_row else None,
+                "grounding_model":  override_row["grounding_model"]  if override_row else None,
+                "drift_model":      override_row["drift_model"]      if override_row else None,
+                "citation_model":   override_row["citation_model"]   if override_row else None,
+                "max_tokens_check": override_row["max_tokens_check"] if override_row else 300,
+                "check_timeout_s":  float(override_row["check_timeout_s"]) if override_row else 8.0,
+                "ollama_base_url":  override_row["ollama_base_url"]  if override_row else None,
+                "_ts":              now,
+            }
+        except Exception as e:
+            log.warning("security_config.load_failed", tenant_id=tenant_id, error=str(e))
+            config = {
+                "default_model": "claude-haiku-4-5-20251001",
+                "default_provider": "anthropic",
+                "_ts": now,
+            }
+        _security_config_cache[tenant_id] = config
+
+    # Resolve check-specific override
+    check_key = f"{check_type}_model"
+    override  = config.get(check_key)
+    if override:
+        provider = _detect_provider_simple(override, config)
+        return override, provider
+
+    model    = config["default_model"]
+    provider = config["default_provider"]
+    return model, provider
+
+def _detect_provider_simple(model: str, config: dict) -> str:
+    """Quick provider detection without importing model_router."""
+    m = model.lower()
+    if m.startswith("claude-"):          return "anthropic"
+    if m.startswith(("gpt-", "o1", "o3", "o4")): return "openai"
+    if m.startswith("gemini-"):          return "gemini"
+    # Groq models
+    groq_names = {"llama", "mixtral", "gemma", "whisper"}
+    if any(g in m for g in groq_names):  return "groq"
+    if config.get("ollama_base_url"):    return "ollama"
+    return "anthropic"  # safe default
+
+def invalidate_security_cache(tenant_id: str):
+    """Call after updating security config to force reload."""
+    _security_config_cache.pop(tenant_id, None)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UNIFIED INTERNAL LLM CALLER
+# Replaces all hardcoded `anthropic.AsyncAnthropic()` + `claude-haiku` calls
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def call_security_llm(
+    prompt:      str,
+    tenant_id:   str,
+    check_type:  str = "default",
+    max_tokens:  int = 300,
+    timeout:     float = 8.0,
+    system:      Optional[str] = None,
+) -> str:
+    """
+    Call the tenant's configured security model for internal checks.
+    Returns raw text response. Raises on failure.
+
+    This replaces every hardcoded:
+        client = anthropic.AsyncAnthropic()
+        msg = await client.messages.create(model="claude-haiku-4-5-20251001", ...)
+
+    With:
+        result = await call_security_llm(prompt, tenant_id, check_type="semantic")
+    """
+    model, provider = await get_tenant_security_model(tenant_id, check_type)
+
+    log.debug("security_llm.call", tenant_id=tenant_id, model=model,
+              provider=provider, check_type=check_type)
+
+    if provider == "anthropic":
+        return await _security_call_anthropic(prompt, model, max_tokens, timeout, system)
+    elif provider in ("openai", "groq"):
+        return await _security_call_openai(prompt, model, max_tokens, timeout, system, provider)
+    elif provider == "gemini":
+        return await _security_call_gemini(prompt, model, max_tokens, timeout, system, tenant_id)
+    elif provider == "ollama":
+        return await _security_call_ollama(prompt, model, max_tokens, timeout, system, tenant_id)
+    else:
+        # Unknown provider — fallback to Anthropic
+        log.warning("security_llm.unknown_provider", provider=provider, fallback="anthropic")
+        return await _security_call_anthropic(prompt, model, max_tokens, timeout, system)
+
+async def _security_call_anthropic(
+    prompt: str, model: str, max_tokens: int, timeout: float, system: Optional[str]
+) -> str:
+    import anthropic as _anthropic
+    client = _anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    build  = dict(model=model, max_tokens=max_tokens,
+                  messages=[{"role": "user", "content": prompt}])
+    if system: build["system"] = system
+    msg = await asyncio.wait_for(client.messages.create(**build), timeout=timeout)
+    return msg.content[0].text if msg.content else ""
+
+async def _security_call_openai(
+    prompt: str, model: str, max_tokens: int, timeout: float,
+    system: Optional[str], provider: str
+) -> str:
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        raise RuntimeError("openai package required. pip install openai")
+    if provider == "groq":
+        client = AsyncOpenAI(
+            api_key=os.environ.get("GROQ_API_KEY", ""),
+            base_url="https://api.groq.com/openai/v1",
+        )
+    else:
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+    messages = []
+    if system: messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    resp = await asyncio.wait_for(
+        client.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens),
+        timeout=timeout)
+    return resp.choices[0].message.content or ""
+
+async def _security_call_gemini(
+    prompt: str, model: str, max_tokens: int, timeout: float,
+    system: Optional[str], tenant_id: str
+) -> str:
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    payload: dict[str, Any] = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens},
+    }
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts)
+
+async def _security_call_ollama(
+    prompt: str, model: str, max_tokens: int, timeout: float,
+    system: Optional[str], tenant_id: str
+) -> str:
+    config   = _security_config_cache.get(tenant_id, {})
+    base     = config.get("ollama_base_url") or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    messages = []
+    if system: messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    payload  = {"model": model, "messages": messages,
+                "stream": False, "options": {"num_predict": max_tokens}}
+    async with httpx.AsyncClient(timeout=timeout + 60) as client:
+        resp = await client.post(f"{base}/api/chat", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    return data.get("message", {}).get("content", "")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASSTHROUGH STREAMING PROXY
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SENSITIVE_HEADERS = {
+    "authorization", "x-api-key", "x-agent-signature",
+    "cookie", "set-cookie", "x-forwarded-for",
+}
+
+def _clean_headers(headers: dict, strip_sensitive: bool = True) -> dict:
+    """Forward safe headers to target, strip sensitive ones."""
+    safe = {}
+    for k, v in headers.items():
+        if strip_sensitive and k.lower() in _SENSITIVE_HEADERS:
+            continue
+        safe[k] = v
+    return safe
+
+# Patterns to scan individual chunks for injection
+_CHUNK_INJECTION_PATTERNS = [
+    re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?", re.I),
+    re.compile(r"you\s+are\s+now\s+(?:a\s+)?(?:different|new|another)", re.I),
+    re.compile(r"system\s*:\s*you\s+(?:must|shall|will|are)", re.I),
+    re.compile(r"<\s*(?:system|instructions?|prompt)\s*>", re.I),
+    re.compile(r"\[\s*(?:INST|SYS|SYSTEM|OVERRIDE)\s*\]", re.I),
+]
+
+def _scan_chunk_for_injection(chunk: str) -> Optional[str]:
+    """Scan a single streaming chunk. Returns pattern name if found, else None."""
+    for pat in _CHUNK_INJECTION_PATTERNS:
+        if pat.search(chunk):
+            return pat.pattern
+    return None
+
+async def proxy_stream_generator(
+    tenant_id:     str,
+    agent_id:      Optional[str],
+    session_id:    Optional[str],
+    target_url:    str,
+    method:        str,
+    forward_headers: dict,
+    body:          Optional[dict],
+    scan_input:    bool,
+    scan_output:   bool,
+    scan_chunks:   bool,
+    buffer_for_gate: bool,
+    strip_sensitive_headers: bool,
+) -> AsyncIterator[bytes]:
+    """
+    Async generator that:
+    1. Optionally scans the request body for injection before forwarding
+    2. Opens a streaming connection to the user's agent
+    3. Scans each chunk for injection patterns as they arrive
+    4. Buffers the full response
+    5. Runs output gate on the complete buffered text
+    6. Yields clean chunks to the client
+    7. Logs the session
+
+    Yields raw bytes — caller wraps in StreamingResponse.
+    """
+    start   = time.monotonic()
+    buffer  = []
+    chunks  = 0
+    bytes_  = 0
+    injection_found = False
+    output_blocked  = False
+    status_code     = 200
+    stream_log_id   = str(uuid.uuid4())
+
+    # ── 1. Input scan ─────────────────────────────────────────────────────────
+    if scan_input and body:
+        body_text = json.dumps(body, default=str)
+        for pat in _CHUNK_INJECTION_PATTERNS:
+            if pat.search(body_text):
+                injection_found = True
+                log.warning("passthrough.input_injection", tenant_id=tenant_id,
+                            session_id=session_id, pattern=pat.pattern)
+                err = json.dumps({"allowed": False, "reason": "Injection pattern in request body",
+                                  "action": "injection_blocked"})
+                yield (f"data: {err}\n\n").encode()
+                return
+
+    # ── 2. Forward request and stream response ─────────────────────────────────
+    clean_headers = _clean_headers(forward_headers, strip_sensitive_headers)
+    clean_headers["Accept"] = "text/event-stream, application/json, */*"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0)) as client:
+            req_kwargs: dict[str, Any] = {"headers": clean_headers}
+            if body is not None:
+                req_kwargs["json"] = body
+
+            async with client.stream(method.upper(), target_url, **req_kwargs) as resp:
+                status_code = resp.status_code
+
+                # Non-2xx — forward the error response directly
+                if not resp.is_success:
+                    error_body = await resp.aread()
+                    yield error_body
+                    return
+
+                is_sse = "text/event-stream" in resp.headers.get("content-type", "")
+
+                async for raw_chunk in resp.aiter_bytes(chunk_size=512):
+                    if not raw_chunk:
+                        continue
+
+                    chunks += 1
+                    bytes_ += len(raw_chunk)
+                    chunk_text = raw_chunk.decode("utf-8", errors="replace")
+
+                    # ── 3. Per-chunk injection scan ───────────────────────────
+                    if scan_chunks and not injection_found:
+                        found = _scan_chunk_for_injection(chunk_text)
+                        if found:
+                            injection_found = True
+                            log.critical("passthrough.chunk_injection",
+                                         tenant_id=tenant_id, session_id=session_id,
+                                         pattern=found, chunk_preview=chunk_text[:100])
+                            # Inject a guardrail event into the SSE stream then stop
+                            blocked_event = (
+                                "event: guardrail_blocked\n"
+                                'data: {"action":"injection_blocked",'
+                                '"reason":"Injection pattern detected in agent output"}\n\n'
+                            )
+                            yield blocked_event.encode()
+                            return
+
+                    # ── 4. Buffer for full output gate ─────────────────────────
+                    if buffer_for_gate:
+                        buffer.append(chunk_text)
+                    else:
+                        # Passthrough mode — forward immediately
+                        yield raw_chunk
+
+    except httpx.ConnectError as e:
+        err = json.dumps({"error": "target_unreachable",
+                           "message": f"Cannot connect to agent at {target_url}: {str(e)}"})
+        yield (f"data: {err}\n\n").encode()
+        return
+    except httpx.TimeoutException:
+        err = json.dumps({"error": "target_timeout",
+                           "message": f"Agent at {target_url} timed out"})
+        yield (f"data: {err}\n\n").encode()
+        return
+    except Exception as e:
+        log.error("passthrough.stream_error", error=str(e))
+        err = json.dumps({"error": "proxy_error", "message": str(e)})
+        yield (f"data: {err}\n\n").encode()
+        return
+
+    # ── 5. Output gate on buffered full response ───────────────────────────────
+    if buffer_for_gate and scan_output and buffer:
+        full_text = "".join(buffer)
+
+        # Import scan functions from existing v3.py
+        try:
+            from app.v3 import scan_output as _scan_output
+            safe_text, findings, modified = await _scan_output(
+                full_text, tenant_id, agent_id, session_id)
+
+            if findings:
+                output_blocked = True
+                blocked_event = (
+                    "event: guardrail_blocked\n"
+                    f'data: {json.dumps({"action":"output_blocked","findings":findings[:3]})}\n\n'
+                )
+                yield blocked_event.encode()
+                # Log then return — don't forward blocked content
+            else:
+                # Forward safe buffered content as a single SSE data chunk
+                # (or as raw bytes if non-SSE)
+                if is_sse:
+                    yield safe_text.encode()
+                else:
+                    yield safe_text.encode()
+        except Exception as e:
+            log.error("passthrough.output_gate_failed", error=str(e))
+            # On guardrail failure, forward anyway (fail-open for output gate only)
+            yield "".join(buffer).encode()
+
+    elif buffer_for_gate and buffer and not scan_output:
+        # Buffered but no scan — just forward the buffered content
+        yield "".join(buffer).encode()
+
+    # ── 6. Log the stream session ─────────────────────────────────────────────
+    ms = int((time.monotonic() - start) * 1000)
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO proxy_stream_log"
+                " (id,tenant_id,agent_id,session_id,target_url,method,"
+                "  status_code,was_streaming,chunks_forwarded,bytes_forwarded,"
+                "  injection_found,output_blocked,duration_ms)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                stream_log_id, tenant_id, agent_id, session_id, target_url, method,
+                status_code, True, chunks, bytes_,
+                injection_found, output_blocked, ms)
+    except Exception as e:
+        log.warning("passthrough.log_failed", error=str(e))
