@@ -60,6 +60,15 @@ from app.v3 import (
     synthesize_policy_from_code,
     PolicySynthesisRequest, PolicySynthesisResult,
     CertVerifyRequest,
+    #final001
+    V34_MIGRATIONS,
+    CitationGroundingResult, check_grounding_with_citations,
+    PolicyConflictReport, detect_policy_conflicts,
+    AnchorCheckResult, anchor_session_intent, check_intent_anchor,
+    HoneyToolConfig, generate_honey_tools, inject_honey_tools,
+    check_honey_tool_call, HONEY_TOOL_PREFIX,
+    run_enforcement_v34,
+
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -223,6 +232,8 @@ async def init_db():
             await conn.execute(_sql)
         # v3.3 — ephemeral certs + synthesized policies
         for _sql in CERT_MIGRATIONS:
+            await conn.execute(_sql)
+        for _sql in V34_MIGRATIONS:
             await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
