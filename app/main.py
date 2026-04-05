@@ -1,5 +1,5 @@
 """
-AgentGuard v3.2.0
+AgentGuard v3.3.0
 """
 import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio, secrets
 from collections import OrderedDict
@@ -53,14 +53,13 @@ from app.v3 import (
     embed_text, cosine_similarity,
     BUILTIN_SEMANTIC_POLICIES, _get_policy_embedding,
     _embedding_cache,
-
+    # v3.3 — ephemeral certs + AST policy synthesis
     CERT_MIGRATIONS,
     mint_session_cert, verify_session_cert, revoke_session_cert,
     get_session_cert, log_cert_request,
     synthesize_policy_from_code,
     PolicySynthesisRequest, PolicySynthesisResult,
     CertVerifyRequest,
-
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -118,7 +117,7 @@ async def lifespan(app: FastAPI):
     elif IS_PROD:
         raise RuntimeError("REDIS_URL required in prod")
     await init_db()
-    log.info("agentguard.started", version="3.2.0", env=AGENTGUARD_ENV)
+    log.info("agentguard.started", version="3.3.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
     if redis_conn:
@@ -216,13 +215,14 @@ async def init_db():
         # v3.0 — sessions, HITL, injection detection, rate limits
         for _sql in SESSION_MIGRATIONS:
             await conn.execute(_sql)
-
         # v3.1 — guardrails: PII tokens, topic policies, guardrail events, grounding
         for _sql in GUARDRAIL_MIGRATIONS:
             await conn.execute(_sql)
-
         # v3.2 — semantic classifier tables
         for _sql in SEMANTIC_MIGRATIONS:
+            await conn.execute(_sql)
+        # v3.3 — ephemeral certs + synthesized policies
+        for _sql in CERT_MIGRATIONS:
             await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -589,7 +589,7 @@ async def load_agent_and_policy(agent_id, tenant_id):
     return agent, policy
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AgentGuard", version="3.2.0", lifespan=lifespan)
+app = FastAPI(title="AgentGuard", version="3.3.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS","*").split(",") if o.strip()]
@@ -669,7 +669,6 @@ async def protect(req: ProtectRequest, request: Request, bg: BackgroundTasks,
     if tenant_id != "__admin__":
         ok, reason = await verify_request(agent, body, x_agent_signature, req.timestamp, req.nonce)
         if not ok: raise HTTPException(401, reason)
-
     rules    = policy_row["rules"]
     patterns = build_patterns(rules)
     allowed, reason, clean, redacted, action = await run_enforcement_v3(
@@ -826,6 +825,99 @@ async def session_protect(session_id: str, req: SessionToolCall, request: Reques
             "session_turn": turn, "request_id": request_id}
 
 # ══════════════════════════════════════════════════════════════════════════════
+# EPHEMERAL SESSION CERTIFICATES v3.3
+# ══════════════════════════════════════════════════════════════════════════════
+@app.post("/sessions/{session_id}/cert")
+async def issue_session_cert(session_id: str, tenant=Depends(get_tenant)):
+    """
+    Issue a short-lived X.509 certificate for a session.
+    The private key is returned ONCE and never stored server-side.
+    """
+    sess = await get_session(session_id, tenant["id"])
+    if not sess:
+        raise HTTPException(404, "Session not found or expired")
+    ttl = 3600
+    if redis_conn:
+        try:
+            remaining = await redis_conn.ttl(f"ag:sess:{session_id}")
+            if remaining > 0:
+                ttl = remaining
+        except Exception:
+            pass
+    result = await mint_session_cert(session_id, tenant["id"],
+                                      sess.get("agent_id", "unknown"), ttl)
+    log.info("cert.issued", session_id=session_id, fingerprint=result["fingerprint"])
+    return result
+
+@app.get("/sessions/{session_id}/cert")
+async def get_cert_status(session_id: str, tenant=Depends(get_tenant)):
+    """Check the status of a session certificate (without the private key)."""
+    cert = await get_session_cert(session_id, tenant["id"])
+    if not cert:
+        raise HTTPException(404, "No certificate found for this session")
+    return cert
+
+@app.post("/sessions/{session_id}/cert/verify")
+async def verify_cert_signature(session_id: str, body: CertVerifyRequest,
+                                  request: Request, tenant=Depends(get_tenant)):
+    """Verify a payload was signed with the session certificate's private key."""
+    ip = request.client.host if request.client else None
+    ok, reason = await verify_session_cert(
+        session_id, tenant["id"], body.payload, body.signature)
+    cert = await get_session_cert(session_id, tenant["id"])
+    fingerprint = cert["fingerprint"] if cert else None
+    await log_cert_request(tenant["id"], cert.get("agent_id", "") if cert else "",
+                            session_id, fingerprint, ok, reason if not ok else None, ip)
+    if not ok:
+        raise HTTPException(401, f"Certificate verification failed: {reason}")
+    return {"verified": True, "session_id": session_id, "fingerprint": fingerprint}
+
+@app.post("/sessions/{session_id}/cert/revoke")
+async def revoke_cert(session_id: str, body: dict, tenant=Depends(get_tenant)):
+    """Revoke a session certificate immediately."""
+    reason = body.get("reason", "manual_revocation")
+    ok = await revoke_session_cert(session_id, tenant["id"], reason)
+    if not ok:
+        raise HTTPException(404, "Certificate not found")
+    log.warning("cert.revoked", session_id=session_id, reason=reason)
+    return {"revoked": True, "session_id": session_id, "reason": reason}
+
+@app.get("/certs")
+async def list_certs(tenant=Depends(get_tenant), revoked: Optional[bool]=None, limit: int=50):
+    """List all session certificates for this tenant."""
+    where = "WHERE tenant_id=$1"; vals = [tenant["id"]]
+    if revoked is not None:
+        where += " AND revoked=$2"; vals.append(revoked)
+    vals.append(min(limit, 200))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT session_id, agent_id, fingerprint, issued_at, expires_at,"
+            f" revoked, revoked_at, revoke_reason"
+            f" FROM session_certificates {where}"
+            f" ORDER BY issued_at DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/certs/stats")
+async def cert_stats(tenant=Depends(get_tenant), days: int=30):
+    """Certificate issuance and verification stats."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_issued,"
+            " COUNT(*) FILTER (WHERE revoked=TRUE) AS total_revoked,"
+            " COUNT(*) FILTER (WHERE expires_at > NOW() AND revoked=FALSE) AS currently_active"
+            " FROM session_certificates WHERE tenant_id=$1"
+            " AND issued_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        verify_row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_checks,"
+            " COUNT(*) FILTER (WHERE verified=TRUE) AS passed,"
+            " COUNT(*) FILTER (WHERE verified=FALSE) AS failed"
+            " FROM cert_request_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+    return {**dict(row), "verification": dict(verify_row)}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # HITL
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/hitl")
@@ -924,7 +1016,7 @@ async def injection_stats(tenant=Depends(get_tenant), days: int=30):
     return {**dict(row), "by_pattern": [dict(r) for r in by_pattern]}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GUARDRAILS v3.1 — topic policies, grounding, output scan, events
+# GUARDRAILS v3.1
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/guardrails/topics")
 async def create_topic_policy(body: TopicPolicy, tenant=Depends(get_tenant)):
@@ -1043,7 +1135,6 @@ async def proxy_chat_v2(req: ProxyRequestV31, request: Request,
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/guardrails/semantic-topics")
 async def create_semantic_policy(body: SemanticTopicPolicy, tenant=Depends(get_tenant)):
-    """Create a semantic topic policy with confidence scoring. Catches paraphrases."""
     policy_dict = {"name": body.name, "example_phrases": body.example_phrases,
                    "confidence_threshold": body.confidence_threshold}
     policy_vec = await _get_policy_embedding(policy_dict)
@@ -1088,7 +1179,6 @@ async def update_threshold(name: str, body: dict, tenant=Depends(get_tenant)):
 
 @app.post("/guardrails/semantic-topics/test")
 async def test_semantic_classifier(body: SemanticCheckRequest, tenant=Depends(get_tenant)):
-    """Test text against all semantic policies. Returns scores for threshold tuning."""
     text_vec = await embed_text(body.text)
     async with pool.acquire() as conn:
         db_policies = await conn.fetch(
@@ -1136,12 +1226,7 @@ async def semantic_classifier_stats(tenant=Depends(get_tenant), days: int=30):
 @limiter.limit("300/minute;30/second")
 async def proxy_chat_v3(req: ProxyRequestV31, request: Request,
                           bg: BackgroundTasks, tenant=Depends(get_tenant)):
-    """
-    Full semantic guardrail proxy — complete pipeline:
-    INPUT:  keyword firewall → semantic classifier → injection scan → PII tokenize
-    LLM
-    OUTPUT: PII detokenize → output gate → semantic output check → grounding
-    """
+    """Full semantic guardrail proxy: keyword + semantic + injection + PII + grounding."""
     start = time.monotonic(); tid = tenant["id"]
     safe_messages, safe_system, input_report = await run_semantic_guardrails(
         req.messages, req.system, tid, req.agent_id, req.session_id, tokenize=req.tokenize_pii)
@@ -1175,6 +1260,79 @@ async def proxy_chat_v3(req: ProxyRequestV31, request: Request,
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                       "total_tokens": prompt_tokens+completion_tokens},
             "guardrails": {"input": input_report, "output": output_report}, "duration_ms": ms}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AST POLICY SYNTHESIS v3.3
+# ══════════════════════════════════════════════════════════════════════════════
+@app.post("/policies/synthesize")
+async def synthesize_policy(body: PolicySynthesisRequest, tenant=Depends(get_tenant)):
+    """Parse agent source code and auto-generate a least-privilege policy."""
+    if len(body.code) > 500_000:
+        raise HTTPException(400, "Code too large (max 500KB)")
+    result = await synthesize_policy_from_code(
+        body.code, body.language, body.policy_name, tenant["id"], body.auto_activate)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+@app.post("/policies/synthesize/{policy_id}/activate")
+async def activate_synthesized_policy(policy_id: str, tenant=Depends(get_tenant)):
+    """Activate a draft synthesized policy — copies it to the active policies table."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM synthesized_policies WHERE id=$1 AND tenant_id=$2",
+            policy_id, tenant["id"])
+        if not row: raise HTTPException(404, "Synthesized policy not found")
+        rules = row["rules"]; name = row["name"]
+        existing = await conn.fetchrow(
+            "SELECT id FROM policies WHERE tenant_id=$1 AND name=$2", tenant["id"], name)
+        if existing:
+            await conn.execute(
+                "UPDATE policies SET rules=$1 WHERE tenant_id=$2 AND name=$3",
+                json.dumps(rules) if isinstance(rules, dict) else rules, tenant["id"], name)
+        else:
+            await conn.execute(
+                "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)",
+                str(uuid.uuid4()), tenant["id"], name,
+                json.dumps(rules) if isinstance(rules, dict) else rules)
+        await conn.execute(
+            "UPDATE synthesized_policies SET status='active', activated_at=NOW() WHERE id=$1",
+            policy_id)
+    return {"activated": True, "policy_id": policy_id, "policy_name": name,
+            "message": f"Policy '{name}' is now active. Assign it to an agent with POST /agents."}
+
+@app.get("/policies/synthesize")
+async def list_synthesized_policies(tenant=Depends(get_tenant),
+                                      status: Optional[str]=None, limit: int=50):
+    """List all synthesized policies (draft and active)."""
+    where = "WHERE tenant_id=$1"; vals = [tenant["id"]]
+    if status: where += " AND status=$2"; vals.append(status)
+    vals.append(min(limit, 200))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT id, name, language, inferred_tools, inferred_hosts,"
+            f" inferred_paths, status, created_at, activated_at"
+            f" FROM synthesized_policies {where}"
+            f" ORDER BY created_at DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/policies/synthesize/{policy_id}")
+async def get_synthesized_policy(policy_id: str, tenant=Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM synthesized_policies WHERE id=$1 AND tenant_id=$2",
+            policy_id, tenant["id"])
+    if not row: raise HTTPException(404, "Synthesized policy not found")
+    return dict(row)
+
+@app.delete("/policies/synthesize/{policy_id}")
+async def delete_synthesized_policy(policy_id: str, tenant=Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM synthesized_policies WHERE id=$1 AND tenant_id=$2",
+            policy_id, tenant["id"])
+    if res == "DELETE 0": raise HTTPException(404, "Synthesized policy not found")
+    return {"deleted": policy_id}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AGENTS
@@ -1458,4 +1616,4 @@ async def health():
     all_ok = checks["postgres"] and checks.get("redis") is not False
     return JSONResponse(status_code=200 if all_ok else 503,
         content={"status":"ok" if all_ok else "degraded",
-                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.2.0"})
+                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.3.0"})
