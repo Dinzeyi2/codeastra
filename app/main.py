@@ -6,7 +6,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from base64 import b64decode, b64encode
-from typing import Any, Optional
+from typing import Any, Optional, AsyncIterator
 from urllib.parse import urlparse
 
 import anthropic
@@ -79,6 +79,11 @@ from app.v3 import (
     build_sse_event, sse_token, sse_done, sse_error, sse_blocked, sse_guardrail,
     run_streaming_guardrails,
     _log_model_usage,
+    # v3.5 option C — passthrough streaming + internal model config
+    V35_MIGRATIONS,
+    SecurityModelConfig, StreamPassthroughRequest,
+    get_tenant_security_model, call_security_llm,
+    proxy_stream_generator, invalidate_security_cache,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -2362,6 +2367,309 @@ async def stream_stats(tenant=Depends(get_tenant), days: int=30):
             " AND created_at > NOW() - ($2||' days')::INTERVAL",
             tenant["id"], str(days))
     return dict(row)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECURITY MODEL CONFIG + PASSTHROUGH STREAMING v3.5
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/settings/security-model")
+async def get_security_model(tenant=Depends(get_tenant)):
+    """
+    Get the model AgentGuard uses internally for security checks.
+    This is NOT the model your agent uses — it's what AgentGuard uses
+    for semantic analysis, grounding checks, injection detection, etc.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT security_model, security_provider FROM tenants WHERE id=$1",
+            tenant["id"])
+        override = await conn.fetchrow(
+            "SELECT * FROM tenant_security_config WHERE tenant_id=$1",
+            tenant["id"])
+
+    base_model    = row["security_model"]    if row else "claude-haiku-4-5-20251001"
+    base_provider = row["security_provider"] if row else "anthropic"
+
+    supported_models = {
+        "anthropic": ["claude-haiku-4-5-20251001", "claude-sonnet-4-6"],
+        "openai":    ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+        "gemini":    ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
+        "groq":      ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+        "ollama":    ["llama3", "mistral", "mixtral", "phi3"],
+    }
+
+    return {
+        "security_model":    base_model,
+        "security_provider": base_provider,
+        "per_check_overrides": {
+            "semantic_model":   override["semantic_model"]   if override else None,
+            "embedding_model":  override["embedding_model"]  if override else None,
+            "grounding_model":  override["grounding_model"]  if override else None,
+            "drift_model":      override["drift_model"]      if override else None,
+            "citation_model":   override["citation_model"]   if override else None,
+        } if override else {},
+        "supported_models":  supported_models,
+        "note": (
+            "This configures which model AgentGuard uses for its own internal security "
+            "checks (semantic analysis, grounding, drift detection). Your agent's LLM "
+            "is unaffected — it stays whatever you've already configured."
+        ),
+    }
+
+@app.put("/settings/security-model")
+async def update_security_model(body: dict, tenant=Depends(get_tenant)):
+    """
+    Update the model AgentGuard uses internally for security checks.
+
+    Body:
+      security_model:    str  — model name e.g. "gpt-4o-mini", "gemini-1.5-flash"
+      security_provider: str  — "anthropic" | "openai" | "gemini" | "groq" | "ollama"
+
+    Affects ALL internal AgentGuard checks for this tenant going forward.
+    Use /settings/security-model/overrides for per-check granularity.
+    """
+    model    = body.get("security_model", "claude-haiku-4-5-20251001")
+    provider = body.get("security_provider", "anthropic")
+
+    valid_providers = {"anthropic", "openai", "gemini", "groq", "ollama"}
+    if provider not in valid_providers:
+        raise HTTPException(400, f"provider must be one of: {', '.join(valid_providers)}")
+
+    # Validate the API key exists for the chosen provider
+    env_map = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai":    "OPENAI_API_KEY",
+        "gemini":    "GEMINI_API_KEY",
+        "groq":      "GROQ_API_KEY",
+        "ollama":    None,
+    }
+    env_key = env_map.get(provider)
+    if env_key and not os.environ.get(env_key):
+        raise HTTPException(400,
+            f"Provider '{provider}' requires {env_key} environment variable. "
+            f"Set it in your Railway environment variables first.")
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tenants SET security_model=$1, security_provider=$2 WHERE id=$3",
+            model, provider, tenant["id"])
+
+    # Invalidate cache
+    invalidate_security_cache(tenant["id"])
+
+    return {
+        "security_model":    model,
+        "security_provider": provider,
+        "message": f"AgentGuard will now use {model} ({provider}) for all internal security checks.",
+    }
+
+@app.put("/settings/security-model/overrides")
+async def update_security_model_overrides(body: dict, tenant=Depends(get_tenant)):
+    """
+    Set per-check model overrides.
+    Useful if you want a faster model for semantic checks but a smarter one for grounding.
+
+    Body (all optional — null clears the override and uses the default):
+      semantic_model:   str | null  — model for semantic topic classification
+      embedding_model:  str | null  — model for embedding (intent anchor, semantic similarity)
+      grounding_model:  str | null  — model for grounding checks
+      drift_model:      str | null  — model for intent drift scoring (Haiku fallback)
+      citation_model:   str | null  — model for citation-level grounding
+      ollama_base_url:  str | null  — Ollama endpoint if using local models
+      max_tokens_check: int         — max tokens for internal check responses (default 300)
+      check_timeout_s:  float       — timeout in seconds for internal checks (default 8.0)
+    """
+    fields = ["semantic_model", "embedding_model", "grounding_model",
+              "drift_model", "citation_model", "ollama_base_url",
+              "max_tokens_check", "check_timeout_s"]
+
+    update_vals = {k: body.get(k) for k in fields if k in body}
+
+    if not update_vals:
+        raise HTTPException(400, "No valid fields provided. "
+                            f"Valid fields: {', '.join(fields)}")
+
+    async with pool.acquire() as conn:
+        # Upsert
+        await conn.execute(
+            "INSERT INTO tenant_security_config (tenant_id) VALUES ($1)"
+            " ON CONFLICT (tenant_id) DO NOTHING",
+            tenant["id"])
+
+        for field, value in update_vals.items():
+            await conn.execute(
+                f"UPDATE tenant_security_config SET {field}=$1, updated_at=NOW()"
+                f" WHERE tenant_id=$2",
+                value, tenant["id"])
+
+    invalidate_security_cache(tenant["id"])
+
+    return {
+        "updated":  list(update_vals.keys()),
+        "values":   update_vals,
+        "message":  "Per-check model overrides updated. Changes take effect immediately.",
+    }
+
+@app.delete("/settings/security-model/overrides")
+async def clear_security_model_overrides(tenant=Depends(get_tenant)):
+    """Clear all per-check model overrides. Revert to the tenant default model."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tenant_security_config"
+            " SET semantic_model=NULL, embedding_model=NULL, grounding_model=NULL,"
+            "     drift_model=NULL, citation_model=NULL, updated_at=NOW()"
+            " WHERE tenant_id=$1",
+            tenant["id"])
+    invalidate_security_cache(tenant["id"])
+    return {"message": "All per-check overrides cleared. Using tenant default model."}
+
+@app.get("/settings/security-model/test")
+async def test_security_model(tenant=Depends(get_tenant), check_type: str = "default"):
+    """
+    Test the configured security model by running a quick check.
+    Validates the model is reachable and the API key works.
+    check_type: default | semantic | embedding | grounding | drift | citation
+    """
+    start = time.monotonic()
+    model, provider = await get_tenant_security_model(tenant["id"], check_type)
+    try:
+        result = await call_security_llm(
+            prompt='Respond with exactly: {"status":"ok"}',
+            tenant_id=tenant["id"],
+            check_type=check_type,
+            max_tokens=20,
+            timeout=10.0,
+        )
+        ms = int((time.monotonic() - start) * 1000)
+        return {
+            "reachable":   True,
+            "model":       model,
+            "provider":    provider,
+            "check_type":  check_type,
+            "response":    result[:100],
+            "duration_ms": ms,
+        }
+    except Exception as e:
+        ms = int((time.monotonic() - start) * 1000)
+        return {
+            "reachable":   False,
+            "model":       model,
+            "provider":    provider,
+            "check_type":  check_type,
+            "error":       str(e),
+            "duration_ms": ms,
+        }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASSTHROUGH STREAMING PROXY ENDPOINTS
+# These sit in front of the USER's agent and transparently forward
+# streaming responses while scanning for injection and running output gate
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/proxy/passthrough")
+@limiter.limit("300/minute;30/second")
+async def proxy_passthrough(
+    req: StreamPassthroughRequest,
+    request: Request,
+    bg: BackgroundTasks,
+    tenant=Depends(get_tenant),
+):
+    """
+    Transparent passthrough proxy to the user's own agent.
+
+    This is what the CLI proxy uses internally. It:
+    1. Scans the request for injection before forwarding
+    2. Forwards the request to the user's agent (target_url)
+    3. Scans each response chunk for injection patterns as they arrive
+    4. Buffers the complete response and runs the output gate
+    5. Returns clean content — streaming if the agent streams, sync if not
+
+    The user's agent uses ITS OWN LLM. AgentGuard never touches their LLM call.
+    AgentGuard only scans what goes in and what comes out.
+
+    Body:
+      target_url:   str   — where the user's agent is running (e.g. http://localhost:8080/chat)
+      method:       str   — HTTP method (default POST)
+      headers:      dict  — headers to forward (sensitive ones stripped automatically)
+      body:         dict  — request body to forward
+      agent_id:     str   — AgentGuard agent ID for policy + logging
+      session_id:   str   — AgentGuard session ID for tracking
+      scan_input:   bool  — scan request body for injection (default true)
+      scan_output:  bool  — run output gate on response (default true)
+      scan_chunks:  bool  — scan each chunk as it arrives (default true)
+      buffer_for_gate: bool — buffer full response for output gate (default true)
+    """
+    tid = tenant["id"]
+
+    # Validate target URL against agent's allowed_hosts
+    if req.agent_id:
+        async with pool.acquire() as conn:
+            agent = await conn.fetchrow(
+                "SELECT allowed_hosts FROM agents WHERE id=$1 AND tenant_id=$2",
+                req.agent_id, tid)
+        if agent:
+            from urllib.parse import urlparse
+            parsed_host = urlparse(req.target_url).hostname or ""
+            allowed     = list(agent["allowed_hosts"] or [])
+            # localhost always allowed for development
+            local_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+            if allowed and parsed_host not in allowed and parsed_host not in local_hosts:
+                raise HTTPException(403,
+                    f"Target host '{parsed_host}' not in agent's allowed_hosts. "
+                    f"Register it via POST /agents/{req.agent_id}/register-key")
+
+    forward_headers = dict(request.headers)
+
+    return StreamingResponse(
+        proxy_stream_generator(
+            tenant_id=tid,
+            agent_id=req.agent_id,
+            session_id=req.session_id,
+            target_url=req.target_url,
+            method=req.method,
+            forward_headers=forward_headers,
+            body=req.body,
+            scan_input=req.scan_input,
+            scan_output=req.scan_output,
+            scan_chunks=req.scan_chunks,
+            buffer_for_gate=req.buffer_for_gate,
+            strip_sensitive_headers=req.strip_sensitive_headers,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
+            "X-AgentGuard":      "v3.5",
+        },
+    )
+
+@app.get("/proxy/passthrough/stats")
+async def passthrough_stats(tenant=Depends(get_tenant), days: int=30):
+    """Passthrough proxy streaming stats."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_requests,"
+            " COUNT(*) FILTER (WHERE was_streaming=TRUE) AS streaming_requests,"
+            " COUNT(*) FILTER (WHERE injection_found=TRUE) AS injection_blocked,"
+            " COUNT(*) FILTER (WHERE output_blocked=TRUE) AS output_blocked,"
+            " SUM(chunks_forwarded) AS total_chunks,"
+            " SUM(bytes_forwarded) AS total_bytes,"
+            " ROUND(AVG(duration_ms)) AS avg_ms"
+            " FROM proxy_stream_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        recent = await conn.fetch(
+            "SELECT agent_id, session_id, target_url, status_code,"
+            " was_streaming, chunks_forwarded, bytes_forwarded,"
+            " injection_found, output_blocked, duration_ms, created_at"
+            " FROM proxy_stream_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " ORDER BY created_at DESC LIMIT 20",
+            tenant["id"], str(days))
+    return {**dict(row), "recent_sessions": [dict(r) for r in recent]}
 
 
 @app.get("/health")
