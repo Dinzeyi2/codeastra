@@ -100,6 +100,7 @@ from app.v3 import (
     ZeroLogConfig, secure_log_action,
     verify_audit_chain,
     generate_docker_compose, generate_env_file, generate_setup_script,
+    generate_bare_metal_setup, generate_systemd_service,
     _external_pools,
 )
 
@@ -2962,6 +2963,7 @@ async def classify_endpoint(
 @limiter.limit("100/minute;10/second")
 async def classify_batch(
     body: dict,
+    request: Request,
     tenant=Depends(get_tenant),
 ):
     """
@@ -3155,88 +3157,143 @@ async def disable_zero_logging(tenant=Depends(get_tenant)):
 @app.post("/onprem/generate")
 async def generate_onprem_deployment(body: dict, tenant=Depends(get_tenant)):
     """
-    Generate a complete on-premise deployment package.
+    Generate a complete on-premise / air-gapped deployment package.
 
-    Returns Docker Compose, .env file, and setup script.
-    Customer downloads these and runs on their own hardware.
-    Zero internet required after initial docker pull.
+    Two deployment modes:
+      deployment_mode: "docker"      — Docker Compose (customer has Docker)
+      deployment_mode: "bare-metal"  — systemd service (no Docker needed)
+
+    Both modes:
+      - Zero internet required after setup
+      - Customer runs on THEIR hardware
+      - AgentGuard never touches their data
+      - Works with Ollama or vLLM running locally
 
     Body:
-      llm_provider: "ollama" | "vllm"   (default: ollama)
-      llm_model:    model name           (default: llama3)
-      air_gapped:   true | false         (default: true)
-      port:         int                  (default: 4000)
-      name:         str                  deployment name for tracking
+      deployment_mode: "docker" | "bare-metal"   (default: bare-metal)
+      llm_provider:    "ollama" | "vllm"          (default: ollama)
+      llm_model:       model name                 (default: llama3)
+      llm_base_url:    LLM endpoint               (default: http://localhost:11434)
+      air_gapped:      true | false               (default: true)
+      port:            int                        (default: 4000)
+      name:            str                        deployment name
+      pg_host:         str                        (bare-metal: their postgres host)
+      redis_host:      str                        (bare-metal: their redis host)
     """
     import secrets as _secrets
 
-    llm_provider  = body.get("llm_provider", "ollama")
-    llm_model     = body.get("llm_model", "llama3")
-    air_gapped    = body.get("air_gapped", True)
-    port          = int(body.get("port", 4000))
-    name          = body.get("name", f"onprem-{tenant['id'][:8]}")
-    pg_password   = _secrets.token_urlsafe(24)
-    redis_password = _secrets.token_urlsafe(24)
+    deployment_mode = body.get("deployment_mode", "bare-metal")
+    llm_provider    = body.get("llm_provider", "ollama")
+    llm_model       = body.get("llm_model", "llama3")
+    llm_base_url    = body.get("llm_base_url", "http://localhost:11434")
+    air_gapped      = body.get("air_gapped", True)
+    port            = int(body.get("port", 4000))
+    name            = body.get("name", f"onprem-{tenant['id'][:8]}")
+    pg_password     = _secrets.token_urlsafe(24)
+    redis_password  = _secrets.token_urlsafe(24)
+    pg_host         = body.get("pg_host", "localhost")
+    redis_host      = body.get("redis_host", "localhost")
 
     if llm_provider not in ("ollama", "vllm"):
         raise HTTPException(400, "llm_provider must be 'ollama' or 'vllm'")
+    if deployment_mode not in ("docker", "bare-metal"):
+        raise HTTPException(400, "deployment_mode must be 'docker' or 'bare-metal'")
 
-    # Get tenant API key for inclusion
+    # Get tenant API key
     async with pool.acquire() as conn:
         api_row = await conn.fetchrow(
             "SELECT api_key FROM tenants WHERE id=$1", tenant["id"])
     api_key = api_row["api_key"] if api_row else "sk-guard-YOUR_API_KEY"
 
-    compose = generate_docker_compose(
-        tenant_id=tenant["id"], api_key=api_key,
-        llm_provider=llm_provider, llm_model=llm_model,
-        air_gapped=air_gapped, pg_password=pg_password,
-        redis_password=redis_password, port=port,
-    )
-    env_file = generate_env_file(
-        tenant_id=tenant["id"], api_key=api_key,
-        llm_provider=llm_provider,
-        pg_password=pg_password, redis_password=redis_password,
-    )
-    setup_sh = generate_setup_script(llm_model=llm_model, port=port)
+    files       = {}
+    instructions = []
+
+    if deployment_mode == "docker":
+        compose  = generate_docker_compose(
+            tenant_id=tenant["id"], api_key=api_key,
+            llm_provider=llm_provider, llm_model=llm_model,
+            air_gapped=air_gapped, pg_password=pg_password,
+            redis_password=redis_password, port=port,
+        )
+        env_file = generate_env_file(
+            tenant_id=tenant["id"], api_key=api_key,
+            llm_provider=llm_provider,
+            pg_password=pg_password, redis_password=redis_password,
+        )
+        setup_sh = generate_setup_script(llm_model=llm_model, port=port)
+        files = {
+            "docker-compose.yml": compose,
+            ".env":               env_file,
+            "setup.sh":           setup_sh,
+        }
+        instructions = [
+            "1. Copy all three files to your server",
+            "2. chmod +x setup.sh",
+            "3. BEFORE going air-gapped: docker compose pull",
+            f"4. BEFORE going air-gapped: docker exec agentguard_ollama ollama pull {llm_model}",
+            "5. ./setup.sh",
+            f"6. Verify: curl http://localhost:{port}/health",
+        ]
+        config_hash = hashlib.sha256(compose.encode()).hexdigest()
+        deploy_type = "docker-compose"
+
+    else:  # bare-metal
+        setup_sh = generate_bare_metal_setup(
+            port=port, pg_host=pg_host, pg_password=pg_password,
+            redis_host=redis_host, redis_password=redis_password,
+            api_key=api_key, llm_base_url=llm_base_url,
+            air_gapped=air_gapped,
+        )
+        systemd_svc = generate_systemd_service(port=port)
+        env_content = generate_env_file(
+            tenant_id=tenant["id"], api_key=api_key,
+            llm_provider=llm_provider,
+            pg_password=pg_password, redis_password=redis_password,
+        )
+        files = {
+            "setup.sh":                   setup_sh,
+            "agentguard.service":         systemd_svc,
+            ".env.example":               env_content,
+            "requirements.txt": "# See your AgentGuard source package\n# pip install -r requirements.txt\n",
+        }
+        instructions = [
+            "1. Copy your AgentGuard source to /opt/agentguard on the server",
+            "2. Copy setup.sh and agentguard.service to the server",
+            "3. chmod +x setup.sh",
+            "4. sudo ./setup.sh",
+            "5. Your Postgres and Redis must already be running",
+            f"6. Your LLM (Ollama/vLLM) must be running at {llm_base_url}",
+            f"7. Verify: curl http://localhost:{port}/health",
+            "NOTE: No Docker required. Runs as a native systemd service.",
+        ]
+        config_hash = hashlib.sha256(setup_sh.encode()).hexdigest()
+        deploy_type = "bare-metal"
 
     # Track deployment
-    config_hash = hashlib.sha256(compose.encode()).hexdigest()
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO onprem_deployments"
             " (tenant_id,name,deployment_type,llm_provider,llm_model,air_gapped,config_hash)"
             " VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            tenant["id"], name, "docker-compose", llm_provider,
+            tenant["id"], name, deploy_type, llm_provider,
             llm_model, air_gapped, config_hash
         )
 
     return {
-        "files": {
-            "docker-compose.yml": compose,
-            ".env":               env_file,
-            "setup.sh":           setup_sh,
-        },
-        "instructions": [
-            "1. Download all three files to your server",
-            "2. chmod +x setup.sh",
-            f"3. BEFORE going air-gapped: docker compose pull",
-            f"4. BEFORE going air-gapped: docker exec agentguard_ollama ollama pull {llm_model}",
-            "5. ./setup.sh",
-            f"6. Verify: curl http://localhost:{port}/health",
-            "7. Point your agents at this host instead of app.agentguard.io",
-        ],
+        "deployment_mode": deployment_mode,
+        "files":           files,
+        "instructions":    instructions,
+        "air_gapped":      air_gapped,
+        "llm_provider":    llm_provider,
+        "llm_model":       llm_model,
+        "config_hash":     config_hash,
         "requirements": {
-            "docker":         "24.0+",
-            "docker_compose": "2.0+",
-            "ram_minimum":    "8GB (16GB recommended for LLM)",
-            "disk":           "50GB+ for models",
-            "gpu":            "Optional but strongly recommended for vLLM",
+            "python":      "3.11+ (bare-metal)",
+            "docker":      "24.0+ (docker mode only)",
+            "ram_minimum": "8GB (16GB recommended for LLM)",
+            "disk":        "50GB+ for models",
+            "gpu":         "Optional but strongly recommended for vLLM",
         },
-        "air_gapped":  air_gapped,
-        "llm_provider": llm_provider,
-        "llm_model":    llm_model,
-        "config_hash":  config_hash,
     }
 
 @app.get("/onprem/deployments")
