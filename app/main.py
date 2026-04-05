@@ -1,5 +1,5 @@
 """
-AgentGuard v3.0.0
+AgentGuard v3.2.0
 """
 import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio, secrets
 from collections import OrderedDict
@@ -28,8 +28,24 @@ from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_
 from pydantic import BaseModel
 import asyncpg
 
-# v3 helpers (no @app decorators inside v3.py)
+# ── v3 imports (all versions) ─────────────────────────────────────────────────
 from app.v3 import (
+    # v3.0 — sessions, HITL, injection, rate limits, enforcement
+    SESSION_MIGRATIONS,
+    SessionCreate, SessionToolCall, HITLDecision, ToolRateLimit,
+    scan_for_injection, log_injection_event,
+    create_session, get_session, increment_session_counters, terminate_session,
+    check_intent_drift, check_tool_rate_limit,
+    create_hitl_request, get_hitl_status, decide_hitl,
+    run_enforcement_v3, _intent_cache,
+    # v3.1 — bidirectional guardrails, PII tokenization, topic firewall, grounding
+    GUARDRAIL_MIGRATIONS,
+    TopicPolicy, GroundingSource, ProxyRequestV31, OutputScanRequest,
+    tokenize_pii, detokenize, check_topic_policy,
+    scan_output, store_grounding_source, check_grounding,
+    run_input_guardrails, run_output_guardrails,
+    _log_guardrail_event, TOKEN_PREFIX,
+    # v3.2 — semantic topic classifier
     SEMANTIC_MIGRATIONS,
     SemanticTopicPolicy, SemanticCheckRequest,
     semantic_topic_check, run_semantic_guardrails,
@@ -72,7 +88,7 @@ REDIS_ERRORS     = Counter("agentguard_redis_errors_total",   "Redis errors")
 bearer  = HTTPBearer(auto_error=False)
 limiter = Limiter(key_func=get_remote_address)
 
-# ── DB + Redis (module-level so v3.py can import them) ────────────────────────
+# ── DB + Redis ────────────────────────────────────────────────────────────────
 pool:       asyncpg.Pool   = None
 redis_conn: aioredis.Redis = None
 
@@ -94,7 +110,7 @@ async def lifespan(app: FastAPI):
     elif IS_PROD:
         raise RuntimeError("REDIS_URL required in prod")
     await init_db()
-    log.info("agentguard.started", version="3.0.0", env=AGENTGUARD_ENV)
+    log.info("agentguard.started", version="3.2.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
     if redis_conn:
@@ -189,8 +205,16 @@ async def init_db():
             url TEXT NOT NULL, events TEXT[] NOT NULL, secret TEXT NOT NULL,
             active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW())""")
 
-        # ── v3 migrations ──────────────────────────────────────────────────────
+        # v3.0 — sessions, HITL, injection detection, rate limits
         for _sql in SESSION_MIGRATIONS:
+            await conn.execute(_sql)
+
+        # v3.1 — guardrails: PII tokens, topic policies, guardrail events, grounding
+        for _sql in GUARDRAIL_MIGRATIONS:
+            await conn.execute(_sql)
+
+        # v3.2 — semantic classifier tables
+        for _sql in SEMANTIC_MIGRATIONS:
             await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -356,7 +380,7 @@ def _is_private(addr):
 def validate_and_resolve_target(url, agent_hosts):
     try: parsed = urlparse(url)
     except: return False, "Invalid URL", []
-    if parsed.scheme not in ("http","https"): return False, f"Scheme not allowed", []
+    if parsed.scheme not in ("http","https"): return False, "Scheme not allowed", []
     host = parsed.hostname or ""
     effective = set(ALLOWED_INVOKE_HOSTS) | set(agent_hosts or [])
     if not effective: return False, "No allowed hosts", []
@@ -447,7 +471,7 @@ def check_args(args, rules):
             except (TypeError, ValueError): pass
     return True, "ok"
 
-# ── Semantic check ────────────────────────────────────────────────────────────
+# ── Semantic check (tool enforcement) ─────────────────────────────────────────
 SEMANTIC_CACHE_MAX = 512
 SEMANTIC_CACHE_TTL = 60
 _sem_cache: OrderedDict = OrderedDict()
@@ -557,7 +581,7 @@ async def load_agent_and_policy(agent_id, tenant_id):
     return agent, policy
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AgentGuard", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="AgentGuard", version="3.2.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS","*").split(",") if o.strip()]
@@ -692,7 +716,7 @@ async def invoke(req: InvokeRequest, request: Request, bg: BackgroundTasks,
             "redacted": redacted, "duration_ms": ms, "policy": agent["policy"]}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSIONS (v3 routes registered here, not in v3.py)
+# SESSIONS
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/sessions")
 async def start_session(body: SessionCreate, tenant=Depends(get_tenant)):
@@ -700,9 +724,8 @@ async def start_session(body: SessionCreate, tenant=Depends(get_tenant)):
         agent = await conn.fetchrow("SELECT id FROM agents WHERE id=$1 AND tenant_id=$2 AND revoked=FALSE",
                                      body.agent_id, tenant["id"])
     if not agent: raise HTTPException(404, "Agent not found or revoked")
-    result = await create_session(tenant["id"], body.agent_id, body.user_id,
-                                   body.intent, body.ttl_seconds, body.metadata)
-    return result
+    return await create_session(tenant["id"], body.agent_id, body.user_id,
+                                 body.intent, body.ttl_seconds, body.metadata)
 
 @app.get("/sessions")
 async def list_sessions(tenant=Depends(get_tenant), agent_id: Optional[str]=None,
@@ -800,10 +823,9 @@ async def session_protect(session_id: str, req: SessionToolCall, request: Reques
 @app.get("/hitl")
 async def list_hitl(tenant=Depends(get_tenant), status: Optional[str]=None,
                      agent_id: Optional[str]=None, limit: int=50):
-    where = "WHERE tenant_id=$1"
-    vals  = [tenant["id"]]
-    if status:    where += f" AND status=${len(vals)+1}";    vals.append(status)
-    if agent_id:  where += f" AND agent_id=${len(vals)+1}";  vals.append(agent_id)
+    where = "WHERE tenant_id=$1"; vals = [tenant["id"]]
+    if status:   where += f" AND status=${len(vals)+1}";   vals.append(status)
+    if agent_id: where += f" AND agent_id=${len(vals)+1}"; vals.append(agent_id)
     vals.append(min(limit, 200))
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -845,15 +867,13 @@ async def set_tool_rate_limit(body: ToolRateLimit, tenant=Depends(get_tenant)):
         await conn.execute(
             "INSERT INTO tool_rate_limits (tenant_id,agent_id,tool_pattern,max_calls,window_secs) VALUES ($1,$2,$3,$4,$5)"
             " ON CONFLICT (tenant_id,agent_id,tool_pattern) DO UPDATE SET max_calls=$4, window_secs=$5",
-            tenant["id"], body.agent_id, body.tool_pattern, body.max_calls, body.window_secs
-        )
+            tenant["id"], body.agent_id, body.tool_pattern, body.max_calls, body.window_secs)
     return {"agent_id": body.agent_id, "tool_pattern": body.tool_pattern,
             "max_calls": body.max_calls, "window_secs": body.window_secs}
 
 @app.get("/rate-limits")
 async def list_rate_limits(tenant=Depends(get_tenant), agent_id: Optional[str]=None):
-    where = "WHERE tenant_id=$1"
-    vals  = [tenant["id"]]
+    where = "WHERE tenant_id=$1"; vals = [tenant["id"]]
     if agent_id: where += " AND agent_id=$2"; vals.append(agent_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM tool_rate_limits {where} ORDER BY created_at DESC", *vals)
@@ -894,6 +914,259 @@ async def injection_stats(tenant=Depends(get_tenant), days: int=30):
             " GROUP BY pattern ORDER BY count DESC",
             tenant["id"], str(days))
     return {**dict(row), "by_pattern": [dict(r) for r in by_pattern]}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GUARDRAILS v3.1 — topic policies, grounding, output scan, events
+# ══════════════════════════════════════════════════════════════════════════════
+@app.post("/guardrails/topics")
+async def create_topic_policy(body: TopicPolicy, tenant=Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO topic_policies (tenant_id,name,direction,action,keywords,description)"
+            " VALUES ($1,$2,$3,$4,$5,$6)"
+            " ON CONFLICT (tenant_id,name) DO UPDATE SET direction=$3,action=$4,keywords=$5,description=$6",
+            tenant["id"], body.name, body.direction, body.action, body.keywords, body.description)
+    return {"name": body.name, "direction": body.direction, "action": body.action, "keywords": body.keywords}
+
+@app.get("/guardrails/topics")
+async def list_topic_policies(tenant=Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM topic_policies WHERE tenant_id=$1 ORDER BY name", tenant["id"])
+    return [dict(r) for r in rows]
+
+@app.delete("/guardrails/topics/{name}")
+async def delete_topic_policy(name: str, tenant=Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM topic_policies WHERE tenant_id=$1 AND name=$2", tenant["id"], name)
+    if res == "DELETE 0": raise HTTPException(404, "Policy not found")
+    return {"deleted": name}
+
+@app.post("/guardrails/grounding")
+async def add_grounding_source(body: GroundingSource, tenant=Depends(get_tenant)):
+    source_id = await store_grounding_source(
+        tenant["id"], body.content, body.session_id, body.agent_id, body.ttl_seconds)
+    return {"source_id": source_id, "content_length": len(body.content), "expires_in": body.ttl_seconds}
+
+@app.get("/guardrails/grounding")
+async def list_grounding_sources(tenant=Depends(get_tenant), session_id: Optional[str]=None):
+    where = "WHERE tenant_id=$1 AND expires_at > NOW()"; vals = [tenant["id"]]
+    if session_id: where += " AND session_id=$2"; vals.append(session_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT id,session_id,agent_id,content_hash,created_at,expires_at FROM grounding_sources {where} ORDER BY created_at DESC", *vals)
+    return [dict(r) for r in rows]
+
+@app.post("/guardrails/scan-output")
+async def scan_output_endpoint(body: OutputScanRequest, tenant=Depends(get_tenant)):
+    safe, findings, modified = await scan_output(body.content, tenant["id"], body.agent_id, body.session_id)
+    return {"safe_content": safe, "findings": findings, "modified": modified}
+
+@app.get("/guardrails/events")
+async def list_guardrail_events(tenant=Depends(get_tenant), layer: Optional[str]=None,
+                                  direction: Optional[str]=None, days: int=7, limit: int=100):
+    where = "WHERE tenant_id=$1 AND created_at > NOW() - ($2||' days')::INTERVAL"
+    vals  = [tenant["id"], str(days)]
+    if layer:     where += f" AND layer=${len(vals)+1}";     vals.append(layer)
+    if direction: where += f" AND direction=${len(vals)+1}"; vals.append(direction)
+    vals.append(min(limit, 500))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"SELECT * FROM guardrail_events {where} ORDER BY created_at DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/guardrails/stats")
+async def guardrail_stats(tenant=Depends(get_tenant), days: int=30):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_events,"
+            " COUNT(*) FILTER (WHERE layer='topic_firewall') AS topic_blocks,"
+            " COUNT(*) FILTER (WHERE layer='output_gate') AS output_scans,"
+            " COUNT(*) FILTER (WHERE layer='grounding_check') AS grounding_checks,"
+            " COUNT(*) FILTER (WHERE layer='grounding_check' AND action='failed') AS grounding_failures,"
+            " COUNT(*) FILTER (WHERE layer='semantic_classifier') AS semantic_checks,"
+            " COUNT(*) FILTER (WHERE action IN ('blocked','modified')) AS total_interventions"
+            " FROM guardrail_events WHERE tenant_id=$1 AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        by_layer = await conn.fetch(
+            "SELECT layer, action, COUNT(*) AS count FROM guardrail_events"
+            " WHERE tenant_id=$1 AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " GROUP BY layer, action ORDER BY count DESC",
+            tenant["id"], str(days))
+    return {**dict(row), "by_layer": [dict(r) for r in by_layer]}
+
+@app.post("/proxy/chat/v2")
+@limiter.limit("300/minute;30/second")
+async def proxy_chat_v2(req: ProxyRequestV31, request: Request,
+                          bg: BackgroundTasks, tenant=Depends(get_tenant)):
+    """Bidirectional guardrail proxy: keyword firewall + PII + output gate + grounding."""
+    start = time.monotonic(); tid = tenant["id"]
+    safe_messages, safe_system, input_report = await run_input_guardrails(
+        req.messages, req.system, tid, req.agent_id, req.session_id, tokenize=req.tokenize_pii)
+    if input_report.get("blocked"):
+        ms = int((time.monotonic()-start)*1000)
+        return JSONResponse(status_code=400, content={
+            "allowed": False, "blocked_at": "input",
+            "reason": input_report["reason"], "layer": input_report["layer"], "duration_ms": ms})
+    if req.dry_run:
+        return {"dry_run": True, "input_report": input_report, "messages_after_guardrails": len(safe_messages)}
+    try:
+        client = anthropic.AsyncAnthropic()
+        build_kwargs = dict(model=req.model, max_tokens=req.max_tokens, messages=safe_messages)
+        if safe_system: build_kwargs["system"] = safe_system
+        msg = await asyncio.wait_for(client.messages.create(**build_kwargs), timeout=120.0)
+        llm_response      = msg.content[0].text if msg.content else ""
+        prompt_tokens     = msg.usage.input_tokens
+        completion_tokens = msg.usage.output_tokens
+    except Exception as e:
+        log.error("proxy_v2.llm_error", error=str(e))
+        return JSONResponse(status_code=502, content={"error": f"LLM error: {type(e).__name__}"})
+    safe_response, output_report = await run_output_guardrails(
+        llm_response, tid, req.agent_id, req.session_id,
+        detokenize_pii=req.tokenize_pii, check_ground=req.check_grounding,
+        grounding_threshold=req.grounding_threshold)
+    ms = int((time.monotonic()-start)*1000)
+    LATENCY.labels(endpoint="proxy_v2").observe(ms/1000)
+    return {"content": safe_response, "model": req.model,
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                      "total_tokens": prompt_tokens+completion_tokens},
+            "guardrails": {"input": input_report, "output": output_report}, "duration_ms": ms}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEMANTIC CLASSIFIER v3.2
+# ══════════════════════════════════════════════════════════════════════════════
+@app.post("/guardrails/semantic-topics")
+async def create_semantic_policy(body: SemanticTopicPolicy, tenant=Depends(get_tenant)):
+    """Create a semantic topic policy with confidence scoring. Catches paraphrases."""
+    policy_dict = {"name": body.name, "example_phrases": body.example_phrases,
+                   "confidence_threshold": body.confidence_threshold}
+    policy_vec = await _get_policy_embedding(policy_dict)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO semantic_topic_policies"
+            " (tenant_id,name,description,example_phrases,confidence_threshold,direction,action)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7)"
+            " ON CONFLICT (tenant_id,name) DO UPDATE"
+            " SET description=$3,example_phrases=$4,confidence_threshold=$5,direction=$6,action=$7,updated_at=NOW()",
+            tenant["id"], body.name, body.description, body.example_phrases,
+            body.confidence_threshold, body.direction, body.action)
+    return {"name": body.name, "description": body.description,
+            "confidence_threshold": body.confidence_threshold, "direction": body.direction,
+            "action": body.action, "example_count": len(body.example_phrases),
+            "embedding_cached": any(v != 0.0 for v in policy_vec)}
+
+@app.get("/guardrails/semantic-topics")
+async def list_semantic_policies(tenant=Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM semantic_topic_policies WHERE tenant_id=$1 ORDER BY name", tenant["id"])
+    return [dict(r) for r in rows]
+
+@app.delete("/guardrails/semantic-topics/{name}")
+async def delete_semantic_policy(name: str, tenant=Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM semantic_topic_policies WHERE tenant_id=$1 AND name=$2", tenant["id"], name)
+    _embedding_cache.pop(f"policy_{name}", None)
+    if res == "DELETE 0": raise HTTPException(404, "Semantic policy not found")
+    return {"deleted": name}
+
+@app.patch("/guardrails/semantic-topics/{name}/threshold")
+async def update_threshold(name: str, body: dict, tenant=Depends(get_tenant)):
+    threshold = float(body.get("threshold", 0.75))
+    if not 0.0 <= threshold <= 1.0: raise HTTPException(400, "threshold must be 0.0-1.0")
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE semantic_topic_policies SET confidence_threshold=$1, updated_at=NOW() WHERE tenant_id=$2 AND name=$3",
+            threshold, tenant["id"], name)
+    if res == "UPDATE 0": raise HTTPException(404, "Semantic policy not found")
+    return {"name": name, "new_threshold": threshold}
+
+@app.post("/guardrails/semantic-topics/test")
+async def test_semantic_classifier(body: SemanticCheckRequest, tenant=Depends(get_tenant)):
+    """Test text against all semantic policies. Returns scores for threshold tuning."""
+    text_vec = await embed_text(body.text)
+    async with pool.acquire() as conn:
+        db_policies = await conn.fetch(
+            "SELECT name,description,example_phrases,confidence_threshold,direction,action"
+            " FROM semantic_topic_policies WHERE tenant_id=$1 AND enabled=TRUE", tenant["id"])
+    all_policies = BUILTIN_SEMANTIC_POLICIES + [dict(r) for r in db_policies]
+    results = []
+    for policy in all_policies:
+        if policy.get("direction") not in (body.direction, "both"): continue
+        policy_vec = await _get_policy_embedding(policy)
+        similarity = cosine_similarity(text_vec, policy_vec)
+        threshold  = float(policy.get("confidence_threshold", 0.75))
+        results.append({"policy": policy["name"], "similarity": round(similarity, 4),
+                         "threshold": threshold, "would_block": similarity >= threshold,
+                         "margin": round(similarity - threshold, 4),
+                         "builtin": policy in BUILTIN_SEMANTIC_POLICIES})
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    blocked_by = [r["policy"] for r in results if r["would_block"]]
+    return {"text": body.text[:200], "direction": body.direction,
+            "blocked": len(blocked_by) > 0, "blocked_by": blocked_by, "scores": results}
+
+@app.get("/guardrails/semantic-topics/stats")
+async def semantic_classifier_stats(tenant=Depends(get_tenant), days: int=30):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_checks,"
+            " COUNT(*) FILTER (WHERE action='blocked') AS total_blocked,"
+            " COUNT(DISTINCT policy_name) AS policies_triggered,"
+            " ROUND(AVG(similarity)::numeric,4) AS avg_similarity,"
+            " ROUND(MAX(similarity)::numeric,4) AS max_similarity"
+            " FROM semantic_classifier_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        by_policy = await conn.fetch(
+            "SELECT policy_name, COUNT(*) AS checks,"
+            " COUNT(*) FILTER (WHERE action='blocked') AS blocked,"
+            " ROUND(AVG(similarity)::numeric,4) AS avg_similarity"
+            " FROM semantic_classifier_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " GROUP BY policy_name ORDER BY blocked DESC",
+            tenant["id"], str(days))
+    return {**dict(row), "by_policy": [dict(r) for r in by_policy]}
+
+@app.post("/proxy/chat/v3")
+@limiter.limit("300/minute;30/second")
+async def proxy_chat_v3(req: ProxyRequestV31, request: Request,
+                          bg: BackgroundTasks, tenant=Depends(get_tenant)):
+    """
+    Full semantic guardrail proxy — complete pipeline:
+    INPUT:  keyword firewall → semantic classifier → injection scan → PII tokenize
+    LLM
+    OUTPUT: PII detokenize → output gate → semantic output check → grounding
+    """
+    start = time.monotonic(); tid = tenant["id"]
+    safe_messages, safe_system, input_report = await run_semantic_guardrails(
+        req.messages, req.system, tid, req.agent_id, req.session_id, tokenize=req.tokenize_pii)
+    if input_report.get("blocked"):
+        ms = int((time.monotonic()-start)*1000)
+        return JSONResponse(status_code=400, content={
+            "allowed": False, "blocked_at": "input",
+            "reason": input_report.get("reason"), "layer": input_report.get("layer"),
+            "confidence": input_report.get("confidence"), "policy": input_report.get("policy"),
+            "duration_ms": ms})
+    if req.dry_run:
+        return {"dry_run": True, "input_report": input_report, "messages_after_guardrails": len(safe_messages)}
+    try:
+        client = anthropic.AsyncAnthropic()
+        build_kwargs = dict(model=req.model, max_tokens=req.max_tokens, messages=safe_messages)
+        if safe_system: build_kwargs["system"] = safe_system
+        msg = await asyncio.wait_for(client.messages.create(**build_kwargs), timeout=120.0)
+        llm_response      = msg.content[0].text if msg.content else ""
+        prompt_tokens     = msg.usage.input_tokens
+        completion_tokens = msg.usage.output_tokens
+    except Exception as e:
+        log.error("proxy_v3.llm_error", error=str(e))
+        return JSONResponse(status_code=502, content={"error": f"LLM error: {type(e).__name__}"})
+    safe_response, output_report = await run_output_semantic_guardrails(
+        llm_response, tid, req.agent_id, req.session_id,
+        detokenize_pii=req.tokenize_pii, check_ground=req.check_grounding,
+        grounding_threshold=req.grounding_threshold)
+    ms = int((time.monotonic()-start)*1000)
+    LATENCY.labels(endpoint="proxy_v3").observe(ms/1000)
+    return {"content": safe_response, "model": req.model,
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                      "total_tokens": prompt_tokens+completion_tokens},
+            "guardrails": {"input": input_report, "output": output_report}, "duration_ms": ms}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AGENTS
@@ -1045,7 +1318,8 @@ async def export_csv(tenant=Depends(get_tenant), days: int=30):
     writer = csv.writer(output)
     writer.writerow(["id","request_id","agent_id","user_id","tool","decision","reason","redacted","duration_ms","created_at"])
     for r in rows:
-        writer.writerow([r["id"],r["request_id"],r["agent_id"],r["user_id"],r["tool"],r["decision"],r["reason"],r["redacted"],r["duration_ms"],r["created_at"]])
+        writer.writerow([r["id"],r["request_id"],r["agent_id"],r["user_id"],r["tool"],
+                         r["decision"],r["reason"],r["redacted"],r["duration_ms"],r["created_at"]])
     return StreamingResponse(iter([output.getvalue().encode()]), media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=agentguard-audit-{days}d.csv"})
 
@@ -1056,7 +1330,12 @@ async def stats_timeseries(tenant=Depends(get_tenant), interval: str="hour", day
     vals  = [tenant["id"], str(days)]
     if agent_id: where += " AND agent_id=$3"; vals.append(agent_id)
     async with pool.acquire() as conn:
-        rows = await conn.fetch(f"SELECT date_trunc('{trunc}', created_at) AS period, COUNT(*) AS total, COUNT(*) FILTER (WHERE decision='allow') AS allowed, COUNT(*) FILTER (WHERE decision='deny') AS denied, ROUND(AVG(duration_ms)) AS avg_ms FROM audit_logs {where} GROUP BY period ORDER BY period ASC", *vals)
+        rows = await conn.fetch(
+            f"SELECT date_trunc('{trunc}', created_at) AS period, COUNT(*) AS total,"
+            f" COUNT(*) FILTER (WHERE decision='allow') AS allowed,"
+            f" COUNT(*) FILTER (WHERE decision='deny') AS denied,"
+            f" ROUND(AVG(duration_ms)) AS avg_ms"
+            f" FROM audit_logs {where} GROUP BY period ORDER BY period ASC", *vals)
     return [dict(r) for r in rows]
 
 @app.get("/audit/stats/by-tool")
@@ -1066,11 +1345,17 @@ async def stats_by_tool(tenant=Depends(get_tenant), days: int=30, agent_id: Opti
     if agent_id: where += " AND agent_id=$3"; vals.append(agent_id)
     vals.append(min(limit, 100))
     async with pool.acquire() as conn:
-        rows = await conn.fetch(f"SELECT tool, COUNT(*) AS total, COUNT(*) FILTER (WHERE decision='allow') AS allowed, COUNT(*) FILTER (WHERE decision='deny') AS denied, ROUND(AVG(duration_ms)) AS avg_ms, ROUND(100.0 * COUNT(*) FILTER (WHERE decision='deny') / NULLIF(COUNT(*),0), 1) AS deny_rate_pct FROM audit_logs {where} GROUP BY tool ORDER BY total DESC LIMIT ${len(vals)}", *vals)
+        rows = await conn.fetch(
+            f"SELECT tool, COUNT(*) AS total,"
+            f" COUNT(*) FILTER (WHERE decision='allow') AS allowed,"
+            f" COUNT(*) FILTER (WHERE decision='deny') AS denied,"
+            f" ROUND(AVG(duration_ms)) AS avg_ms,"
+            f" ROUND(100.0 * COUNT(*) FILTER (WHERE decision='deny') / NULLIF(COUNT(*),0), 1) AS deny_rate_pct"
+            f" FROM audit_logs {where} GROUP BY tool ORDER BY total DESC LIMIT ${len(vals)}", *vals)
     return [dict(r) for r in rows]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALERTS, WEBHOOKS, HEALTH, ADMIN
+# ALERTS, WEBHOOKS, SETTINGS, ADMIN, HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/alerts")
 async def list_alerts(tenant=Depends(get_tenant), resolved: Optional[bool]=None, limit: int=50):
@@ -1126,7 +1411,9 @@ async def set_retention(body: dict, tenant=Depends(get_tenant)):
     if not 7 <= days <= 3650: raise HTTPException(400, "Retention must be 7-3650 days")
     async with pool.acquire() as conn:
         await conn.execute("UPDATE tenants SET retention_days=$1 WHERE id=$2", days, tenant["id"])
-        deleted = await conn.fetchval("WITH d AS (DELETE FROM audit_logs WHERE tenant_id=$1 AND created_at < NOW() - ($2 || ' days')::INTERVAL RETURNING id) SELECT COUNT(*) FROM d", tenant["id"], str(days))
+        deleted = await conn.fetchval(
+            "WITH d AS (DELETE FROM audit_logs WHERE tenant_id=$1 AND created_at < NOW() - ($2 || ' days')::INTERVAL RETURNING id) SELECT COUNT(*) FROM d",
+            tenant["id"], str(days))
     return {"retention_days": days, "purged_records": deleted}
 
 @app.get("/metrics")
@@ -1163,4 +1450,4 @@ async def health():
     all_ok = checks["postgres"] and checks.get("redis") is not False
     return JSONResponse(status_code=200 if all_ok else 503,
         content={"status":"ok" if all_ok else "degraded",
-                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.0.0"})
+                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.2.0"})
