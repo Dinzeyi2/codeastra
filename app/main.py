@@ -1,5 +1,5 @@
 """
-AgentGuard v3.6.0
+AgentGuard v3.7.0
 """
 import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio, secrets
 from collections import OrderedDict
@@ -92,6 +92,15 @@ from app.v3 import (
     wrap_gemini_with_privacy, privacy_compliant_call,
     privacy_compliant_stream, invalidate_privacy_cache,
     PROVIDER_PRIVACY_FACTS, _compute_compliance_score,
+    # v3.7 — PHI/PCI classifier, zero-logging, on-premise, tamper-proof audit, data classification
+    V37_MIGRATIONS, V37B_MIGRATIONS, V37C_MIGRATIONS,
+    ClassificationResult, ClassificationPolicyModel,
+    classify_text, classify_for_ai,
+    ClassificationAPIRequest, ClassificationAPIResponse,
+    ZeroLogConfig, secure_log_action,
+    verify_audit_chain,
+    generate_docker_compose, generate_env_file, generate_setup_script,
+    _external_pools,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -149,7 +158,7 @@ async def lifespan(app: FastAPI):
     elif IS_PROD:
         raise RuntimeError("REDIS_URL required in prod")
     await init_db()
-    log.info("agentguard.started", version="3.6.0", env=AGENTGUARD_ENV)
+    log.info("agentguard.started", version="3.7.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
     if redis_conn:
@@ -265,6 +274,10 @@ async def init_db():
         # v3.6 — no-training headers + ZDR + data privacy enforcement
         for _sql in V36_MIGRATIONS:
             await conn.execute(_sql)
+        # v3.7 — PHI/PCI, zero-logging, tamper-proof audit, on-premise, classification
+        for _sql in V37_MIGRATIONS:   await conn.execute(_sql)
+        for _sql in V37B_MIGRATIONS:  await conn.execute(_sql)
+        for _sql in V37C_MIGRATIONS:  await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class TenantSignup(BaseModel):
@@ -630,7 +643,7 @@ async def load_agent_and_policy(agent_id, tenant_id):
     return agent, policy
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AgentGuard", version="3.6.0", lifespan=lifespan)
+app = FastAPI(title="AgentGuard", version="3.7.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS","*").split(",") if o.strip()]
@@ -2907,6 +2920,453 @@ async def test_privacy_enforcement(body: dict, tenant=Depends(get_tenant)):
     }
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHI/PCI CLASSIFIER + ZERO-LOGGING + ON-PREMISE + TAMPER-PROOF AUDIT v3.7
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/classify")
+@limiter.limit("500/minute;50/second")
+async def classify_endpoint(
+    body: ClassificationAPIRequest,
+    request: Request,
+    tenant=Depends(get_tenant),
+):
+    """
+    Classify text for PHI, PCI-DSS, and PII before sending to any AI model.
+
+    Returns:
+      classification:   clean | phi | pci | pii | mixed
+      risk_level:       low | medium | high | critical
+      recommendation:   allow | redact | block
+      regulations:      which regulations apply (HIPAA, PCI-DSS, GDPR...)
+      required_controls: what you must do before using AI with this data
+      redacted_text:    safe version of the text with sensitive data replaced
+      safe_to_send:     boolean — true only if recommendation is allow
+
+    This is the main gate before any AI call for regulated industries.
+    """
+    start = time.monotonic()
+    result = await classify_for_ai(
+        text=body.text,
+        tenant_id=tenant["id"],
+        session_id=body.session_id,
+        agent_id=body.agent_id,
+        context=body.context,
+        strict=body.strict,
+    )
+    ms = int((time.monotonic()-start)*1000)
+    return {**result.dict(), "duration_ms": ms}
+
+@app.post("/classify/batch")
+@limiter.limit("100/minute;10/second")
+async def classify_batch(
+    body: dict,
+    tenant=Depends(get_tenant),
+):
+    """
+    Classify multiple texts at once. Max 20 per batch.
+    Useful for classifying a document split into chunks before sending to AI.
+
+    Body: { "texts": ["text1", "text2", ...], "context": "medical_records" }
+    """
+    texts   = body.get("texts", [])
+    context = body.get("context")
+    strict  = body.get("strict", False)
+
+    if len(texts) > 20:
+        raise HTTPException(400, "Max 20 texts per batch")
+
+    results = await asyncio.gather(*[
+        classify_for_ai(t, tenant["id"], context=context, strict=strict)
+        for t in texts
+    ])
+
+    overall_risk = "low"
+    risk_order   = ["low", "medium", "high", "critical"]
+    for r in results:
+        if risk_order.index(r.risk_level) > risk_order.index(overall_risk):
+            overall_risk = r.risk_level
+
+    return {
+        "count":          len(results),
+        "overall_risk":   overall_risk,
+        "safe_to_send":   all(r.safe_to_send for r in results),
+        "has_phi":        any(r.has_phi for r in results),
+        "has_pci":        any(r.has_pci for r in results),
+        "has_pii":        any(r.has_pii for r in results),
+        "results":        [r.dict() for r in results],
+    }
+
+@app.get("/classify/policy")
+async def get_classification_policy(tenant=Depends(get_tenant)):
+    """Get the data classification policy for this tenant."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM classification_policy WHERE tenant_id=$1", tenant["id"])
+    if not row:
+        return ClassificationPolicyModel().dict()
+    return dict(row)
+
+@app.put("/classify/policy")
+async def update_classification_policy(
+    body: ClassificationPolicyModel,
+    tenant=Depends(get_tenant),
+):
+    """
+    Update data classification policy.
+
+    Key settings:
+      hipaa_mode: true  — enables strict HIPAA scanning, blocks PHI automatically
+      pci_mode: true    — enables strict PCI-DSS scanning, blocks card data automatically
+      block_phi: true   — block any input/output containing PHI (recommend for healthcare)
+      block_pci: true   — block any input/output containing PCI data (recommend for fintech)
+      redact_phi: true  — automatically redact PHI (default: true)
+      redact_pci: true  — automatically redact PCI data (default: true)
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO classification_policy"
+            " (tenant_id,block_phi,block_pci,redact_phi,redact_pci,redact_pii,"
+            "  alert_on_phi,alert_on_pci,hipaa_mode,pci_mode,custom_patterns)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"
+            " ON CONFLICT (tenant_id) DO UPDATE SET"
+            " block_phi=$2,block_pci=$3,redact_phi=$4,redact_pci=$5,redact_pii=$6,"
+            " alert_on_phi=$7,alert_on_pci=$8,hipaa_mode=$9,pci_mode=$10,"
+            " custom_patterns=$11,updated_at=NOW()",
+            tenant["id"],
+            body.block_phi, body.block_pci,
+            body.redact_phi, body.redact_pci, body.redact_pii,
+            body.alert_on_phi, body.alert_on_pci,
+            body.hipaa_mode, body.pci_mode,
+            json.dumps(body.custom_patterns),
+        )
+    return {"updated": True, "message": "Classification policy updated."}
+
+@app.get("/classify/stats")
+async def classification_stats(tenant=Depends(get_tenant), days: int=30):
+    """PHI/PCI classification statistics."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_classified,"
+            " COUNT(*) FILTER (WHERE classification='phi') AS phi_detected,"
+            " COUNT(*) FILTER (WHERE classification='pci') AS pci_detected,"
+            " COUNT(*) FILTER (WHERE classification='pii') AS pii_detected,"
+            " COUNT(*) FILTER (WHERE classification='mixed') AS mixed_detected,"
+            " COUNT(*) FILTER (WHERE classification='clean') AS clean,"
+            " COUNT(*) FILTER (WHERE blocked=TRUE) AS blocked,"
+            " COUNT(*) FILTER (WHERE redacted=TRUE) AS redacted,"
+            " COUNT(*) FILTER (WHERE risk_level='critical') AS critical_risk"
+            " FROM data_classification_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+    return dict(row)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FEATURE 2: ZERO-LOGGING MODE ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/settings/zero-logging")
+async def configure_zero_logging(body: ZeroLogConfig, tenant=Depends(get_tenant)):
+    """
+    Enable zero-logging mode.
+
+    When enabled, ALL audit logs are written to YOUR database instead of ours.
+    Your data never touches AgentGuard infrastructure.
+
+    Provide your PostgreSQL connection string:
+    postgresql://user:password@your-host:5432/your-database
+
+    AgentGuard will create the agentguard_audit_log table in your database automatically.
+
+    Set log_to_agentguard=true for dual-write (both your DB and ours).
+    """
+    # Validate connection string format
+    db_url = body.external_db_url
+    if not db_url.startswith(("postgresql://", "postgres://")):
+        raise HTTPException(400, "external_db_url must be a PostgreSQL connection string "
+                                 "(postgresql://user:pass@host:5432/dbname)")
+
+    # Test the connection
+    try:
+        import asyncpg as _asyncpg
+        test_pool = await _asyncpg.create_pool(db_url, min_size=1, max_size=1,
+                                                command_timeout=10)
+        async with test_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        await test_pool.close()
+    except Exception as e:
+        raise HTTPException(400, f"Cannot connect to external database: {str(e)}")
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO tenant_zero_log_config"
+            " (tenant_id,enabled,external_db_url,log_to_agentguard)"
+            " VALUES ($1,$2,$3,$4)"
+            " ON CONFLICT (tenant_id) DO UPDATE SET"
+            " enabled=$2,external_db_url=$3,log_to_agentguard=$4,updated_at=NOW()",
+            tenant["id"], body.enabled, db_url, body.log_to_agentguard
+        )
+
+    # Invalidate external pool so it reconnects with new config
+    from app.v3 import _external_pools
+    _external_pools.pop(tenant["id"], None)
+
+    return {
+        "enabled":           body.enabled,
+        "log_to_agentguard": body.log_to_agentguard,
+        "message":           (
+            "Zero-logging enabled. Your audit data will be written to your database. "
+            "AgentGuard will NOT store your audit logs." if not body.log_to_agentguard
+            else "Dual-write enabled. Logs written to both your database and AgentGuard."
+        ),
+    }
+
+@app.get("/settings/zero-logging")
+async def get_zero_logging_status(tenant=Depends(get_tenant)):
+    """Check zero-logging configuration status."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT enabled,log_to_agentguard,tables_created,"
+            " last_write_at,last_error,created_at"
+            " FROM tenant_zero_log_config WHERE tenant_id=$1",
+            tenant["id"])
+    if not row:
+        return {"enabled": False, "message": "Zero-logging not configured."}
+    r = dict(row)
+    r.pop("external_db_url", None)  # never return connection string
+    return r
+
+@app.delete("/settings/zero-logging")
+async def disable_zero_logging(tenant=Depends(get_tenant)):
+    """Disable zero-logging and revert to AgentGuard audit storage."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tenant_zero_log_config SET enabled=FALSE WHERE tenant_id=$1",
+            tenant["id"])
+    from app.v3 import _external_pools
+    _external_pools.pop(tenant["id"], None)
+    return {"enabled": False, "message": "Zero-logging disabled. Logs stored in AgentGuard."}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FEATURE 3: ON-PREMISE / AIR-GAPPED DEPLOYMENT ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/onprem/generate")
+async def generate_onprem_deployment(body: dict, tenant=Depends(get_tenant)):
+    """
+    Generate a complete on-premise deployment package.
+
+    Returns Docker Compose, .env file, and setup script.
+    Customer downloads these and runs on their own hardware.
+    Zero internet required after initial docker pull.
+
+    Body:
+      llm_provider: "ollama" | "vllm"   (default: ollama)
+      llm_model:    model name           (default: llama3)
+      air_gapped:   true | false         (default: true)
+      port:         int                  (default: 4000)
+      name:         str                  deployment name for tracking
+    """
+    import secrets as _secrets
+
+    llm_provider  = body.get("llm_provider", "ollama")
+    llm_model     = body.get("llm_model", "llama3")
+    air_gapped    = body.get("air_gapped", True)
+    port          = int(body.get("port", 4000))
+    name          = body.get("name", f"onprem-{tenant['id'][:8]}")
+    pg_password   = _secrets.token_urlsafe(24)
+    redis_password = _secrets.token_urlsafe(24)
+
+    if llm_provider not in ("ollama", "vllm"):
+        raise HTTPException(400, "llm_provider must be 'ollama' or 'vllm'")
+
+    # Get tenant API key for inclusion
+    async with pool.acquire() as conn:
+        api_row = await conn.fetchrow(
+            "SELECT api_key FROM tenants WHERE id=$1", tenant["id"])
+    api_key = api_row["api_key"] if api_row else "sk-guard-YOUR_API_KEY"
+
+    compose = generate_docker_compose(
+        tenant_id=tenant["id"], api_key=api_key,
+        llm_provider=llm_provider, llm_model=llm_model,
+        air_gapped=air_gapped, pg_password=pg_password,
+        redis_password=redis_password, port=port,
+    )
+    env_file = generate_env_file(
+        tenant_id=tenant["id"], api_key=api_key,
+        llm_provider=llm_provider,
+        pg_password=pg_password, redis_password=redis_password,
+    )
+    setup_sh = generate_setup_script(llm_model=llm_model, port=port)
+
+    # Track deployment
+    config_hash = hashlib.sha256(compose.encode()).hexdigest()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO onprem_deployments"
+            " (tenant_id,name,deployment_type,llm_provider,llm_model,air_gapped,config_hash)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            tenant["id"], name, "docker-compose", llm_provider,
+            llm_model, air_gapped, config_hash
+        )
+
+    return {
+        "files": {
+            "docker-compose.yml": compose,
+            ".env":               env_file,
+            "setup.sh":           setup_sh,
+        },
+        "instructions": [
+            "1. Download all three files to your server",
+            "2. chmod +x setup.sh",
+            f"3. BEFORE going air-gapped: docker compose pull",
+            f"4. BEFORE going air-gapped: docker exec agentguard_ollama ollama pull {llm_model}",
+            "5. ./setup.sh",
+            f"6. Verify: curl http://localhost:{port}/health",
+            "7. Point your agents at this host instead of app.agentguard.io",
+        ],
+        "requirements": {
+            "docker":         "24.0+",
+            "docker_compose": "2.0+",
+            "ram_minimum":    "8GB (16GB recommended for LLM)",
+            "disk":           "50GB+ for models",
+            "gpu":            "Optional but strongly recommended for vLLM",
+        },
+        "air_gapped":  air_gapped,
+        "llm_provider": llm_provider,
+        "llm_model":    llm_model,
+        "config_hash":  config_hash,
+    }
+
+@app.get("/onprem/deployments")
+async def list_onprem_deployments(tenant=Depends(get_tenant)):
+    """List all on-premise deployments for this tenant."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id,name,deployment_type,llm_provider,llm_model,"
+            " air_gapped,last_heartbeat,version,status,created_at"
+            " FROM onprem_deployments WHERE tenant_id=$1 ORDER BY created_at DESC",
+            tenant["id"])
+    return [dict(r) for r in rows]
+
+@app.post("/onprem/{deployment_id}/heartbeat")
+async def onprem_heartbeat(deployment_id: str, body: dict, tenant=Depends(get_tenant)):
+    """
+    Called by on-premise deployments to report health.
+    Lets you monitor self-hosted instances from the dashboard.
+    """
+    version = body.get("version", "unknown")
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE onprem_deployments"
+            " SET last_heartbeat=NOW(), version=$1, status='online'"
+            " WHERE id=$2 AND tenant_id=$3",
+            version, deployment_id, tenant["id"])
+    if res == "UPDATE 0":
+        raise HTTPException(404, "Deployment not found")
+    return {"acknowledged": True, "deployment_id": deployment_id}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FEATURE 4: TAMPER-PROOF AUDIT LOG ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/audit/secure")
+async def secure_audit_log(
+    tenant=Depends(get_tenant),
+    limit: int = 100,
+    decision: Optional[str] = None,
+    tool: Optional[str] = None,
+):
+    """
+    Tamper-proof audit log with hash chain.
+    Every entry is SHA-256 linked to the previous one.
+    Any modification to any historical entry is immediately detectable.
+    """
+    where = "WHERE tenant_id=$1"
+    vals  = [tenant["id"]]
+    if decision: where += f" AND decision=${len(vals)+1}"; vals.append(decision)
+    if tool:     where += f" AND tool=${len(vals)+1}";     vals.append(tool)
+    vals.append(min(limit, 500))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT id,seq,tool,decision,reason,redacted,duration_ms,"
+            f" entry_hash,prev_hash,chain_valid,created_at"
+            f" FROM audit_log_secure {where}"
+            f" ORDER BY seq DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/audit/secure/verify")
+async def verify_audit_chain_endpoint(
+    tenant=Depends(get_tenant),
+    limit: int = 1000,
+):
+    """
+    Verify the integrity of the entire audit log chain.
+    Walks every entry and verifies the hash chain is unbroken.
+    Returns verification result with any broken links.
+
+    Use this for compliance audits to prove the log hasn't been tampered with.
+    """
+    result = await verify_audit_chain(tenant["id"], limit)
+    return result
+
+@app.get("/audit/secure/stats")
+async def secure_audit_stats(tenant=Depends(get_tenant), days: int=30):
+    """Tamper-proof audit log statistics."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_entries,"
+            " COUNT(*) FILTER (WHERE decision='allow') AS allowed,"
+            " COUNT(*) FILTER (WHERE decision='deny') AS denied,"
+            " COUNT(*) FILTER (WHERE chain_valid=FALSE) AS chain_violations,"
+            " MIN(seq) AS first_seq, MAX(seq) AS last_seq"
+            " FROM audit_log_secure WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL",
+            tenant["id"], str(days))
+        chain = await conn.fetchrow(
+            "SELECT last_hash, last_seq, total_entries, chain_broken, broken_at_seq"
+            " FROM audit_chain_state WHERE tenant_id=$1",
+            tenant["id"])
+    return {
+        **dict(row),
+        "chain_state": dict(chain) if chain else None,
+        "chain_intact": not (chain["chain_broken"] if chain else False),
+    }
+
+@app.get("/audit/secure/export")
+async def export_secure_audit(tenant=Depends(get_tenant), days: int=30):
+    """
+    Export the complete tamper-proof audit log as JSON.
+    Includes all hash chain data for offline verification.
+    Use for compliance audits, legal discovery, or SOC 2 evidence.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM audit_log_secure WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||' days')::INTERVAL"
+            " ORDER BY seq ASC",
+            tenant["id"], str(days))
+        chain = await conn.fetchrow(
+            "SELECT * FROM audit_chain_state WHERE tenant_id=$1", tenant["id"])
+
+    data = {
+        "export_date":    datetime.now(timezone.utc).isoformat(),
+        "tenant_id":      tenant["id"],
+        "period_days":    days,
+        "total_entries":  len(rows),
+        "chain_state":    dict(chain) if chain else None,
+        "entries":        [dict(r) for r in rows],
+        "verification":   "Run GET /audit/secure/verify to verify chain integrity",
+    }
+    content = json.dumps(data, default=str, indent=2).encode()
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename=agentguard-secure-audit-{days}d.json"}
+    )
+
+
 @app.get("/health")
 async def health():
     checks = {"postgres": False, "redis": None}
@@ -2920,4 +3380,4 @@ async def health():
     all_ok = checks["postgres"] and checks.get("redis") is not False
     return JSONResponse(status_code=200 if all_ok else 503,
         content={"status":"ok" if all_ok else "degraded",
-                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.6.0"})
+                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.7.0"})
