@@ -3236,3 +3236,222 @@ async def run_enforcement_v34(
         return False, "requires human approval", clean, redacted, "pending_approval"
 
     return True, "all checks passed", clean, redacted, "proceed"
+
+
+
+"""
+AgentGuard v3.5.0 — Multi-Model + Streaming additions
+
+PASTE AT BOTTOM OF: app/v3.py
+
+NEW DB MIGRATIONS: V35_MIGRATIONS
+  - model_usage_log  — tracks provider/model per request
+  - stream_sessions  — tracks active streaming sessions
+
+NEW FUNCTIONS:
+  - run_streaming_guardrails()  — buffer-then-scan for output
+  - build_sse_event()           — SSE format helper
+  - StreamProxyRequest          — Pydantic model for streaming endpoints
+
+NEW ENDPOINTS (paste into main.py before /health):
+  POST /proxy/chat/v2/stream   — keyword + PII + grounding, streaming
+  POST /proxy/chat/v3/stream   — full semantic stack, streaming
+  POST /proxy/chat/v4/stream   — complete v3.4 pipeline, streaming
+  GET  /models                 — list all supported models by provider
+  GET  /models/{model}/validate — validate a model string
+  GET  /models/ollama/available — list locally available Ollama models
+"""
+
+import json, time, asyncio, uuid
+from typing import Optional, AsyncIterator
+from pydantic import BaseModel
+import structlog
+
+log = structlog.get_logger()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB MIGRATIONS v3.5
+# ══════════════════════════════════════════════════════════════════════════════
+
+V35_MIGRATIONS = [
+
+# Track model usage per request across all providers
+"""CREATE TABLE IF NOT EXISTS model_usage_log (
+    id                TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id         TEXT NOT NULL,
+    session_id        TEXT,
+    agent_id          TEXT,
+    model             TEXT NOT NULL,
+    provider          TEXT NOT NULL,
+    prompt_tokens     INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens      INTEGER DEFAULT 0,
+    streaming         BOOLEAN DEFAULT FALSE,
+    duration_ms       INTEGER,
+    finish_reason     TEXT,
+    guardrail_blocked BOOLEAN DEFAULT FALSE,
+    created_at        TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS model_usage_tenant_idx
+   ON model_usage_log(tenant_id, created_at DESC)""",
+"""CREATE INDEX IF NOT EXISTS model_usage_provider_idx
+   ON model_usage_log(provider, model, created_at DESC)""",
+
+# Track active streaming sessions for cleanup
+"""CREATE TABLE IF NOT EXISTS stream_sessions (
+    id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id   TEXT NOT NULL,
+    session_id  TEXT,
+    agent_id    TEXT,
+    model       TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active',
+    started_at  TIMESTAMPTZ DEFAULT NOW(),
+    ended_at    TIMESTAMPTZ,
+    total_chunks INTEGER DEFAULT 0,
+    aborted     BOOLEAN DEFAULT FALSE
+)""",
+"""CREATE INDEX IF NOT EXISTS stream_sessions_tenant_idx
+   ON stream_sessions(tenant_id, started_at DESC)""",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StreamProxyRequest(BaseModel):
+    """Request body for all streaming proxy endpoints."""
+    model:               str = "claude-sonnet-4-6"
+    messages:            list[dict]
+    system:              Optional[str] = None
+    max_tokens:          int = 1000
+    agent_id:            Optional[str] = None
+    session_id:          Optional[str] = None
+    tokenize_pii:        bool = False
+    check_grounding:     bool = False
+    grounding_threshold: float = 0.5
+    dry_run:             bool = False
+    temperature:         Optional[float] = None
+    # Stream behavior
+    buffer_output:       bool = True   # True = buffer+scan, False = passthrough+async-scan
+    stream_guardrail_events: bool = True  # include guardrail SSE events in stream
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SSE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_sse_event(data: dict, event: str = "message") -> str:
+    """Format a dict as a Server-Sent Event string."""
+    payload = json.dumps(data, default=str)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+def sse_token(delta: str, model: str, provider: str) -> str:
+    return build_sse_event(
+        {"type": "token", "delta": delta, "model": model, "provider": provider},
+        event="token"
+    )
+
+def sse_done(model: str, provider: str, prompt_tokens: int,
+             completion_tokens: int, guardrails: dict) -> str:
+    return build_sse_event(
+        {"type": "done", "model": model, "provider": provider,
+         "usage": {"prompt_tokens": prompt_tokens,
+                   "completion_tokens": completion_tokens,
+                   "total_tokens": prompt_tokens + completion_tokens},
+         "guardrails": guardrails},
+        event="done"
+    )
+
+def sse_error(message: str, code: str = "error") -> str:
+    return build_sse_event({"type": "error", "code": code, "message": message}, event="error")
+
+def sse_blocked(reason: str, layer: str, action: str = "blocked") -> str:
+    return build_sse_event(
+        {"type": "blocked", "reason": reason, "layer": layer, "action": action},
+        event="blocked"
+    )
+
+def sse_guardrail(event_type: str, detail: dict) -> str:
+    return build_sse_event({"type": "guardrail", "event": event_type, **detail}, event="guardrail")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STREAMING GUARDRAIL PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_streaming_guardrails(
+    response_text: str,
+    tenant_id:     str,
+    agent_id:      Optional[str],
+    session_id:    Optional[str],
+    detokenize_pii:      bool  = False,
+    check_ground:        bool  = False,
+    grounding_threshold: float = 0.5,
+    citation_level:      bool  = False,
+) -> tuple[str, dict]:
+    """
+    Run all output guardrails on a complete buffered response.
+    Returns (safe_text, report_dict).
+    Identical to run_output_semantic_guardrails but returns a
+    structured report suitable for embedding in the SSE done event.
+    """
+    # Import from existing v3 functions (already defined above this file in v3.py)
+    from app.v3 import (
+        run_output_semantic_guardrails,
+        check_grounding_with_citations,
+    )
+
+    safe_text, output_report = await run_output_semantic_guardrails(
+        response_text, tenant_id, agent_id, session_id,
+        detokenize_pii=detokenize_pii,
+        check_ground=check_ground and not citation_level,
+        grounding_threshold=grounding_threshold,
+    )
+
+    grounding_report = None
+    if citation_level and check_ground:
+        grounding_report = await check_grounding_with_citations(
+            safe_text, tenant_id, session_id, agent_id,
+            threshold=grounding_threshold)
+        if not grounding_report.grounded:
+            prefix = (
+                f"[GROUNDING WARNING: {grounding_report.support_ratio:.0%} supported "
+                f"({grounding_report.supported}/{grounding_report.total_sentences} sentences). "
+                "Unsupported claims detected.]\n\n"
+            )
+            safe_text = prefix + safe_text
+
+    report = {"output": output_report}
+    if grounding_report:
+        report["grounding"] = {
+            "grounded":        grounding_report.grounded,
+            "support_ratio":   grounding_report.support_ratio,
+            "total_sentences": grounding_report.total_sentences,
+            "supported":       grounding_report.supported,
+            "unsupported":     grounding_report.unsupported,
+            "summary":         grounding_report.summary,
+            "citations":       grounding_report.citations,
+        }
+    return safe_text, report
+
+async def _log_model_usage(
+    tenant_id: str, session_id: Optional[str], agent_id: Optional[str],
+    model: str, provider: str, prompt_tokens: int, completion_tokens: int,
+    streaming: bool, duration_ms: int, finish_reason: str,
+    guardrail_blocked: bool = False,
+):
+    """Persist model usage stats."""
+    try:
+        from app.main import pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO model_usage_log"
+                " (tenant_id,session_id,agent_id,model,provider,"
+                "  prompt_tokens,completion_tokens,total_tokens,"
+                "  streaming,duration_ms,finish_reason,guardrail_blocked)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                tenant_id, session_id, agent_id, model, provider,
+                prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
+                streaming, duration_ms, finish_reason, guardrail_blocked,
+            )
+    except Exception as e:
+        log.warning("model_usage.log_failed", error=str(e))
