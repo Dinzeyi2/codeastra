@@ -30,13 +30,13 @@ import asyncpg
 
 # v3 helpers (no @app decorators inside v3.py)
 from app.v3 import (
-    SESSION_MIGRATIONS,
-    SessionCreate, SessionToolCall, HITLDecision, ToolRateLimit,
-    scan_for_injection, log_injection_event,
-    create_session, get_session, increment_session_counters, terminate_session,
-    check_intent_drift, check_tool_rate_limit,
-    create_hitl_request, get_hitl_status, decide_hitl,
-    run_enforcement_v3, _intent_cache,
+    SEMANTIC_MIGRATIONS,
+    SemanticTopicPolicy, SemanticCheckRequest,
+    semantic_topic_check, run_semantic_guardrails,
+    run_output_semantic_guardrails,
+    embed_text, cosine_similarity,
+    BUILTIN_SEMANTIC_POLICIES, _get_policy_embedding,
+    _embedding_cache,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
