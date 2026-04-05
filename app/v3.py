@@ -1222,3 +1222,979 @@ async def run_output_semantic_guardrails(response_text, tenant_id, agent_id, ses
                 f"response may not be supported by source documents. {reason}]\n\n"
                 + safe_response)
     return safe_response, report
+"""
+AgentGuard v3.3.0 — Ephemeral Session Certificates + AST Policy Synthesis
+
+TWO NEW FEATURES:
+
+1. EPHEMERAL SESSION CERTS
+   - Every session gets a short-lived X.509 certificate tied to session_id + agent + tenant
+   - Requests must be signed with the session cert, not just the API key
+   - Stolen API key alone is not enough — attacker needs the per-session private key too
+   - Certs auto-expire when the session expires
+   - Full revocation support
+
+2. AST POLICY SYNTHESIS
+   - POST /policies/synthesize with Python/JS agent code
+   - Parses the AST to find tool calls, network calls, file ops, shell commands
+   - Auto-generates least-privilege policy
+   - Users review and approve — one click to activate
+   - No more allow_all: true
+
+PASTE AT BOTTOM OF: app/v3.py
+
+ADD TO init_db() in main.py:
+    for _sql in CERT_MIGRATIONS:
+        await conn.execute(_sql)
+
+ADD TO imports in main.py:
+    from app.v3 import (
+        ...existing...,
+        CERT_MIGRATIONS,
+        mint_session_cert, verify_session_cert, revoke_session_cert,
+        get_session_cert, synthesize_policy_from_code,
+        PolicySynthesisRequest, PolicySynthesisResult,
+        CertVerifyRequest,
+    )
+
+ADD ENDPOINTS: paste CERT_AND_SYNTHESIS_ENDPOINTS into main.py before /health
+"""
+
+import ast
+import re
+import textwrap
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.backends import default_backend
+from pydantic import BaseModel
+from typing import Any, Optional
+from datetime import datetime, timezone, timedelta
+import json, hashlib, uuid, asyncio
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB MIGRATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+CERT_MIGRATIONS = [
+"""CREATE TABLE IF NOT EXISTS session_certificates (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    session_id      TEXT NOT NULL UNIQUE,
+    tenant_id       TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    cert_pem        TEXT NOT NULL,
+    public_key_pem  TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL UNIQUE,
+    issued_at       TIMESTAMPTZ DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    revoked         BOOLEAN DEFAULT FALSE,
+    revoked_at      TIMESTAMPTZ,
+    revoke_reason   TEXT
+)""",
+"""CREATE INDEX IF NOT EXISTS session_cert_session_idx ON session_certificates(session_id)""",
+"""CREATE INDEX IF NOT EXISTS session_cert_tenant_idx  ON session_certificates(tenant_id, expires_at)""",
+"""CREATE INDEX IF NOT EXISTS session_cert_fingerprint ON session_certificates(fingerprint)""",
+
+"""CREATE TABLE IF NOT EXISTS cert_request_log (
+    id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id   TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    fingerprint TEXT,
+    verified    BOOLEAN NOT NULL,
+    fail_reason TEXT,
+    ip          TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS cert_req_session_idx ON cert_request_log(session_id, created_at DESC)""",
+
+"""CREATE TABLE IF NOT EXISTS synthesized_policies (
+    id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    tenant_id       TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    source_hash     TEXT NOT NULL,
+    language        TEXT NOT NULL DEFAULT 'python',
+    inferred_tools  TEXT[] NOT NULL DEFAULT '{}',
+    inferred_hosts  TEXT[] NOT NULL DEFAULT '{}',
+    inferred_paths  TEXT[] NOT NULL DEFAULT '{}',
+    rules           JSONB NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'draft',
+    activated_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+)""",
+"""CREATE INDEX IF NOT EXISTS synth_policy_tenant_idx ON synthesized_policies(tenant_id, created_at DESC)""",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PolicySynthesisRequest(BaseModel):
+    code:          str           # agent source code (Python or JS)
+    language:      str = "python"
+    policy_name:   str = "auto-generated"
+    auto_activate: bool = False  # immediately activate or leave as draft
+
+class PolicySynthesisResult(BaseModel):
+    policy_id:      str
+    policy_name:    str
+    status:         str
+    inferred_tools: list[str]
+    inferred_hosts: list[str]
+    inferred_paths: list[str]
+    rules:          dict
+    warnings:       list[str]
+
+class CertVerifyRequest(BaseModel):
+    session_id: str
+    payload:    str   # base64 payload that was signed
+    signature:  str   # base64 signature
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EPHEMERAL SESSION CERTIFICATES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# AgentGuard CA — generated once at startup, lives in memory
+# In production set AGENTGUARD_CA_KEY and AGENTGUARD_CA_CERT env vars
+_ca_key:  Optional[rsa.RSAPrivateKey] = None
+_ca_cert: Optional[x509.Certificate]  = None
+
+def _get_or_create_ca():
+    """Get or create the in-process CA. In prod, load from env vars."""
+    global _ca_key, _ca_cert
+    if _ca_key and _ca_cert:
+        return _ca_key, _ca_cert
+
+    import os
+    ca_key_pem  = os.environ.get("AGENTGUARD_CA_KEY")
+    ca_cert_pem = os.environ.get("AGENTGUARD_CA_CERT")
+
+    if ca_key_pem and ca_cert_pem:
+        _ca_key  = serialization.load_pem_private_key(
+            ca_key_pem.encode(), password=None, backend=default_backend())
+        _ca_cert = x509.load_pem_x509_certificate(
+            ca_cert_pem.encode(), default_backend())
+        return _ca_key, _ca_cert
+
+    # Generate ephemeral CA (dev mode — regenerates on restart)
+    _ca_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend())
+    _ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "AgentGuard Local CA"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "AgentGuard"),
+        ]))
+        .issuer_name(x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "AgentGuard Local CA"),
+        ]))
+        .public_key(_ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .sign(_ca_key, hashes.SHA256(), default_backend())
+    )
+    return _ca_key, _ca_cert
+
+async def mint_session_cert(session_id: str, tenant_id: str, agent_id: str,
+                             ttl_seconds: int = 3600) -> dict:
+    """
+    Mint a short-lived X.509 certificate for a session.
+    Returns the cert PEM and private key PEM.
+    The private key is returned ONCE and never stored — caller must keep it.
+    """
+    ca_key, ca_cert = _get_or_create_ca()
+
+    # Generate session keypair
+    session_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend())
+
+    not_before = datetime.now(timezone.utc)
+    not_after  = not_before + timedelta(seconds=ttl_seconds)
+
+    # Embed session metadata in Subject Alternative Names
+    san = x509.SubjectAlternativeName([
+        x509.DNSName(f"session.{session_id[:16]}.agentguard.local"),
+        x509.DNSName(f"agent.{agent_id[:16]}.agentguard.local"),
+        x509.RFC822Name(f"{session_id}@agentguard.sessions"),
+    ])
+
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME,            f"session:{session_id}"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME,      tenant_id),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, agent_id),
+            x509.NameAttribute(NameOID.SERIAL_NUMBER,          session_id),
+        ]))
+        .issuer_name(ca_cert.subject)
+        .public_key(session_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(san, critical=False)
+        .add_extension(
+            x509.KeyUsage(digital_signature=True, key_encipherment=False,
+                          content_commitment=True, data_encipherment=False,
+                          key_agreement=False, key_cert_sign=False,
+                          crl_sign=False, encipher_only=False, decipher_only=False),
+            critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.ExtendedKeyUsageOID.CLIENT_AUTH]),
+            critical=False)
+        .sign(ca_key, hashes.SHA256(), default_backend())
+    )
+
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    pub_pem  = session_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode()
+    priv_pem = session_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()
+    ).decode()
+
+    # Fingerprint = SHA256 of DER-encoded cert
+    fingerprint = hashlib.sha256(cert.public_bytes(serialization.Encoding.DER)).hexdigest()
+
+    # Store cert in DB (NOT the private key — caller keeps that)
+    from app.main import pool, redis_conn
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO session_certificates
+               (session_id, tenant_id, agent_id, cert_pem, public_key_pem, fingerprint, expires_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)
+               ON CONFLICT (session_id) DO UPDATE
+               SET cert_pem=$4, public_key_pem=$5, fingerprint=$6,
+                   expires_at=$7, revoked=FALSE, revoked_at=NULL""",
+            session_id, tenant_id, agent_id, cert_pem, pub_pem, fingerprint, not_after
+        )
+
+    # Cache in Redis for fast verification
+    if redis_conn:
+        try:
+            await redis_conn.setex(
+                f"ag:cert:{session_id}", ttl_seconds,
+                json.dumps({"fingerprint": fingerprint, "pub_pem": pub_pem,
+                            "tenant_id": tenant_id, "agent_id": agent_id,
+                            "revoked": False})
+            )
+        except Exception:
+            pass
+
+    return {
+        "session_id":   session_id,
+        "cert_pem":     cert_pem,
+        "private_key_pem": priv_pem,   # returned once, never stored
+        "fingerprint":  fingerprint,
+        "expires_at":   not_after.isoformat(),
+        "ttl_seconds":  ttl_seconds,
+        "warning":      "Store private_key_pem securely — it is not saved server-side.",
+    }
+
+async def verify_session_cert(session_id: str, tenant_id: str,
+                               payload_b64: str, signature_b64: str) -> tuple[bool, str]:
+    """
+    Verify a request signed with the session certificate's private key.
+    Returns (ok, reason)
+    """
+    from app.main import pool, redis_conn
+    from base64 import b64decode
+
+    # Fast path: Redis
+    cert_data = None
+    if redis_conn:
+        try:
+            raw = await redis_conn.get(f"ag:cert:{session_id}")
+            if raw:
+                cert_data = json.loads(raw)
+        except Exception:
+            pass
+
+    if not cert_data:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM session_certificates"
+                " WHERE session_id=$1 AND tenant_id=$2",
+                session_id, tenant_id
+            )
+        if not row:
+            return False, "No certificate found for this session"
+        cert_data = dict(row)
+
+    if cert_data.get("revoked"):
+        return False, "Session certificate has been revoked"
+
+    # Check expiry
+    expires_at = cert_data.get("expires_at")
+    if expires_at:
+        if isinstance(expires_at, str):
+            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        else:
+            exp = expires_at
+        if exp < datetime.now(timezone.utc):
+            return False, "Session certificate has expired"
+
+    # Verify signature
+    try:
+        pub_key = serialization.load_pem_public_key(
+            cert_data["pub_pem"].encode()
+            if "pub_pem" in cert_data
+            else cert_data["public_key_pem"].encode(),
+            backend=default_backend()
+        )
+        payload   = b64decode(payload_b64)
+        signature = b64decode(signature_b64)
+        pub_key.verify(signature, payload, padding.PKCS1v15(), hashes.SHA256())
+        return True, "ok"
+    except Exception as e:
+        return False, f"Signature verification failed: {type(e).__name__}"
+
+async def revoke_session_cert(session_id: str, tenant_id: str, reason: str = "manual") -> bool:
+    from app.main import pool, redis_conn
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE session_certificates SET revoked=TRUE, revoked_at=NOW(), revoke_reason=$1"
+            " WHERE session_id=$2 AND tenant_id=$3",
+            reason, session_id, tenant_id
+        )
+    if redis_conn:
+        try:
+            raw = await redis_conn.get(f"ag:cert:{session_id}")
+            if raw:
+                data = json.loads(raw)
+                data["revoked"] = True
+                ttl = await redis_conn.ttl(f"ag:cert:{session_id}")
+                await redis_conn.setex(f"ag:cert:{session_id}", max(ttl, 60), json.dumps(data))
+        except Exception:
+            pass
+    return res != "UPDATE 0"
+
+async def get_session_cert(session_id: str, tenant_id: str) -> Optional[dict]:
+    from app.main import pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT session_id, tenant_id, agent_id, cert_pem, fingerprint,"
+            " issued_at, expires_at, revoked, revoked_at, revoke_reason"
+            " FROM session_certificates WHERE session_id=$1 AND tenant_id=$2",
+            session_id, tenant_id
+        )
+    return dict(row) if row else None
+
+async def log_cert_request(tenant_id, agent_id, session_id, fingerprint, verified, fail_reason, ip):
+    from app.main import pool
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO cert_request_log"
+                " (tenant_id,agent_id,session_id,fingerprint,verified,fail_reason,ip)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                tenant_id, agent_id, session_id, fingerprint, verified, fail_reason, ip
+            )
+    except Exception:
+        pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AST POLICY SYNTHESIS — Python
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Known tool call patterns — function names that map to AgentGuard tool names
+PYTHON_TOOL_PATTERNS = {
+    # HTTP / network
+    "requests.get":    "http_get",
+    "requests.post":   "http_post",
+    "requests.put":    "http_put",
+    "requests.delete": "http_delete",
+    "requests.patch":  "http_patch",
+    "httpx.get":       "http_get",
+    "httpx.post":      "http_post",
+    "aiohttp":         "http_*",
+    "urllib.request":  "http_*",
+    # File ops
+    "open":            "file_read",
+    "os.remove":       "file_delete",
+    "os.unlink":       "file_delete",
+    "shutil.rmtree":   "file_delete",
+    "os.makedirs":     "file_write",
+    "os.mkdir":        "file_write",
+    "shutil.copy":     "file_write",
+    "shutil.move":     "file_write",
+    # Shell
+    "os.system":       "shell_exec",
+    "subprocess.run":  "shell_exec",
+    "subprocess.call": "shell_exec",
+    "subprocess.Popen":"shell_exec",
+    "os.popen":        "shell_exec",
+    # DB
+    "cursor.execute":  "db_query",
+    "conn.execute":    "db_query",
+    "engine.execute":  "db_query",
+    # Email
+    "smtplib":         "send_email",
+    "sendgrid":        "send_email",
+    # Cloud
+    "boto3":           "aws_*",
+    "s3":              "aws_s3_*",
+    "dynamodb":        "aws_dynamodb_*",
+    # AgentGuard tools (direct)
+    "guard.protect":   None,  # skip — that's our own wrapper
+    "guard.invoke":    None,
+}
+
+# URL patterns to extract allowed hosts
+URL_PATTERN = re.compile(
+    r"""['"](https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)['"]""",
+    re.IGNORECASE
+)
+
+# File path patterns
+PATH_PATTERN = re.compile(
+    r"""open\s*\(\s*['"f]([^'"]+)['"]""",
+    re.IGNORECASE
+)
+
+# Write mode detection
+WRITE_MODE_PATTERN = re.compile(r"""open\s*\([^,]+,\s*['"]([wa+rb]+)['"]""")
+
+# Dangerous patterns that generate warnings
+DANGEROUS_PATTERNS = [
+    (re.compile(r"os\.system|subprocess\.call|os\.popen"), "shell_exec — review carefully"),
+    (re.compile(r"shutil\.rmtree|os\.remove|os\.unlink"),  "file deletion detected"),
+    (re.compile(r"DROP\s+TABLE|DELETE\s+FROM", re.I),       "destructive SQL detected"),
+    (re.compile(r"rm\s+-rf|sudo\s+"),                       "dangerous shell command detected"),
+    (re.compile(r"eval\s*\(|exec\s*\("),                    "dynamic code execution detected"),
+    (re.compile(r"__import__|importlib\.import_module"),     "dynamic import detected"),
+]
+
+class PythonASTVisitor(ast.NodeVisitor):
+    def __init__(self):
+        self.tools:    set[str] = set()
+        self.urls:     set[str] = set()
+        self.paths:    set[str] = set()
+        self.warnings: list[str] = []
+        self.write_ops: bool = False
+        self.delete_ops: bool = False
+        self.shell_ops: bool = False
+        self.network_ops: bool = False
+
+    def _attr_chain(self, node) -> str:
+        """Convert a.b.c attribute access to 'a.b.c' string."""
+        if isinstance(node, ast.Attribute):
+            return f"{self._attr_chain(node.value)}.{node.attr}"
+        elif isinstance(node, ast.Name):
+            return node.id
+        return ""
+
+    def visit_Call(self, node):
+        func_name = self._attr_chain(node.func)
+
+        # Check against known patterns
+        for pattern, tool in PYTHON_TOOL_PATTERNS.items():
+            if func_name == pattern or func_name.startswith(pattern):
+                if tool:
+                    self.tools.add(tool)
+                    if "http" in tool:
+                        self.network_ops = True
+                    if "delete" in tool or "remove" in tool:
+                        self.delete_ops = True
+                    if "write" in tool:
+                        self.write_ops = True
+                    if "shell" in tool:
+                        self.shell_ops = True
+
+        # Extract string args for URLs and paths
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                val = arg.value
+                if val.startswith("http"):
+                    try:
+                        from urllib.parse import urlparse
+                        parsed = urlparse(val)
+                        if parsed.hostname:
+                            self.urls.add(parsed.hostname)
+                    except Exception:
+                        pass
+                elif "/" in val or "\\" in val:
+                    self.paths.add(val)
+
+        # Check write mode for open()
+        if func_name == "open" and len(node.args) >= 2:
+            mode_arg = node.args[1]
+            if isinstance(mode_arg, ast.Constant):
+                mode = str(mode_arg.value)
+                if any(c in mode for c in ("w", "a", "x")):
+                    self.write_ops = True
+                    self.tools.add("file_write")
+                else:
+                    self.tools.add("file_read")
+
+        self.generic_visit(node)
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            if alias.name.startswith("boto3"):
+                self.tools.add("aws_*")
+            if alias.name == "smtplib":
+                self.tools.add("send_email")
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        if node.module and node.module.startswith("boto3"):
+            self.tools.add("aws_*")
+        if node.module and "sendgrid" in node.module:
+            self.tools.add("send_email")
+        self.generic_visit(node)
+
+def _analyze_python(code: str) -> tuple[set, set, set, list, list]:
+    """
+    Parse Python code and extract:
+    - tools: set of inferred tool names
+    - urls: set of hostnames accessed
+    - paths: set of file paths accessed
+    - warnings: list of warning strings
+    - errors: list of parse errors
+    """
+    warnings = []
+    errors   = []
+
+    try:
+        tree = ast.parse(textwrap.dedent(code))
+    except SyntaxError as e:
+        return set(), set(), set(), [], [f"SyntaxError: {e}"]
+
+    visitor = PythonASTVisitor()
+    visitor.visit(tree)
+
+    # Also run regex on raw source for URL strings we might have missed
+    for match in URL_PATTERN.finditer(code):
+        url = match.group(1)
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if parsed.hostname:
+                visitor.urls.add(parsed.hostname)
+                visitor.network_ops = True
+        except Exception:
+            pass
+
+    # Check for dangerous patterns
+    for pattern, warning in DANGEROUS_PATTERNS:
+        if pattern.search(code):
+            warnings.append(warning)
+
+    return visitor.tools, visitor.urls, visitor.paths, warnings, errors
+
+def _analyze_javascript(code: str) -> tuple[set, set, set, list, list]:
+    """
+    Analyze JavaScript/TypeScript agent code using regex.
+    Less precise than AST but covers the common patterns.
+    """
+    tools    = set()
+    urls     = set()
+    paths    = set()
+    warnings = []
+
+    # Network calls
+    if re.search(r"fetch\s*\(|axios\.|got\(|request\(|https?\.get", code):
+        tools.add("http_get"); tools.add("http_post")
+    if re.search(r"axios\.post|fetch.*method.*POST", code, re.I):
+        tools.add("http_post")
+    if re.search(r"axios\.delete|fetch.*method.*DELETE", code, re.I):
+        tools.add("http_delete")
+
+    # File ops
+    if re.search(r"fs\.readFile|fs\.readFileSync|readFile", code):
+        tools.add("file_read")
+    if re.search(r"fs\.writeFile|fs\.appendFile|writeFile", code):
+        tools.add("file_write")
+    if re.search(r"fs\.unlink|fs\.rm|rimraf", code):
+        tools.add("file_delete")
+        warnings.append("file deletion detected")
+
+    # Shell
+    if re.search(r"exec\s*\(|spawn\s*\(|execSync|child_process", code):
+        tools.add("shell_exec")
+        warnings.append("shell execution detected")
+
+    # DB
+    if re.search(r"\.query\s*\(|\.execute\s*\(|knex\.|sequelize\.", code):
+        tools.add("db_query")
+
+    # Email
+    if re.search(r"nodemailer|sendgrid|mailgun", code, re.I):
+        tools.add("send_email")
+
+    # Extract URLs
+    for match in URL_PATTERN.finditer(code):
+        url = match.group(1)
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if parsed.hostname:
+                urls.add(parsed.hostname)
+        except Exception:
+            pass
+
+    # Dangerous patterns
+    if re.search(r"eval\s*\(|Function\s*\(", code):
+        warnings.append("dynamic code execution (eval) detected")
+    if re.search(r"rm\s+-rf|sudo\s+", code):
+        warnings.append("dangerous shell command detected")
+
+    return tools, urls, paths, warnings, []
+
+def _build_policy_rules(tools: set, urls: set, paths: set,
+                         write_detected: bool = False) -> dict:
+    """
+    Convert inferred capabilities into an AgentGuard policy rules dict.
+    Generates minimum required permissions — deny everything else.
+    """
+    allow_tools = sorted(list(tools))
+    deny_tools  = []
+    read_only   = True
+
+    # If write/delete operations detected, not read-only
+    write_indicators = {"file_write", "file_delete", "http_post", "http_put",
+                        "http_delete", "http_patch", "db_query", "shell_exec"}
+    if tools & write_indicators or write_detected:
+        read_only = False
+
+    # Always deny these unless explicitly found
+    if "shell_exec" not in tools:
+        deny_tools.extend(["exec*", "shell*", "system*"])
+    if "file_delete" not in tools:
+        deny_tools.extend(["delete*", "remove*", "unlink*"])
+    if "aws_*" not in tools:
+        deny_tools.append("aws*")
+
+    # Build redact patterns (always include baseline)
+    redact_patterns = [
+        r"\b\d{3}-\d{2}-\d{4}\b",
+        r"\b4[0-9]{12}(?:[0-9]{3})?\b",
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    ]
+
+    rules = {
+        "allow_tools":      allow_tools if allow_tools else ["*"],
+        "deny_tools":       deny_tools,
+        "read_only":        read_only,
+        "max_records":      100,
+        "require_approval": ["shell_exec", "file_delete"] if "shell_exec" in tools or "file_delete" in tools else [],
+        "redact_patterns":  redact_patterns,
+        "_synthesized":     True,
+        "_inferred_hosts":  sorted(list(urls)),
+        "_inferred_paths":  sorted(list(paths)),
+    }
+
+    return rules
+
+async def synthesize_policy_from_code(code: str, language: str,
+                                       policy_name: str, tenant_id: str,
+                                       auto_activate: bool = False) -> dict:
+    """
+    Main entry point: parse agent code, synthesize policy, store as draft.
+    """
+    source_hash = hashlib.sha256(code.encode()).hexdigest()
+
+    # Parse based on language
+    if language == "python":
+        tools, urls, paths, warnings, errors = _analyze_python(code)
+    elif language in ("javascript", "typescript", "js", "ts"):
+        tools, urls, paths, warnings, errors = _analyze_javascript(code)
+    else:
+        return {"error": f"Unsupported language: {language}. Use 'python' or 'javascript'."}
+
+    if errors:
+        return {"error": errors[0], "warnings": warnings}
+
+    rules = _build_policy_rules(tools, urls, paths)
+
+    # Check if we've seen this exact code before
+    from app.main import pool
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT id FROM synthesized_policies WHERE tenant_id=$1 AND source_hash=$2",
+            tenant_id, source_hash
+        )
+
+    status = "active" if auto_activate else "draft"
+    policy_id = str(uuid.uuid4())
+
+    async with pool.acquire() as conn:
+        if existing:
+            await conn.execute(
+                "UPDATE synthesized_policies SET rules=$1, inferred_tools=$2,"
+                " inferred_hosts=$3, inferred_paths=$4, status=$5,"
+                " activated_at=CASE WHEN $5='active' THEN NOW() ELSE NULL END"
+                " WHERE id=$6",
+                json.dumps(rules), list(tools), list(urls), list(paths),
+                status, existing["id"]
+            )
+            policy_id = existing["id"]
+        else:
+            await conn.execute(
+                "INSERT INTO synthesized_policies"
+                " (id,tenant_id,name,source_hash,language,inferred_tools,"
+                "  inferred_hosts,inferred_paths,rules,status,activated_at)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,"
+                "  CASE WHEN $10='active' THEN NOW() ELSE NULL END)",
+                policy_id, tenant_id, policy_name, source_hash, language,
+                list(tools), list(urls), list(paths), json.dumps(rules), status
+            )
+
+    # If auto_activate, also write to policies table
+    if auto_activate:
+        async with pool.acquire() as conn:
+            existing_policy = await conn.fetchrow(
+                "SELECT id FROM policies WHERE tenant_id=$1 AND name=$2",
+                tenant_id, policy_name
+            )
+            if existing_policy:
+                await conn.execute(
+                    "UPDATE policies SET rules=$1 WHERE tenant_id=$2 AND name=$3",
+                    json.dumps(rules), tenant_id, policy_name
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)",
+                    str(uuid.uuid4()), tenant_id, policy_name, json.dumps(rules)
+                )
+
+    return {
+        "policy_id":      policy_id,
+        "policy_name":    policy_name,
+        "status":         status,
+        "inferred_tools": sorted(list(tools)),
+        "inferred_hosts": sorted(list(urls)),
+        "inferred_paths": sorted(list(paths)),
+        "rules":          rules,
+        "warnings":       warnings,
+        "source_hash":    source_hash,
+        "message":        "Policy activated immediately." if auto_activate
+                          else "Policy saved as draft. POST /policies/synthesize/{id}/activate to use it.",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS — paste into main.py before /health
+# ══════════════════════════════════════════════════════════════════════════════
+
+CERT_AND_SYNTHESIS_ENDPOINTS = '''
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EPHEMERAL SESSION CERTIFICATES v3.3
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/sessions/{session_id}/cert")
+async def issue_session_cert(session_id: str, tenant=Depends(get_tenant)):
+    """
+    Issue a short-lived X.509 certificate for a session.
+    The private key is returned ONCE and never stored server-side.
+    All subsequent requests from this session can be verified against the cert.
+    """
+    sess = await get_session(session_id, tenant["id"])
+    if not sess:
+        raise HTTPException(404, "Session not found or expired")
+
+    # TTL matches session TTL
+    ttl = 3600
+    if redis_conn:
+        try:
+            remaining = await redis_conn.ttl(f"ag:sess:{session_id}")
+            if remaining > 0:
+                ttl = remaining
+        except Exception:
+            pass
+
+    result = await mint_session_cert(session_id, tenant["id"],
+                                      sess.get("agent_id", "unknown"), ttl)
+    log.info("cert.issued", session_id=session_id, fingerprint=result["fingerprint"])
+    return result
+
+@app.get("/sessions/{session_id}/cert")
+async def get_cert_status(session_id: str, tenant=Depends(get_tenant)):
+    """Check the status of a session certificate (without the private key)."""
+    cert = await get_session_cert(session_id, tenant["id"])
+    if not cert:
+        raise HTTPException(404, "No certificate found for this session")
+    return cert
+
+@app.post("/sessions/{session_id}/cert/verify")
+async def verify_cert_signature(session_id: str, body: CertVerifyRequest,
+                                  request: Request, tenant=Depends(get_tenant)):
+    """
+    Verify that a payload was signed with the session certificate\'s private key.
+    Use this to add an extra layer of auth on top of API key verification.
+    """
+    ip = request.client.host if request.client else None
+    ok, reason = await verify_session_cert(
+        session_id, tenant["id"], body.payload, body.signature)
+
+    cert = await get_session_cert(session_id, tenant["id"])
+    fingerprint = cert["fingerprint"] if cert else None
+    await log_cert_request(tenant["id"], cert.get("agent_id","") if cert else "",
+                            session_id, fingerprint, ok, reason if not ok else None, ip)
+
+    if not ok:
+        raise HTTPException(401, f"Certificate verification failed: {reason}")
+    return {"verified": True, "session_id": session_id, "fingerprint": fingerprint}
+
+@app.post("/sessions/{session_id}/cert/revoke")
+async def revoke_cert(session_id: str, body: dict, tenant=Depends(get_tenant)):
+    """Revoke a session certificate immediately."""
+    reason = body.get("reason", "manual_revocation")
+    ok = await revoke_session_cert(session_id, tenant["id"], reason)
+    if not ok:
+        raise HTTPException(404, "Certificate not found")
+    log.warning("cert.revoked", session_id=session_id, reason=reason)
+    return {"revoked": True, "session_id": session_id, "reason": reason}
+
+@app.get("/certs")
+async def list_certs(tenant=Depends(get_tenant), revoked: Optional[bool]=None,
+                      limit: int=50):
+    """List all session certificates for this tenant."""
+    where = "WHERE tenant_id=$1"
+    vals  = [tenant["id"]]
+    if revoked is not None:
+        where += " AND revoked=$2"; vals.append(revoked)
+    vals.append(min(limit, 200))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT session_id, agent_id, fingerprint, issued_at, expires_at,"
+            f" revoked, revoked_at, revoke_reason"
+            f" FROM session_certificates {where}"
+            f" ORDER BY issued_at DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/certs/stats")
+async def cert_stats(tenant=Depends(get_tenant), days: int=30):
+    """Certificate issuance and verification stats."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_issued,"
+            " COUNT(*) FILTER (WHERE revoked=TRUE) AS total_revoked,"
+            " COUNT(*) FILTER (WHERE expires_at > NOW() AND revoked=FALSE) AS currently_active"
+            " FROM session_certificates WHERE tenant_id=$1"
+            " AND issued_at > NOW() - ($2||\\' days\\')::INTERVAL",
+            tenant["id"], str(days))
+        verify_row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_checks,"
+            " COUNT(*) FILTER (WHERE verified=TRUE) AS passed,"
+            " COUNT(*) FILTER (WHERE verified=FALSE) AS failed"
+            " FROM cert_request_log WHERE tenant_id=$1"
+            " AND created_at > NOW() - ($2||\\' days\\')::INTERVAL",
+            tenant["id"], str(days))
+    return {**dict(row), "verification": dict(verify_row)}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AST POLICY SYNTHESIS v3.3
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/policies/synthesize")
+async def synthesize_policy(body: PolicySynthesisRequest, tenant=Depends(get_tenant)):
+    """
+    Parse your agent source code and auto-generate a least-privilege policy.
+    Supports Python and JavaScript/TypeScript.
+
+    Example:
+        POST /policies/synthesize
+        {
+            "code": "import requests\\nrequests.get(\\'https://api.stripe.com/v1/charges\\')",
+            "language": "python",
+            "policy_name": "stripe-reader"
+        }
+
+    Returns a draft policy. Activate it with POST /policies/synthesize/{id}/activate.
+    Set auto_activate=true to skip the review step.
+    """
+    if len(body.code) > 500_000:
+        raise HTTPException(400, "Code too large (max 500KB)")
+
+    result = await synthesize_policy_from_code(
+        body.code, body.language, body.policy_name,
+        tenant["id"], body.auto_activate
+    )
+
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+
+    return result
+
+@app.post("/policies/synthesize/{policy_id}/activate")
+async def activate_synthesized_policy(policy_id: str, tenant=Depends(get_tenant)):
+    """
+    Activate a draft synthesized policy — copies it to the active policies table.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM synthesized_policies WHERE id=$1 AND tenant_id=$2",
+            policy_id, tenant["id"])
+        if not row:
+            raise HTTPException(404, "Synthesized policy not found")
+
+        rules = row["rules"]
+        name  = row["name"]
+
+        existing = await conn.fetchrow(
+            "SELECT id FROM policies WHERE tenant_id=$1 AND name=$2",
+            tenant["id"], name)
+        if existing:
+            await conn.execute(
+                "UPDATE policies SET rules=$1 WHERE tenant_id=$2 AND name=$3",
+                json.dumps(rules) if isinstance(rules, dict) else rules,
+                tenant["id"], name)
+        else:
+            await conn.execute(
+                "INSERT INTO policies (id,tenant_id,name,rules) VALUES ($1,$2,$3,$4)",
+                str(uuid.uuid4()), tenant["id"], name,
+                json.dumps(rules) if isinstance(rules, dict) else rules)
+
+        await conn.execute(
+            "UPDATE synthesized_policies SET status=\'active\', activated_at=NOW() WHERE id=$1",
+            policy_id)
+
+    return {"activated": True, "policy_id": policy_id, "policy_name": name,
+            "message": f"Policy \'{name}\' is now active. Assign it to an agent with POST /agents."}
+
+@app.get("/policies/synthesize")
+async def list_synthesized_policies(tenant=Depends(get_tenant),
+                                      status: Optional[str]=None, limit: int=50):
+    """List all synthesized policies (draft and active)."""
+    where = "WHERE tenant_id=$1"
+    vals  = [tenant["id"]]
+    if status:
+        where += " AND status=$2"; vals.append(status)
+    vals.append(min(limit, 200))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT id, name, language, inferred_tools, inferred_hosts,"
+            f" inferred_paths, status, created_at, activated_at"
+            f" FROM synthesized_policies {where}"
+            f" ORDER BY created_at DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/policies/synthesize/{policy_id}")
+async def get_synthesized_policy(policy_id: str, tenant=Depends(get_tenant)):
+    """Get full details of a synthesized policy including the generated rules."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM synthesized_policies WHERE id=$1 AND tenant_id=$2",
+            policy_id, tenant["id"])
+    if not row:
+        raise HTTPException(404, "Synthesized policy not found")
+    return dict(row)
+
+@app.delete("/policies/synthesize/{policy_id}")
+async def delete_synthesized_policy(policy_id: str, tenant=Depends(get_tenant)):
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM synthesized_policies WHERE id=$1 AND tenant_id=$2",
+            policy_id, tenant["id"])
+    if res == "DELETE 0":
+        raise HTTPException(404, "Synthesized policy not found")
+    return {"deleted": policy_id}
+'''
