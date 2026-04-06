@@ -141,7 +141,47 @@ except ImportError:
         results: list = []; duration_ms: int = 0
 
     GUARDRAIL_TEMPLATES = {}
-    V38_MIGRATIONS = []
+    V38_MIGRATIONS = [
+        """CREATE TABLE IF NOT EXISTS tenant_guardrail_template (
+            tenant_id TEXT PRIMARY KEY,
+            template_id TEXT NOT NULL,
+            applied_at TIMESTAMPTZ DEFAULT NOW(),
+            applied_by TEXT,
+            overrides JSONB DEFAULT '{}'
+        )""",
+        """CREATE TABLE IF NOT EXISTS template_apply_log (
+            id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+            tenant_id TEXT NOT NULL,
+            template_id TEXT NOT NULL,
+            applied_at TIMESTAMPTZ DEFAULT NOW(),
+            settings_snapshot JSONB NOT NULL
+        )""",
+        """CREATE INDEX IF NOT EXISTS template_log_tenant_idx
+           ON template_apply_log(tenant_id, applied_at DESC)""",
+        """CREATE TABLE IF NOT EXISTS model_eval_runs (
+            id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+            tenant_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            template_id TEXT,
+            test_suite TEXT NOT NULL DEFAULT 'standard',
+            status TEXT NOT NULL DEFAULT 'pending',
+            total_tests INTEGER DEFAULT 0,
+            passed INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0,
+            safety_score NUMERIC(5,2),
+            accuracy_score NUMERIC(5,2),
+            compliance_score NUMERIC(5,2),
+            leakage_score NUMERIC(5,2),
+            overall_score NUMERIC(5,2),
+            results JSONB,
+            started_at TIMESTAMPTZ DEFAULT NOW(),
+            completed_at TIMESTAMPTZ,
+            duration_ms INTEGER
+        )""",
+        """CREATE INDEX IF NOT EXISTS eval_tenant_idx
+           ON model_eval_runs(tenant_id, started_at DESC)""",
+    ]
     async def apply_guardrail_template(*a, **kw):
         return {"error": "v3.8 not loaded in v3.py yet"}
     async def run_model_evaluation(*a, **kw):
