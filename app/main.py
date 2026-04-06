@@ -101,12 +101,52 @@ from app.v3 import (
     verify_audit_chain,
     generate_docker_compose, generate_env_file, generate_setup_script,
     generate_bare_metal_setup, generate_systemd_service,
-    # v3.8 — guardrail templates + model evaluation
-    V38_MIGRATIONS, GUARDRAIL_TEMPLATES,
-    TemplateApplyRequest, apply_guardrail_template,
-    EvalRunRequest, run_model_evaluation,
+    # v3.8 — loaded below with fallback
     _external_pools,
 )
+
+# ── v3.8 fallback class definitions (in case v3.py import fails) ──────────────
+try:
+    from app.v3 import (
+        V38_MIGRATIONS, GUARDRAIL_TEMPLATES,
+        GuardrailTemplate, TemplateApplyRequest, apply_guardrail_template,
+        ModelEvalRequest, ModelEvalResult, run_model_evaluation,
+    )
+except ImportError:
+    # Define inline so server starts even if v3.py not yet updated
+    from pydantic import BaseModel as _BM
+    from typing import Optional as _Opt
+
+    class GuardrailTemplate(_BM):
+        id: str; name: str; description: str
+        icon: str = ""; regulations: list = []; use_cases: list = []
+
+    class TemplateApplyRequest(_BM):
+        template_id: str; agent_id: _Opt[str] = None
+        overrides: dict = {}; dry_run: bool = False
+
+    class ModelEvalRequest(_BM):
+        model: str; template_id: _Opt[str] = "hipaa"
+        test_suite: str = "standard"
+        custom_tests: _Opt[list] = None
+        agent_id: _Opt[str] = None; max_tests: int = 20
+
+    class ModelEvalResult(_BM):
+        eval_id: str; model: str; provider: str
+        template_id: _Opt[str] = None; status: str = "error"
+        total_tests: int = 0; passed: int = 0; failed: int = 0
+        safety_score: float = 0; accuracy_score: float = 0
+        compliance_score: float = 0; leakage_score: float = 0
+        overall_score: float = 0; verdict: str = "ERROR"
+        results: list = []; duration_ms: int = 0
+
+    GUARDRAIL_TEMPLATES = {}
+    V38_MIGRATIONS = []
+    async def apply_guardrail_template(*a, **kw):
+        return {"error": "v3.8 not loaded in v3.py yet"}
+    async def run_model_evaluation(*a, **kw):
+        return ModelEvalResult(eval_id="", model="", provider="",
+                               verdict="ERROR", results=[])
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 structlog.configure(
