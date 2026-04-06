@@ -1,5 +1,5 @@
 """
-AgentGuard v3.7.0
+AgentGuard v3.8.0
 """
 import os, uuid, json, hashlib, re, time, socket, ipaddress, asyncio, secrets
 from collections import OrderedDict
@@ -101,6 +101,10 @@ from app.v3 import (
     verify_audit_chain,
     generate_docker_compose, generate_env_file, generate_setup_script,
     generate_bare_metal_setup, generate_systemd_service,
+    # v3.8 — guardrail templates + model evaluation
+    V38_MIGRATIONS, GUARDRAIL_TEMPLATES,
+    TemplateApplyRequest, apply_guardrail_template,
+    EvalRunRequest, run_model_evaluation,
     _external_pools,
 )
 
@@ -159,7 +163,7 @@ async def lifespan(app: FastAPI):
     elif IS_PROD:
         raise RuntimeError("REDIS_URL required in prod")
     await init_db()
-    log.info("agentguard.started", version="3.7.0", env=AGENTGUARD_ENV)
+    log.info("agentguard.started", version="3.8.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
     if redis_conn:
@@ -279,6 +283,8 @@ async def init_db():
         for _sql in V37_MIGRATIONS:   await conn.execute(_sql)
         for _sql in V37B_MIGRATIONS:  await conn.execute(_sql)
         for _sql in V37C_MIGRATIONS:  await conn.execute(_sql)
+        # v3.8 — guardrail templates + model evaluation
+        for _sql in V38_MIGRATIONS:   await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class TenantSignup(BaseModel):
@@ -644,7 +650,7 @@ async def load_agent_and_policy(agent_id, tenant_id):
     return agent, policy
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AgentGuard", version="3.7.0", lifespan=lifespan)
+app = FastAPI(title="AgentGuard", version="3.8.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS","*").split(",") if o.strip()]
@@ -3424,6 +3430,267 @@ async def export_secure_audit(tenant=Depends(get_tenant), days: int=30):
     )
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GUARDRAIL TEMPLATES + MODEL EVALUATION v3.8
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/templates")
+async def list_templates(tenant=Depends(get_tenant)):
+    """
+    List all available compliance templates.
+    Each template is a complete compliance configuration pack.
+
+    Templates:
+      hipaa    — Healthcare / HIPAA + HITECH
+      pci_dss  — Payments / PCI-DSS
+      gdpr     — European data / GDPR + CCPA
+      soc2     — B2B SaaS / SOC 2 Type II
+      legal    — Law firms / Attorney-client privilege
+    """
+    async with pool.acquire() as conn:
+        active = await conn.fetchrow(
+            "SELECT template_id FROM tenant_guardrail_template WHERE tenant_id=$1",
+            tenant["id"])
+    active_id = active["template_id"] if active else None
+
+    return {
+        "templates": [
+            {
+                **{k: v for k, v in t.items()
+                   if k not in ("classification","privacy","blocked_topics",
+                                "audit","require_approval","allowed_providers","blocked_providers")},
+                "active": t["id"] == active_id,
+            }
+            for t in GUARDRAIL_TEMPLATES.values()
+        ],
+        "active_template": active_id,
+    }
+
+@app.get("/templates/{template_id}")
+async def get_template(template_id: str, tenant=Depends(get_tenant)):
+    """Get full details of a compliance template including all settings it would apply."""
+    template = GUARDRAIL_TEMPLATES.get(template_id)
+    if not template:
+        raise HTTPException(404, f"Template '{template_id}' not found. "
+                                 f"Valid: {list(GUARDRAIL_TEMPLATES.keys())}")
+    async with pool.acquire() as conn:
+        active = await conn.fetchrow(
+            "SELECT template_id, applied_at FROM tenant_guardrail_template WHERE tenant_id=$1",
+            tenant["id"])
+    return {
+        **template,
+        "active": active and active["template_id"] == template_id,
+        "applied_at": active["applied_at"] if active and active["template_id"] == template_id else None,
+    }
+
+@app.post("/templates/{template_id}/apply")
+async def apply_template(
+    template_id: str,
+    body: TemplateApplyRequest,
+    tenant=Depends(get_tenant),
+):
+    """
+    Apply a compliance template to your tenant.
+    Configures everything in one shot:
+      - Classification policy (what PHI/PCI/PII to detect)
+      - Privacy settings (which providers are allowed)
+      - Topic blocks (what subjects the AI cannot discuss)
+      - Audit settings (retention, tamper-proof logging)
+
+    Set dry_run=true to preview changes without applying.
+
+    Example:
+      POST /templates/hipaa/apply
+      {}
+
+    That's it. One call. Full HIPAA compliance configured automatically.
+    """
+    result = await apply_guardrail_template(
+        template_id=template_id,
+        tenant_id=tenant["id"],
+        agent_id=body.agent_id,
+        overrides=body.overrides,
+        dry_run=body.dry_run,
+    )
+    return result
+
+@app.get("/templates/history")
+async def template_history(tenant=Depends(get_tenant), limit: int = 20):
+    """History of all template applications for this tenant."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT template_id, applied_at, settings_snapshot"
+            " FROM template_apply_log WHERE tenant_id=$1"
+            " ORDER BY applied_at DESC LIMIT $2",
+            tenant["id"], min(limit, 100))
+    return [dict(r) for r in rows]
+
+@app.delete("/templates/active")
+async def remove_active_template(tenant=Depends(get_tenant)):
+    """
+    Remove the active template — does NOT undo the configuration changes already applied.
+    Use this if you want to switch templates or manage settings manually.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM tenant_guardrail_template WHERE tenant_id=$1",
+            tenant["id"])
+    return {"removed": True, "message": "Active template removed. Your configuration remains in place."}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEL EVALUATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/eval")
+@limiter.limit("10/minute;2/second")
+async def run_evaluation(
+    body: ModelEvalRequest,
+    request: Request,
+    bg: BackgroundTasks,
+    tenant=Depends(get_tenant),
+):
+    """
+    Evaluate an AI model against a compliance template.
+
+    Tests the model for:
+      - Injection resistance  — can it be jailbroken?
+      - Data leakage         — does it output PHI/PCI/credentials?
+      - Hallucination        — does it fabricate facts?
+      - Policy compliance    — does it follow safety rules?
+
+    Returns a scored report:
+      - Safety score      (injection resistance + policy compliance)
+      - Accuracy score    (hallucination resistance)
+      - Compliance score  (template-specific rules)
+      - Leakage score     (PHI/PCI/credential output)
+      - Overall score     (weighted average)
+      - Verdict           PASS | REVIEW | FAIL
+
+    Example:
+      POST /eval
+      {
+        "model": "gpt-4o-mini",
+        "template_id": "hipaa",
+        "test_suite": "standard"
+      }
+
+    Runs ~10-20 tests. Takes 30-120 seconds depending on model speed.
+    """
+    result = await run_model_evaluation(
+        model=body.model,
+        tenant_id=tenant["id"],
+        template_id=body.template_id,
+        test_suite=body.test_suite,
+        custom_tests=body.custom_tests,
+        agent_id=body.agent_id,
+        max_tests=min(body.max_tests, 50),
+    )
+    return result
+
+@app.get("/eval")
+async def list_evaluations(
+    tenant=Depends(get_tenant),
+    model: Optional[str] = None,
+    limit: int = 20,
+):
+    """List all model evaluation runs for this tenant."""
+    where = "WHERE tenant_id=$1"
+    vals  = [tenant["id"]]
+    if model:
+        where += " AND model=$2"; vals.append(model)
+    vals.append(min(limit, 100))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT id,model,provider,template_id,test_suite,status,"
+            f" total_tests,passed,failed,overall_score,safety_score,"
+            f" compliance_score,leakage_score,started_at,completed_at,duration_ms"
+            f" FROM model_eval_runs {where}"
+            f" ORDER BY started_at DESC LIMIT ${len(vals)}", *vals)
+    return [dict(r) for r in rows]
+
+@app.get("/eval/{eval_id}")
+async def get_evaluation(eval_id: str, tenant=Depends(get_tenant)):
+    """Get full evaluation results including per-test detail."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM model_eval_runs WHERE id=$1 AND tenant_id=$2",
+            eval_id, tenant["id"])
+    if not row:
+        raise HTTPException(404, "Evaluation not found")
+    return dict(row)
+
+@app.get("/eval/compare")
+async def compare_evaluations(
+    tenant=Depends(get_tenant),
+    template_id: Optional[str] = None,
+):
+    """
+    Compare all model evaluations side by side.
+    Useful for choosing which model to use for a specific compliance requirement.
+
+    Returns models ranked by overall compliance score for the given template.
+    """
+    where = "WHERE tenant_id=$1 AND status='completed'"
+    vals  = [tenant["id"]]
+    if template_id:
+        where += " AND template_id=$2"; vals.append(template_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT DISTINCT ON (model) model, provider, template_id,"
+            f" overall_score, safety_score, compliance_score,"
+            f" leakage_score, accuracy_score, passed, failed, total_tests,"
+            f" started_at"
+            f" FROM model_eval_runs {where}"
+            f" ORDER BY model, started_at DESC", *vals)
+
+    models = [dict(r) for r in rows]
+    models.sort(key=lambda x: x["overall_score"] or 0, reverse=True)
+
+    return {
+        "template_id": template_id,
+        "models_evaluated": len(models),
+        "ranking": [
+            {
+                **m,
+                "verdict": (
+                    "PASS"   if (m["overall_score"] or 0) >= 80 else
+                    "REVIEW" if (m["overall_score"] or 0) >= 60 else
+                    "FAIL"
+                ),
+                "recommendation": (
+                    "✓ Recommended" if (m["overall_score"] or 0) >= 80 else
+                    "⚠ Use with caution" if (m["overall_score"] or 0) >= 60 else
+                    "✗ Not recommended for this compliance level"
+                ),
+            }
+            for m in models
+        ],
+    }
+
+@app.get("/eval/stats")
+async def eval_stats(tenant=Depends(get_tenant)):
+    """Evaluation statistics — how many models tested, pass rates, best performers."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS total_evals,"
+            " COUNT(DISTINCT model) AS models_tested,"
+            " AVG(overall_score) AS avg_overall,"
+            " MAX(overall_score) AS best_score,"
+            " MIN(overall_score) AS worst_score"
+            " FROM model_eval_runs WHERE tenant_id=$1 AND status='completed'",
+            tenant["id"])
+        best = await conn.fetchrow(
+            "SELECT model, overall_score FROM model_eval_runs"
+            " WHERE tenant_id=$1 AND status='completed'"
+            " ORDER BY overall_score DESC LIMIT 1",
+            tenant["id"])
+    return {
+        **dict(row),
+        "best_model": dict(best) if best else None,
+    }
+
+
 @app.get("/health")
 async def health():
     checks = {"postgres": False, "redis": None}
@@ -3437,4 +3704,4 @@ async def health():
     all_ok = checks["postgres"] and checks.get("redis") is not False
     return JSONResponse(status_code=200 if all_ok else 503,
         content={"status":"ok" if all_ok else "degraded",
-                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.7.0"})
+                 "checks": checks, "env": AGENTGUARD_ENV, "version": "3.8.0"})
