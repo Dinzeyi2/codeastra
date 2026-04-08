@@ -3908,6 +3908,153 @@ async def get_agent_policy_endpoint(agent_id: str, tenant=Depends(get_tenant)):
             tenant["id"], agent_id)
     return {"agent_id": agent_id, "policies": [dict(r) for r in rows]}
 
+# ── Agent Execution Endpoint Registration ─────────────────────────────────────
+@app.post("/agent/executor")
+async def register_execution_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Register your execution endpoint.
+
+    Codeastra will POST resolved (real) params to this URL when an agent
+    submits an action. Your system executes. Your data never leaves your
+    infrastructure.
+
+    Flow:
+      Agent submits: action_type="send_email", params={"to": "[CVT:EMAIL:A1B2]"}
+      Codeastra resolves: [CVT:EMAIL:A1B2] → john@hospital.org (internally)
+      Codeastra POSTs to your URL: {"action_type": "send_email", "params": {"to": "john@hospital.org"}}
+      Your system sends the email.
+      Agent never saw the email address.
+
+    Body:
+      execution_url:  str   — your endpoint URL (must be HTTPS in production)
+      action_type:    str   — specific action or "*" for all actions
+      agent_id:       str   — specific agent or null for all agents
+      description:    str   — optional label
+    """
+    url         = body.get("execution_url")
+    action_type = body.get("action_type", "*")
+    agent_id    = body.get("agent_id")
+    description = body.get("description", "")
+
+    if not url:
+        raise HTTPException(400, "execution_url required")
+    if not url.startswith("https://") and not url.startswith("http://localhost") and not url.startswith("http://127."):
+        raise HTTPException(400, "execution_url must be HTTPS (localhost allowed for development)")
+
+    endpoint_secret = secrets.token_hex(32)
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO agent_execution_endpoints
+              (tenant_id, agent_id, action_type, execution_url, secret, description)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT (tenant_id, agent_id, action_type)
+            DO UPDATE SET
+              execution_url=$4, secret=$5, description=$6,
+              enabled=TRUE, updated_at=NOW()
+        """, tenant["id"], agent_id, action_type, url, endpoint_secret, description)
+
+    return {
+        "registered":       True,
+        "execution_url":    url,
+        "action_type":      action_type,
+        "agent_id":         agent_id,
+        "secret":           endpoint_secret,
+        "message": (
+            "Codeastra will POST resolved params to your URL when agents execute actions. "
+            "Verify requests using X-Codeastra-Signature header (HMAC-SHA256). "
+            "Your system executes. Agents never see real values."
+        ),
+        "verification": {
+            "header":    "X-Codeastra-Signature",
+            "format":    "sha256=<hmac_hex>",
+            "algorithm": "HMAC-SHA256",
+            "key":       "your secret (shown once — store it now)",
+        }
+    }
+
+@app.get("/agent/executor")
+async def list_execution_endpoints(tenant=Depends(get_tenant)):
+    """List all registered execution endpoints for this tenant."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, agent_id, action_type, execution_url, description, enabled, created_at "
+            "FROM agent_execution_endpoints WHERE tenant_id=$1 ORDER BY created_at DESC",
+            tenant["id"])
+    return {"endpoints": [dict(r) for r in rows], "count": len(rows)}
+
+@app.delete("/agent/executor/{endpoint_id}")
+async def delete_execution_endpoint(endpoint_id: str, tenant=Depends(get_tenant)):
+    """Remove a registered execution endpoint."""
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM agent_execution_endpoints WHERE id=$1 AND tenant_id=$2",
+            endpoint_id, tenant["id"])
+    if res == "DELETE 0":
+        raise HTTPException(404, "Endpoint not found")
+    return {"deleted": endpoint_id}
+
+@app.post("/agent/executor/test")
+async def test_execution_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Test your registered execution endpoint with a sample payload.
+    Sends a test POST with fake resolved params so you can verify
+    your endpoint receives and handles it correctly.
+    """
+    import httpx as _httpx
+    import hmac as _hmac
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT execution_url, secret, action_type FROM agent_execution_endpoints "
+            "WHERE tenant_id=$1 AND enabled=TRUE LIMIT 1",
+            tenant["id"])
+
+    if not row:
+        raise HTTPException(404, "No execution endpoint registered. Use POST /agent/executor first.")
+
+    test_payload = json.dumps({
+        "action_type": row["action_type"] if row["action_type"] != "*" else "send_email",
+        "params": {
+            "to":      "test@example.com",
+            "subject": "Codeastra test — this is a test execution",
+            "body":    "If you see this, your execution endpoint is working correctly.",
+        },
+        "executed_at": datetime.now(timezone.utc).isoformat(),
+        "source":      "codeastra-test",
+        "test":        True,
+    })
+
+    sig = _hmac.new(row["secret"].encode(), test_payload.encode(), "sha256").hexdigest()
+
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                row["execution_url"],
+                content=test_payload,
+                headers={
+                    "Content-Type":           "application/json",
+                    "X-Codeastra-Signature":  f"sha256={sig}",
+                    "X-Codeastra-Source":     "blind-agent-execution",
+                    "X-Codeastra-Test":       "true",
+                }
+            )
+        return {
+            "success":       resp.is_success,
+            "http_code":     resp.status_code,
+            "execution_url": row["execution_url"],
+            "response":      resp.text[:500],
+            "message":       "Your endpoint is working." if resp.is_success else "Your endpoint returned an error — check your server logs.",
+        }
+    except Exception as e:
+        return {
+            "success":       False,
+            "error":         str(e),
+            "execution_url": row["execution_url"],
+            "message":       "Could not reach your endpoint. Make sure it is running and accessible.",
+        }
+
+
 @app.post("/agent/demo")
 async def agent_demo_endpoint(body: dict, tenant=Depends(get_tenant)):
     patient_data = body.get("patient_data", {
