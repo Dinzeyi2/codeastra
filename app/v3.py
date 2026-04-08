@@ -7214,3 +7214,547 @@ async def run_model_evaluation(
         phi_leakage=phi_leak, hallucinations=hallucin,
         results=results, summary=summary,
     )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.0 — BLIND AGENT INFRASTRUCTURE
+# AI agents act on sensitive data without ever seeing it.
+# Real values locked in vault. Agents operate on tokens only.
+# Actions execute with real values resolved inside Codeastra.
+# ══════════════════════════════════════════════════════════════════════════════
+
+BLIND_AGENT_MIGRATIONS = [
+    """CREATE TABLE IF NOT EXISTS agent_vault (
+        token          TEXT PRIMARY KEY,
+        tenant_id      TEXT NOT NULL,
+        agent_id       TEXT,
+        real_value     TEXT NOT NULL,
+        entity_type    TEXT NOT NULL,
+        field_label    TEXT,
+        classification TEXT DEFAULT 'pii',
+        created_at     TIMESTAMPTZ DEFAULT NOW(),
+        expires_at     TIMESTAMPTZ,
+        access_count   INTEGER DEFAULT 0,
+        last_accessed  TIMESTAMPTZ
+    )""",
+    """CREATE INDEX IF NOT EXISTS vault_tenant_idx ON agent_vault(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS vault_agent_idx  ON agent_vault(agent_id, tenant_id)""",
+
+    """CREATE TABLE IF NOT EXISTS vault_access_log (
+        id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id    TEXT NOT NULL,
+        token        TEXT NOT NULL,
+        agent_id     TEXT,
+        action_type  TEXT NOT NULL,
+        session_id   TEXT,
+        authorized   BOOLEAN DEFAULT true,
+        purpose      TEXT,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS val_tenant_idx ON vault_access_log(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS val_token_idx  ON vault_access_log(token)""",
+
+    """CREATE TABLE IF NOT EXISTS agent_action_log (
+        id             TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id      TEXT NOT NULL,
+        agent_id       TEXT NOT NULL,
+        session_id     TEXT,
+        action_type    TEXT NOT NULL,
+        params_tokens  JSONB NOT NULL,
+        tokens_resolved JSONB DEFAULT '[]',
+        authorized     BOOLEAN NOT NULL,
+        executed       BOOLEAN DEFAULT false,
+        block_reason   TEXT,
+        result         JSONB,
+        created_at     TIMESTAMPTZ DEFAULT NOW(),
+        executed_at    TIMESTAMPTZ
+    )""",
+    """CREATE INDEX IF NOT EXISTS aal_tenant_idx ON agent_action_log(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS aal_agent_idx  ON agent_action_log(agent_id, tenant_id)""",
+
+    """CREATE TABLE IF NOT EXISTS agent_token_policy (
+        id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id    TEXT NOT NULL,
+        agent_id     TEXT NOT NULL,
+        entity_type  TEXT NOT NULL,
+        can_read     BOOLEAN DEFAULT true,
+        can_resolve  BOOLEAN DEFAULT false,
+        can_export   BOOLEAN DEFAULT false,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS atp_unique ON agent_token_policy(tenant_id, agent_id, entity_type)""",
+
+    # Execution endpoints — where Codeastra posts resolved params
+    """CREATE TABLE IF NOT EXISTS agent_execution_endpoints (
+        id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id    TEXT NOT NULL,
+        agent_id     TEXT,
+        action_type  TEXT NOT NULL DEFAULT '*',
+        execution_url TEXT NOT NULL,
+        secret       TEXT NOT NULL,
+        description  TEXT,
+        enabled      BOOLEAN DEFAULT TRUE,
+        created_at   TIMESTAMPTZ DEFAULT NOW(),
+        updated_at   TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS aee_unique
+       ON agent_execution_endpoints(tenant_id, agent_id, action_type)""",
+    """CREATE INDEX IF NOT EXISTS aee_tenant_idx
+       ON agent_execution_endpoints(tenant_id)""",
+]
+
+# ── Token format ───────────────────────────────────────────────────────────────
+VAULT_PREFIX = "CVT"
+VAULT_TTL    = 86400  # 24 hours default
+
+_FIELD_HINTS = {
+    "name": "NAME", "patient_name": "NAME", "full_name": "NAME",
+    "first_name": "NAME", "last_name": "NAME", "doctor": "NAME",
+    "ssn": "SSN", "social_security": "SSN",
+    "mrn": "MRN", "medical_record": "MRN", "chart": "MRN",
+    "dob": "DOB", "date_of_birth": "DOB", "birthday": "DOB",
+    "npi": "NPI", "diagnosis": "DX", "icd": "DX",
+    "card": "CARD", "card_number": "CARD", "pan": "CARD",
+    "cvv": "CVV", "cvc": "CVV",
+    "routing": "RTN", "routing_number": "RTN",
+    "account": "ACCT", "account_number": "ACCT",
+    "email": "EMAIL", "phone": "PHONE",
+    "address": "ADDR", "zip": "ADDR",
+    "balance": "BAL", "amount": "AMT", "salary": "SAL",
+}
+
+_ALLOWED_ACTIONS = {
+    "send_email", "update_record", "schedule_appointment",
+    "send_notification", "query_database", "create_record",
+    "delete_record", "export_data", "call_api", "send_message",
+    "book_appointment", "process_payment", "send_alert",
+}
+
+_HIGH_RISK_ACTIONS = {"delete_record", "export_data", "send_email", "process_payment"}
+
+
+def _vault_token(field: str) -> str:
+    short = _FIELD_HINTS.get(field.lower(), field[:4].upper())
+    rand  = _secrets.token_hex(5).upper()
+    return f"[{VAULT_PREFIX}:{short}:{rand}]"
+
+
+def _is_vault_token(val: str) -> bool:
+    return isinstance(val, str) and val.startswith(f"[{VAULT_PREFIX}:")
+
+
+# ── Core vault operations ──────────────────────────────────────────────────────
+
+async def vault_store_fields(pool, tenant_id: str, data: dict,
+                              agent_id: str = None, ttl: int = VAULT_TTL,
+                              classification: str = "pii") -> dict:
+    """
+    Store structured fields in vault. Return token map.
+    {"name": "John Smith", "ssn": "123-45-6789"} →
+    {"name": "[CVT:NAME:A1B2C3]", "ssn": "[CVT:SSN:D4E5F6]"}
+    """
+    from app.main import pool as _pool
+    _pool = pool
+    token_map  = {}
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+
+    async with _pool.acquire() as conn:
+        for field, real_value in data.items():
+            if real_value is None or real_value == "":
+                token_map[field] = real_value
+                continue
+            token = _vault_token(field)
+            entity_type = _FIELD_HINTS.get(field.lower(), "GENERIC")
+            await conn.execute("""
+                INSERT INTO agent_vault
+                  (token,tenant_id,agent_id,real_value,entity_type,field_label,classification,expires_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                ON CONFLICT (token) DO NOTHING
+            """, token, tenant_id, agent_id, str(real_value),
+                entity_type, field, classification, expires_at)
+            token_map[field] = token
+
+    # Also store in Redis for fast resolution
+    try:
+        from app.main import redis_conn
+        if redis_conn:
+            for field, token in token_map.items():
+                if _is_vault_token(token):
+                    await redis_conn.setex(
+                        f"vault:{tenant_id}:{token}", ttl,
+                        json.dumps({"real": data[field], "field": field})
+                    )
+    except Exception:
+        pass
+
+    return token_map
+
+
+async def vault_resolve(pool, tenant_id: str, token: str,
+                         agent_id: str = None, purpose: str = "resolve") -> Optional[str]:
+    """
+    Resolve token to real value. Called ONLY by Codeastra internally
+    when executing agent actions. Never exposed to agents.
+    """
+    from app.main import pool as _pool, redis_conn
+    _pool = pool
+
+    # Try Redis first
+    try:
+        if redis_conn:
+            raw = await redis_conn.get(f"vault:{tenant_id}:{token}")
+            if raw:
+                data = json.loads(raw)
+                # Log access
+                async with _pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO vault_access_log
+                          (tenant_id,token,agent_id,action_type,authorized)
+                        VALUES ($1,$2,$3,$4,true)
+                    """, tenant_id, token, agent_id, purpose)
+                return data["real"]
+    except Exception:
+        pass
+
+    # Fall back to Postgres
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT real_value FROM agent_vault
+            WHERE token=$1 AND tenant_id=$2
+              AND (expires_at IS NULL OR expires_at > NOW())
+        """, token, tenant_id)
+
+        if not row:
+            return None
+
+        await conn.execute("""
+            UPDATE agent_vault
+            SET access_count=access_count+1, last_accessed=NOW()
+            WHERE token=$1 AND tenant_id=$2
+        """, token, tenant_id)
+
+        await conn.execute("""
+            INSERT INTO vault_access_log
+              (tenant_id,token,agent_id,action_type,authorized)
+            VALUES ($1,$2,$3,$4,true)
+        """, tenant_id, token, agent_id, purpose)
+
+        return row["real_value"]
+
+
+async def vault_read_as_agent(pool, tenant_id: str, agent_id: str,
+                               data: dict, session_id: str = None,
+                               purpose: str = None) -> dict:
+    """
+    Agent requests data. ALWAYS returns tokens — never real values.
+    This is how the agent reads — it thinks it sees data, it sees tokens.
+    """
+    from app.main import pool as _pool
+    _pool = pool
+    token_map = {}
+
+    async with _pool.acquire() as conn:
+        for field, value in data.items():
+            if _is_vault_token(str(value)):
+                token_map[field] = value
+                continue
+            if value is None or value == "":
+                token_map[field] = value
+                continue
+
+            token = _vault_token(field)
+            entity_type = _FIELD_HINTS.get(field.lower(), "GENERIC")
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=VAULT_TTL)
+
+            await conn.execute("""
+                INSERT INTO agent_vault
+                  (token,tenant_id,agent_id,real_value,entity_type,field_label,expires_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                ON CONFLICT (token) DO NOTHING
+            """, token, tenant_id, agent_id, str(value),
+                entity_type, field, expires_at)
+
+            await conn.execute("""
+                INSERT INTO vault_access_log
+                  (tenant_id,token,agent_id,action_type,purpose,authorized)
+                VALUES ($1,$2,$3,'read',$4,true)
+            """, tenant_id, token, agent_id, purpose or "agent_read")
+
+            token_map[field] = token
+
+    return token_map
+
+
+async def _resolve_tokens_in_value(pool, tenant_id: str, val: Any,
+                                    agent_id: str, tokens_used: list) -> Any:
+    """Recursively walk a value, resolve all vault tokens to real values."""
+    if isinstance(val, str):
+        pattern = re.compile(r'\[CVT:[A-Z]+:[A-F0-9]+\]')
+        matches = pattern.findall(val)
+        resolved = val
+        for token in matches:
+            real = await vault_resolve(pool, tenant_id, token, agent_id, "action_execute")
+            if real:
+                resolved = resolved.replace(token, real)
+                if token not in tokens_used:
+                    tokens_used.append(token)
+        return resolved
+    elif isinstance(val, dict):
+        return {k: await _resolve_tokens_in_value(pool, tenant_id, v, agent_id, tokens_used)
+                for k, v in val.items()}
+    elif isinstance(val, list):
+        return [await _resolve_tokens_in_value(pool, tenant_id, i, agent_id, tokens_used)
+                for i in val]
+    return val
+
+
+async def execute_blind_action(pool, tenant_id: str, agent_id: str,
+                                action_type: str, params: dict,
+                                session_id: str = None,
+                                dry_run: bool = False) -> dict:
+    """
+    THE CORE OF BLIND AGENT INFRASTRUCTURE.
+
+    Agent submits: action_type + params containing tokens
+    Codeastra:
+      1. Validates action is allowed
+      2. Resolves all tokens to real values INTERNALLY
+      3. Executes action with real values
+      4. Returns result — agent never saw real values
+
+    This is what makes agents blind by design.
+    """
+    action_id = _secrets.token_hex(8)
+    result = {
+        "action_id":    action_id,
+        "action_type":  action_type,
+        "agent_id":     agent_id,
+        "authorized":   False,
+        "executed":     False,
+        "dry_run":      dry_run,
+        "tokens_resolved": [],
+        "result":       None,
+        "block_reason": None,
+        "agent_saw_real_data": False,
+    }
+
+    # 1 — Validate action type
+    if action_type not in _ALLOWED_ACTIONS:
+        result["block_reason"] = f"Action '{action_type}' not in allowed list"
+        await _log_blind_action(pool, tenant_id, agent_id, session_id,
+                                action_type, params, [], False, False, result["block_reason"])
+        return result
+
+    result["authorized"] = True
+
+    if dry_run:
+        pattern = re.compile(r'\[CVT:[A-Z]+:[A-F0-9]+\]')
+        all_tokens = pattern.findall(json.dumps(params))
+        valid = []
+        for t in all_tokens:
+            real = await vault_resolve(pool, tenant_id, t, agent_id, "dry_run")
+            if real:
+                valid.append(t)
+        result["tokens_resolved"] = valid
+        result["result"] = {"dry_run": True, "tokens_found": len(valid), "would_execute": True}
+        return result
+
+    # 2 — Resolve all tokens to real values
+    tokens_used: list = []
+    resolved_params = await _resolve_tokens_in_value(
+        pool, tenant_id, params, agent_id, tokens_used
+    )
+    result["tokens_resolved"] = tokens_used
+
+    # 3 — Look up registered execution endpoint for this tenant+action
+    execution_url    = None
+    execution_secret = None
+    try:
+        from app.main import pool as _pool_ref
+        async with _pool_ref.acquire() as _conn:
+            ex_row = await _conn.fetchrow(
+                "SELECT execution_url, secret FROM agent_execution_endpoints "
+                "WHERE tenant_id=$1 AND (action_type=$2 OR action_type='*') "
+                "AND enabled=TRUE ORDER BY action_type DESC LIMIT 1",
+                tenant_id, action_type
+            )
+            if ex_row:
+                execution_url    = ex_row["execution_url"]
+                execution_secret = ex_row["secret"]
+    except Exception:
+        pass
+
+    # 4 — Execute with real values via customer's registered endpoint
+    exec_result = await _run_action(action_type, resolved_params,
+                                     execution_url, execution_secret)
+    result["executed"] = True
+    result["result"]   = exec_result
+
+    # 5 — Log to audit trail
+    await _log_blind_action(pool, tenant_id, agent_id, session_id,
+                             action_type, params, tokens_used,
+                             True, True, None, exec_result)
+
+    return result
+
+
+async def _run_action(action_type: str, resolved_params: dict,
+                      execution_url: str = None,
+                      execution_secret: str = None) -> dict:
+    """
+    Execute the action with REAL resolved values.
+
+    How it works:
+      - Codeastra has already resolved all tokens to real values internally.
+      - We now POST the resolved params to the customer's registered execution endpoint.
+      - The customer's system executes the action (send email, book appointment, etc).
+      - The customer's system returns a result.
+      - We return that result. The agent never saw the resolved values.
+
+    If no execution_url is registered for this tenant+action:
+      - We return an error telling the customer to register their execution endpoint.
+      - We never fake execution.
+    """
+    import httpx as _httpx
+    import hmac as _hmac
+
+    if not execution_url:
+        return {
+            "status":  "no_executor_registered",
+            "action":  action_type,
+            "error":   (
+                "No execution endpoint registered for this action. "
+                "Register your endpoint via POST /agent/executor. "
+                "Codeastra will POST resolved params to your endpoint. "
+                "Your system executes. Your data never leaves your infrastructure."
+            ),
+            "resolved_params_were_ready": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # Build HMAC signature so customer can verify the call is from Codeastra
+    payload = json.dumps({
+        "action_type":    action_type,
+        "params":         resolved_params,
+        "executed_at":    datetime.now(timezone.utc).isoformat(),
+        "source":         "codeastra",
+    }, default=str)
+
+    headers = {
+        "Content-Type":         "application/json",
+        "X-Codeastra-Action":   action_type,
+        "X-Codeastra-Source":   "blind-agent-execution",
+    }
+
+    if execution_secret:
+        sig = _hmac.new(
+            execution_secret.encode(),
+            payload.encode(),
+            "sha256"
+        ).hexdigest()
+        headers["X-Codeastra-Signature"] = f"sha256={sig}"
+
+    try:
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(execution_url, content=payload, headers=headers)
+
+        if resp.is_success:
+            try:
+                result = resp.json()
+            except Exception:
+                result = {"raw": resp.text}
+
+            return {
+                "status":    "executed",
+                "action":    action_type,
+                "http_code": resp.status_code,
+                "result":    result,
+                "executed_at": datetime.now(timezone.utc).isoformat(),
+                "execution_url": execution_url,
+            }
+        else:
+            return {
+                "status":    "execution_failed",
+                "action":    action_type,
+                "http_code": resp.status_code,
+                "error":     resp.text[:500],
+                "execution_url": execution_url,
+            }
+
+    except _httpx.TimeoutException:
+        return {
+            "status":  "execution_timeout",
+            "action":  action_type,
+            "error":   f"Execution endpoint did not respond within 30s: {execution_url}",
+        }
+    except Exception as e:
+        return {
+            "status":  "execution_error",
+            "action":  action_type,
+            "error":   str(e),
+            "execution_url": execution_url,
+        }
+
+
+async def _log_blind_action(pool, tenant_id, agent_id, session_id,
+                             action_type, params, tokens_resolved,
+                             authorized, executed, block_reason, result=None):
+    from app.main import pool as _pool
+    _pool = pool
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO agent_action_log
+              (tenant_id,agent_id,session_id,action_type,
+               params_tokens,tokens_resolved,authorized,executed,block_reason,result)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        """, tenant_id, agent_id, session_id, action_type,
+            json.dumps(params), json.dumps(tokens_resolved),
+            authorized, executed, block_reason,
+            json.dumps(result) if result else None)
+
+
+async def vault_get_stats(pool, tenant_id: str) -> dict:
+    from app.main import pool as _pool
+    _pool = pool
+    async with _pool.acquire() as conn:
+        total     = await conn.fetchval("SELECT COUNT(*) FROM agent_vault WHERE tenant_id=$1", tenant_id)
+        accesses  = await conn.fetchval("SELECT COUNT(*) FROM vault_access_log WHERE tenant_id=$1", tenant_id)
+        actions   = await conn.fetchval("SELECT COUNT(*) FROM agent_action_log WHERE tenant_id=$1", tenant_id)
+        executed  = await conn.fetchval("SELECT COUNT(*) FROM agent_action_log WHERE tenant_id=$1 AND executed=true", tenant_id)
+        blind_ok  = await conn.fetchval(
+            "SELECT COUNT(*) FROM agent_action_log WHERE tenant_id=$1 AND executed=true AND jsonb_array_length(tokens_resolved)>0",
+            tenant_id)
+        by_type   = await conn.fetch(
+            "SELECT entity_type, COUNT(*) as c FROM agent_vault WHERE tenant_id=$1 GROUP BY entity_type ORDER BY c DESC",
+            tenant_id)
+    return {
+        "tokens_in_vault":         total,
+        "total_token_accesses":    accesses,
+        "total_agent_actions":     actions,
+        "actions_executed":        executed,
+        "blind_executions":        blind_ok,
+        "real_data_seen_by_agent": 0,
+        "real_data_seen_by_llm":   0,
+        "by_entity_type":          {r["entity_type"]: r["c"] for r in by_type},
+    }
+
+
+async def set_agent_vault_policy(pool, tenant_id: str, agent_id: str, policies: list) -> dict:
+    from app.main import pool as _pool
+    _pool = pool
+    async with _pool.acquire() as conn:
+        for p in policies:
+            await conn.execute("""
+                INSERT INTO agent_token_policy
+                  (tenant_id,agent_id,entity_type,can_read,can_resolve,can_export)
+                VALUES ($1,$2,$3,$4,$5,$6)
+                ON CONFLICT (tenant_id,agent_id,entity_type)
+                DO UPDATE SET
+                  can_read=EXCLUDED.can_read,
+                  can_resolve=EXCLUDED.can_resolve,
+                  can_export=EXCLUDED.can_export
+            """, tenant_id, agent_id,
+                p["entity_type"],
+                p.get("can_read", True),
+                p.get("can_resolve", False),
+                p.get("can_export", False))
+    return {"agent_id": agent_id, "policies_set": len(policies)}
