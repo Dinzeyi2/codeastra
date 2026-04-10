@@ -3931,10 +3931,11 @@ async def register_execution_endpoint(body: dict, tenant=Depends(get_tenant)):
       agent_id:       str   — specific agent or null for all agents
       description:    str   — optional label
     """
-    url         = body.get("execution_url")
-    action_type = body.get("action_type", "*")
-    agent_id    = body.get("agent_id")
-    description = body.get("description", "")
+    url             = body.get("execution_url")
+    action_type     = body.get("action_type", "*")
+    agent_id        = body.get("agent_id")
+    description     = body.get("description", "")
+    allowed_actions = body.get("allowed_actions")  # list of allowed action names, None = all allowed
 
     if not url:
         raise HTTPException(400, "execution_url required")
@@ -3946,24 +3947,31 @@ async def register_execution_endpoint(body: dict, tenant=Depends(get_tenant)):
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO agent_execution_endpoints
-              (tenant_id, agent_id, action_type, execution_url, secret, description)
-            VALUES ($1,$2,$3,$4,$5,$6)
+              (tenant_id, agent_id, action_type, execution_url, secret, description, allowed_actions)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
             ON CONFLICT (tenant_id, agent_id, action_type)
             DO UPDATE SET
               execution_url=$4, secret=$5, description=$6,
-              enabled=TRUE, updated_at=NOW()
-        """, tenant["id"], agent_id, action_type, url, endpoint_secret, description)
+              allowed_actions=$7, enabled=TRUE, updated_at=NOW()
+        """, tenant["id"], agent_id, action_type, url, endpoint_secret,
+             description, allowed_actions)
 
     return {
         "registered":       True,
         "execution_url":    url,
         "action_type":      action_type,
         "agent_id":         agent_id,
+        "allowed_actions":  allowed_actions or "all actions allowed",
         "secret":           endpoint_secret,
         "message": (
             "Codeastra will POST resolved params to your URL when agents execute actions. "
             "Verify requests using X-Codeastra-Signature header (HMAC-SHA256). "
             "Your system executes. Agents never see real values."
+        ),
+        "how_authorization_works": (
+            "Actions are authorized if: (1) you have a registered executor for that action_type "
+            "or a wildcard '*' executor, AND (2) the action is in your allowed_actions list (if set). "
+            "No global whitelist. You control exactly what your agents can do."
         ),
         "verification": {
             "header":    "X-Codeastra-Signature",
