@@ -7285,17 +7285,27 @@ BLIND_AGENT_MIGRATIONS = [
 
     # Execution endpoints — where Codeastra posts resolved params
     """CREATE TABLE IF NOT EXISTS agent_execution_endpoints (
-        id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-        tenant_id    TEXT NOT NULL,
-        agent_id     TEXT,
-        action_type  TEXT NOT NULL DEFAULT '*',
-        execution_url TEXT NOT NULL,
-        secret       TEXT NOT NULL,
-        description  TEXT,
-        enabled      BOOLEAN DEFAULT TRUE,
-        created_at   TIMESTAMPTZ DEFAULT NOW(),
-        updated_at   TIMESTAMPTZ DEFAULT NOW()
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        agent_id        TEXT,
+        action_type     TEXT NOT NULL DEFAULT '*',
+        execution_url   TEXT NOT NULL,
+        secret          TEXT NOT NULL,
+        description     TEXT,
+        allowed_actions TEXT[],
+        enabled         BOOLEAN DEFAULT TRUE,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
     )""",
+    """DO $$ BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='agent_execution_endpoints'
+            AND column_name='allowed_actions'
+        ) THEN
+            ALTER TABLE agent_execution_endpoints ADD COLUMN allowed_actions TEXT[];
+        END IF;
+    END $$""",
     """CREATE UNIQUE INDEX IF NOT EXISTS aee_unique
        ON agent_execution_endpoints(tenant_id, agent_id, action_type)""",
     """CREATE INDEX IF NOT EXISTS aee_tenant_idx
@@ -7322,12 +7332,11 @@ _FIELD_HINTS = {
     "balance": "BAL", "amount": "AMT", "salary": "SAL",
 }
 
-_ALLOWED_ACTIONS = {
-    "send_email", "update_record", "schedule_appointment",
-    "send_notification", "query_database", "create_record",
-    "delete_record", "export_data", "call_api", "send_message",
-    "book_appointment", "process_payment", "send_alert",
-}
+# No global action whitelist.
+# Each tenant registers their own allowed actions via POST /agent/executor.
+# If a tenant has a registered executor for the action → allowed.
+# If no executor registered for that action → blocked.
+# This lets every customer define exactly what their agent can do.
 
 _HIGH_RISK_ACTIONS = {"delete_record", "export_data", "send_email", "process_payment"}
 
@@ -7537,9 +7546,48 @@ async def execute_blind_action(pool, tenant_id: str, agent_id: str,
         "agent_saw_real_data": False,
     }
 
-    # 1 — Validate action type
-    if action_type not in _ALLOWED_ACTIONS:
-        result["block_reason"] = f"Action '{action_type}' not in allowed list"
+    # 1 — Validate action type against tenant's registered executor
+    # No global whitelist — each tenant defines their own allowed actions
+    # by registering executors via POST /agent/executor
+    execution_url    = None
+    execution_secret = None
+    try:
+        from app.main import pool as _pool_ref
+        async with _pool_ref.acquire() as _conn:
+            # Check for action-specific executor first, then wildcard "*"
+            ex_row = await _conn.fetchrow(
+                "SELECT execution_url, secret, allowed_actions "
+                "FROM agent_execution_endpoints "
+                "WHERE tenant_id=$1 "
+                "AND (action_type=$2 OR action_type='*') "
+                "AND enabled=TRUE "
+                "ORDER BY action_type DESC LIMIT 1",
+                tenant_id, action_type
+            )
+            if ex_row:
+                execution_url    = ex_row["execution_url"]
+                execution_secret = ex_row["secret"]
+                # Check per-executor allowed_actions list if set
+                allowed_actions = ex_row.get("allowed_actions")
+                if allowed_actions and len(allowed_actions) > 0:
+                    if action_type not in allowed_actions:
+                        result["block_reason"] = (
+                            f"Action '{action_type}' not in your registered allowed_actions list. "
+                            f"Allowed: {list(allowed_actions)}"
+                        )
+                        await _log_blind_action(pool, tenant_id, agent_id, session_id,
+                                                action_type, params, [], False, False,
+                                                result["block_reason"])
+                        return result
+    except Exception as _ex:
+        pass
+
+    if not execution_url:
+        result["block_reason"] = (
+            f"No executor registered for action '{action_type}'. "
+            f"Register your endpoint via POST /agent/executor with action_type='{action_type}' or action_type='*'. "
+            f"This is how you authorize what your agents can do."
+        )
         await _log_blind_action(pool, tenant_id, agent_id, session_id,
                                 action_type, params, [], False, False, result["block_reason"])
         return result
@@ -7565,25 +7613,8 @@ async def execute_blind_action(pool, tenant_id: str, agent_id: str,
     )
     result["tokens_resolved"] = tokens_used
 
-    # 3 — Look up registered execution endpoint for this tenant+action
-    execution_url    = None
-    execution_secret = None
-    try:
-        from app.main import pool as _pool_ref
-        async with _pool_ref.acquire() as _conn:
-            ex_row = await _conn.fetchrow(
-                "SELECT execution_url, secret FROM agent_execution_endpoints "
-                "WHERE tenant_id=$1 AND (action_type=$2 OR action_type='*') "
-                "AND enabled=TRUE ORDER BY action_type DESC LIMIT 1",
-                tenant_id, action_type
-            )
-            if ex_row:
-                execution_url    = ex_row["execution_url"]
-                execution_secret = ex_row["secret"]
-    except Exception:
-        pass
-
-    # 4 — Execute with real values via customer's registered endpoint
+    # 3 — Execute with real values via customer's registered endpoint
+    # (execution_url and execution_secret already resolved above in step 1)
     exec_result = await _run_action(action_type, resolved_params,
                                      execution_url, execution_secret)
     result["executed"] = True
@@ -7758,3 +7789,4 @@ async def set_agent_vault_policy(pool, tenant_id: str, agent_id: str, policies: 
                 p.get("can_resolve", False),
                 p.get("can_export", False))
     return {"agent_id": agent_id, "policies_set": len(policies)}
+
