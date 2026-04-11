@@ -7778,3 +7778,433 @@ async def set_agent_vault_policy(pool, tenant_id: str, agent_id: str, policies: 
                 p.get("can_resolve", False),
                 p.get("can_export", False))
     return {"agent_id": agent_id, "policies_set": len(policies)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.1 — CROSS-AGENT TOKEN SHARING
+# Multi-agent pipeline infrastructure.
+# Agent A tokenizes data → passes tokens to Agent B → Agent B to Agent C.
+# Real data flows through entire pipeline. No agent ever sees it.
+#
+# How it works:
+#   1. Agent A mints tokens (vault_store_fields as normal)
+#   2. Agent A creates a pipeline grant: "Agent B can use these tokens for scheduling"
+#   3. Agent B receives tokens, uses them to execute actions
+#   4. Agent B can optionally delegate a subset to Agent C
+#   5. Every delegation logged. Every access audited. Full chain of custody.
+#
+# NEW DB TABLES: agent_pipeline_grants, pipeline_delegation_log
+# NEW ENDPOINTS:  POST /vault/grant        — grant token access to another agent
+#                 GET  /vault/grants        — list active grants
+#                 DELETE /vault/grants/{id} — revoke a grant
+#                 POST /vault/delegate      — agent delegates tokens downstream
+#                 GET  /pipeline/audit      — full chain of custody for a token
+# ══════════════════════════════════════════════════════════════════════════════
+
+PIPELINE_MIGRATIONS = [
+    # Grants: Agent A explicitly grants Agent B access to specific tokens
+    """CREATE TABLE IF NOT EXISTS agent_pipeline_grants (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        granting_agent  TEXT NOT NULL,   -- agent that owns the tokens
+        receiving_agent TEXT NOT NULL,   -- agent being granted access
+        tokens          TEXT[] NOT NULL, -- specific tokens granted
+        allowed_actions TEXT[] DEFAULT '{}', -- empty = all actions allowed
+        purpose         TEXT,            -- what Agent B is supposed to do
+        pipeline_id     TEXT,            -- optional: group grants into a pipeline
+        expires_at      TIMESTAMPTZ,     -- optional expiry
+        revoked         BOOLEAN DEFAULT FALSE,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS apg_tenant_idx
+       ON agent_pipeline_grants(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS apg_receiving_idx
+       ON agent_pipeline_grants(tenant_id, receiving_agent)""",
+    """CREATE INDEX IF NOT EXISTS apg_pipeline_idx
+       ON agent_pipeline_grants(pipeline_id)""",
+
+    # Full delegation log — chain of custody for every token
+    """CREATE TABLE IF NOT EXISTS pipeline_delegation_log (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        pipeline_id     TEXT,
+        token           TEXT NOT NULL,
+        from_agent      TEXT NOT NULL,
+        to_agent        TEXT NOT NULL,
+        action_type     TEXT,
+        grant_id        TEXT,
+        authorized      BOOLEAN NOT NULL,
+        deny_reason     TEXT,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS pdl_tenant_idx
+       ON pipeline_delegation_log(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS pdl_token_idx
+       ON pipeline_delegation_log(token)""",
+    """CREATE INDEX IF NOT EXISTS pdl_pipeline_idx
+       ON pipeline_delegation_log(pipeline_id)""",
+]
+
+
+async def grant_tokens_to_agent(
+    pool,
+    tenant_id:       str,
+    granting_agent:  str,
+    receiving_agent: str,
+    tokens:          list[str],
+    allowed_actions: list[str] = [],
+    purpose:         str = None,
+    pipeline_id:     str = None,
+    ttl_seconds:     int = VAULT_TTL,
+) -> dict:
+    """
+    Agent A grants specific tokens to Agent B.
+
+    This is the core of cross-agent token sharing.
+    Agent A says: "Agent B can use these tokens, only for these actions."
+    Agent B never sees real values — only the same tokens.
+    Codeastra enforces the grant at execution time.
+
+    Example:
+        # Agent A (intake) tokenizes patient, grants scheduling agent access
+        grant = await grant_tokens_to_agent(
+            pool, tenant_id,
+            granting_agent="intake-agent",
+            receiving_agent="scheduling-agent",
+            tokens=["[CVT:NAME:A1B2]", "[CVT:EMAIL:C3D4]", "[CVT:MRN:E5F6]"],
+            allowed_actions=["schedule_appointment", "send_email"],
+            purpose="Schedule follow-up appointment",
+            pipeline_id="pipeline_intake_2026_001",
+        )
+    """
+    grant_id   = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+
+    # Verify granting agent actually owns these tokens
+    async with pool.acquire() as conn:
+        for token in tokens:
+            row = await conn.fetchrow(
+                "SELECT token FROM agent_vault "
+                "WHERE token=$1 AND tenant_id=$2 "
+                "AND (agent_id=$3 OR agent_id IS NULL) "
+                "AND (expires_at IS NULL OR expires_at > NOW())",
+                token, tenant_id, granting_agent
+            )
+            if not row:
+                return {
+                    "granted": False,
+                    "error": f"Token {token} not found or not owned by {granting_agent}",
+                    "grant_id": None,
+                }
+
+        await conn.execute("""
+            INSERT INTO agent_pipeline_grants
+              (id, tenant_id, granting_agent, receiving_agent,
+               tokens, allowed_actions, purpose, pipeline_id, expires_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        """, grant_id, tenant_id, granting_agent, receiving_agent,
+            tokens, allowed_actions, purpose, pipeline_id, expires_at)
+
+    return {
+        "granted":        True,
+        "grant_id":       grant_id,
+        "granting_agent": granting_agent,
+        "receiving_agent": receiving_agent,
+        "tokens_granted": len(tokens),
+        "allowed_actions": allowed_actions or "all",
+        "pipeline_id":    pipeline_id,
+        "expires_at":     expires_at.isoformat(),
+        "message": (
+            f"{receiving_agent} can now use {len(tokens)} token(s) "
+            f"for: {', '.join(allowed_actions) if allowed_actions else 'any action'}. "
+            f"Real data never leaves the vault."
+        ),
+    }
+
+
+async def check_agent_grant(
+    pool,
+    tenant_id:      str,
+    requesting_agent: str,
+    token:          str,
+    action_type:    str = None,
+) -> tuple[bool, str, str]:
+    """
+    Check if an agent has been granted access to a token.
+    Returns (authorized, grant_id, reason).
+    Called internally before resolving tokens for cross-agent actions.
+    """
+    async with pool.acquire() as conn:
+        # Check: does the agent own the token directly?
+        owns = await conn.fetchrow(
+            "SELECT token FROM agent_vault "
+            "WHERE token=$1 AND tenant_id=$2 "
+            "AND (agent_id=$3 OR agent_id IS NULL) "
+            "AND (expires_at IS NULL OR expires_at > NOW())",
+            token, tenant_id, requesting_agent
+        )
+        if owns:
+            return True, "direct_owner", "Agent owns this token directly"
+
+        # Check: does the agent have a grant for this token?
+        grants = await conn.fetch(
+            "SELECT id, allowed_actions, expires_at FROM agent_pipeline_grants "
+            "WHERE tenant_id=$1 "
+            "AND receiving_agent=$2 "
+            "AND $3 = ANY(tokens) "
+            "AND revoked=FALSE "
+            "AND (expires_at IS NULL OR expires_at > NOW())",
+            tenant_id, requesting_agent, token
+        )
+
+        if not grants:
+            return False, None, (
+                f"Agent '{requesting_agent}' has no grant for token {token}. "
+                f"The owning agent must call POST /vault/grant first."
+            )
+
+        # Check action is allowed by the grant
+        for grant in grants:
+            allowed = grant["allowed_actions"]
+            if not allowed or len(allowed) == 0:
+                return True, grant["id"], "Grant allows all actions"
+            if action_type and action_type in allowed:
+                return True, grant["id"], f"Grant allows {action_type}"
+            if not action_type:
+                return True, grant["id"], "Grant found"
+
+        return False, None, (
+            f"Agent '{requesting_agent}' has a grant for this token "
+            f"but action '{action_type}' is not in the allowed_actions list."
+        )
+
+
+async def execute_pipeline_action(
+    pool,
+    tenant_id:      str,
+    agent_id:       str,
+    action_type:    str,
+    params:         dict,
+    pipeline_id:    str = None,
+    session_id:     str = None,
+    dry_run:        bool = False,
+) -> dict:
+    """
+    Execute an action in a multi-agent pipeline.
+    Same as execute_blind_action but checks cross-agent grants
+    before resolving tokens. An agent can only resolve tokens
+    it owns OR has been explicitly granted access to.
+
+    This is the function Agent B and Agent C call — not execute_blind_action.
+    """
+    action_id = _secrets.token_hex(8)
+    result = {
+        "action_id":       action_id,
+        "action_type":     action_type,
+        "agent_id":        agent_id,
+        "pipeline_id":     pipeline_id,
+        "authorized":      False,
+        "executed":        False,
+        "dry_run":         dry_run,
+        "tokens_resolved": [],
+        "grants_used":     [],
+        "result":          None,
+        "block_reason":    None,
+        "agent_saw_real_data": False,
+    }
+
+    # 1 — Check executor registration (same as execute_blind_action)
+    execution_url    = None
+    execution_secret = None
+    try:
+        async with pool.acquire() as _conn:
+            ex_row = await _conn.fetchrow(
+                "SELECT execution_url, secret, allowed_actions "
+                "FROM agent_execution_endpoints "
+                "WHERE tenant_id=$1 "
+                "AND (action_type=$2 OR action_type='*') "
+                "AND enabled=TRUE "
+                "ORDER BY action_type DESC LIMIT 1",
+                tenant_id, action_type
+            )
+            if ex_row:
+                execution_url    = ex_row["execution_url"]
+                execution_secret = ex_row["secret"]
+                allowed = ex_row.get("allowed_actions")
+                if allowed and action_type not in allowed:
+                    result["block_reason"] = f"Action '{action_type}' not in allowed_actions"
+                    return result
+    except Exception:
+        pass
+
+    if not execution_url:
+        result["block_reason"] = (
+            f"No executor registered for action '{action_type}'. "
+            f"Register via POST /agent/executor."
+        )
+        return result
+
+    result["authorized"] = True
+
+    if dry_run:
+        pattern = re.compile(r'\[CVT:[A-Z]+:[A-F0-9]+\]')
+        tokens  = pattern.findall(json.dumps(params))
+        valid   = []
+        for t in tokens:
+            auth, grant_id, _ = await check_agent_grant(pool, tenant_id, agent_id, t, action_type)
+            if auth:
+                valid.append(t)
+        result["tokens_resolved"] = valid
+        result["result"] = {"dry_run": True, "tokens_found": len(valid)}
+        return result
+
+    # 2 — Walk params, resolve tokens, checking grants for each
+    grants_used   = []
+    tokens_used   = []
+    denied_tokens = []
+    delegation_log_entries = []  # collect here, batch-insert after resolution
+
+    async def resolve_with_grant_check(val):
+        if isinstance(val, str):
+            pattern = re.compile(r'\[CVT:[A-Z]+:[A-F0-9]+\]')
+            matches = pattern.findall(val)
+            resolved = val
+            for token in matches:
+                auth, grant_id, reason = await check_agent_grant(
+                    pool, tenant_id, agent_id, token, action_type)
+
+                # Collect log entry — insert in batch after resolution (avoids nested acquire)
+                delegation_log_entries.append((
+                    tenant_id, pipeline_id, token,
+                    "vault", agent_id, action_type,
+                    grant_id, auth,
+                    None if auth else reason
+                ))
+
+                if not auth:
+                    denied_tokens.append({"token": token, "reason": reason})
+                    continue
+
+                real = await vault_resolve(pool, tenant_id, token, agent_id, action_type)
+                if real:
+                    resolved = resolved.replace(token, real)
+                    tokens_used.append(token)
+                    if grant_id and grant_id != "direct_owner":
+                        if grant_id not in grants_used:
+                            grants_used.append(grant_id)
+            return resolved
+        elif isinstance(val, dict):
+            return {k: await resolve_with_grant_check(v) for k, v in val.items()}
+        elif isinstance(val, list):
+            return [await resolve_with_grant_check(i) for i in val]
+        return val
+
+    resolved_params = await resolve_with_grant_check(params)
+
+    # Batch-insert delegation log entries (single connection, no nesting)
+    if delegation_log_entries:
+        async with pool.acquire() as conn:
+            await conn.executemany("""
+                INSERT INTO pipeline_delegation_log
+                  (tenant_id,pipeline_id,token,from_agent,to_agent,
+                   action_type,grant_id,authorized,deny_reason)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            """, delegation_log_entries)
+
+    # 3 — If any tokens were denied, block the action
+    if denied_tokens:
+        result["block_reason"] = (
+            f"Token access denied for {len(denied_tokens)} token(s). "
+            f"First denial: {denied_tokens[0]['reason']}. "
+            f"The owning agent must call POST /vault/grant first."
+        )
+        result["authorized"] = False
+        return result
+
+    result["tokens_resolved"] = tokens_used
+    result["grants_used"]     = grants_used
+
+    # 4 — Execute with real values
+    exec_result    = await _run_action(action_type, resolved_params,
+                                       execution_url, execution_secret)
+    result["executed"] = True
+    result["result"]   = exec_result
+
+    # 5 — Log
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO agent_action_log
+              (tenant_id,agent_id,session_id,action_type,
+               params_tokens,tokens_resolved,authorized,executed,result)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        """, tenant_id, agent_id, session_id, action_type,
+            json.dumps(params), json.dumps(tokens_used),
+            True, True, json.dumps(exec_result))
+
+    return result
+
+
+async def get_pipeline_audit(
+    pool,
+    tenant_id:   str,
+    token:       str = None,
+    pipeline_id: str = None,
+    limit:       int = 100,
+) -> list:
+    """
+    Full chain of custody for a token or pipeline.
+    Shows every agent that touched every token, in order.
+    This is the compliance proof for multi-agent workflows.
+    """
+    async with pool.acquire() as conn:
+        if token:
+            rows = await conn.fetch(
+                "SELECT * FROM pipeline_delegation_log "
+                "WHERE tenant_id=$1 AND token=$2 "
+                "ORDER BY created_at ASC LIMIT $3",
+                tenant_id, token, limit)
+        elif pipeline_id:
+            rows = await conn.fetch(
+                "SELECT * FROM pipeline_delegation_log "
+                "WHERE tenant_id=$1 AND pipeline_id=$2 "
+                "ORDER BY created_at ASC LIMIT $3",
+                tenant_id, pipeline_id, limit)
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM pipeline_delegation_log "
+                "WHERE tenant_id=$1 "
+                "ORDER BY created_at DESC LIMIT $2",
+                tenant_id, limit)
+    return [dict(r) for r in rows]
+
+
+async def revoke_grant(
+    pool,
+    tenant_id:     str,
+    grant_id:      str,
+    revoking_agent: str,
+) -> dict:
+    """Revoke a token grant. Receiving agent immediately loses access."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT granting_agent, receiving_agent, tokens "
+            "FROM agent_pipeline_grants "
+            "WHERE id=$1 AND tenant_id=$2",
+            grant_id, tenant_id
+        )
+        if not row:
+            return {"revoked": False, "error": "Grant not found"}
+        if row["granting_agent"] != revoking_agent:
+            return {"revoked": False, "error": "Only the granting agent can revoke"}
+
+        await conn.execute(
+            "UPDATE agent_pipeline_grants SET revoked=TRUE WHERE id=$1",
+            grant_id)
+
+    return {
+        "revoked":          True,
+        "grant_id":         grant_id,
+        "receiving_agent":  row["receiving_agent"],
+        "tokens_revoked":   len(row["tokens"]),
+        "message": f"{row['receiving_agent']} can no longer access these tokens.",
+    }
