@@ -146,7 +146,7 @@ except ImportError:
 
     class TemplateApplyRequest(_BM):
         template_id: str; agent_id: _Opt[str] = None
-        overrides: dict = {}; dry_run: bool = False
+        override_settings: dict = {}; dry_run: bool = False
 
     class ModelEvalRequest(_BM):
         model: str; template_id: _Opt[str] = "hipaa"
@@ -3614,7 +3614,7 @@ async def apply_template(
         template_id=template_id,
         tenant_id=tenant["id"],
         agent_id=body.agent_id,
-        overrides=body.overrides,
+        override_settings=body.override_settings,
         dry_run=body.dry_run,
     )
     return result
@@ -3681,15 +3681,19 @@ async def run_evaluation(
 
     Runs ~10-20 tests. Takes 30-120 seconds depending on model speed.
     """
-    result = await run_model_evaluation(
+    # run_model_evaluation in v3.py takes (run_request: EvalRunRequest, tenant_id: str)
+    from app.v3 import EvalRunRequest as _EvalRunReq, EvalTestCase as _EvalTestCase
+    test_cases = []
+    if body.custom_tests:
+        for t in body.custom_tests:
+            test_cases.append(_EvalTestCase(**t) if isinstance(t, dict) else t)
+    req = _EvalRunReq(
+        name=f"eval-{body.model}-{body.template_id or 'default'}",
         model=body.model,
-        tenant_id=tenant["id"],
-        template_id=body.template_id,
-        test_suite=body.test_suite,
-        custom_tests=body.custom_tests,
+        test_cases=test_cases,
         agent_id=body.agent_id,
-        max_tests=min(body.max_tests, 50),
     )
+    result = await run_model_evaluation(run_request=req, tenant_id=tenant["id"])
     return result
 
 @app.get("/eval")
@@ -3709,7 +3713,7 @@ async def list_evaluations(
             f"SELECT id,model,provider,template_id,test_suite,status,"
             f" total_tests,passed,failed,overall_score,safety_score,"
             f" compliance_score,leakage_score,started_at,completed_at,duration_ms"
-            f" FROM model_eval_runs {where}"
+            f" FROM eval_runs {where}"
             f" ORDER BY started_at DESC LIMIT ${len(vals)}", *vals)
     return [dict(r) for r in rows]
 
@@ -3718,7 +3722,7 @@ async def get_evaluation(eval_id: str, tenant=Depends(get_tenant)):
     """Get full evaluation results including per-test detail."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM model_eval_runs WHERE id=$1 AND tenant_id=$2",
+            "SELECT * FROM eval_runs WHERE id=$1 AND tenant_id=$2",
             eval_id, tenant["id"])
     if not row:
         raise HTTPException(404, "Evaluation not found")
@@ -3745,7 +3749,7 @@ async def compare_evaluations(
             f" overall_score, safety_score, compliance_score,"
             f" leakage_score, accuracy_score, passed, failed, total_tests,"
             f" started_at"
-            f" FROM model_eval_runs {where}"
+            f" FROM eval_runs {where}"
             f" ORDER BY model, started_at DESC", *vals)
 
     models = [dict(r) for r in rows]
@@ -3782,7 +3786,7 @@ async def eval_stats(tenant=Depends(get_tenant)):
             " AVG(overall_score) AS avg_overall,"
             " MAX(overall_score) AS best_score,"
             " MIN(overall_score) AS worst_score"
-            " FROM model_eval_runs WHERE tenant_id=$1 AND status='completed'",
+            " FROM eval_runs WHERE tenant_id=$1 AND status='completed'",
             tenant["id"])
         best = await conn.fetchrow(
             "SELECT model, overall_score FROM model_eval_runs"
