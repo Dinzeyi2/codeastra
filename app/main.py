@@ -126,6 +126,23 @@ except ImportError:
     async def vault_get_stats(pool, tid): return {}
     async def set_agent_vault_policy(pool, tid, aid, policies): return {}
 
+# ── v4.1 cross-agent pipeline ─────────────────────────────────────────────────
+try:
+    from app.v3 import (
+        PIPELINE_MIGRATIONS,
+        grant_tokens_to_agent,
+        check_agent_grant,
+        execute_pipeline_action,
+        get_pipeline_audit,
+        revoke_grant,
+    )
+except ImportError:
+    PIPELINE_MIGRATIONS = []
+    async def grant_tokens_to_agent(pool, tid, **kw): return {"error": "v4.1 not loaded"}
+    async def check_agent_grant(pool, tid, **kw): return False, None, "v4.1 not loaded"
+    async def execute_pipeline_action(pool, tid, **kw): return {"error": "v4.1 not loaded"}
+    async def get_pipeline_audit(pool, tid, **kw): return []
+    async def revoke_grant(pool, tid, **kw): return {"error": "v4.1 not loaded"}
 
 
 # ── v3.8 fallback class definitions (in case v3.py import fails) ──────────────
@@ -181,7 +198,7 @@ except ImportError:
         )""",
         """CREATE INDEX IF NOT EXISTS template_log_tenant_idx
            ON template_apply_log(tenant_id, applied_at DESC)""",
-        """CREATE TABLE IF NOT EXISTS model_eval_runs (
+        """CREATE TABLE IF NOT EXISTS eval_runs (
             id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
             tenant_id TEXT NOT NULL,
             model TEXT NOT NULL,
@@ -203,7 +220,7 @@ except ImportError:
             duration_ms INTEGER
         )""",
         """CREATE INDEX IF NOT EXISTS eval_tenant_idx
-           ON model_eval_runs(tenant_id, started_at DESC)""",
+           ON eval_runs(tenant_id, started_at DESC)""",
     ]
     async def apply_guardrail_template(*a, **kw):
         return {"error": "v3.8 not loaded in v3.py yet"}
@@ -389,6 +406,8 @@ async def init_db():
         # v3.8 — guardrail templates + model evaluation
         for _sql in V38_MIGRATIONS:   await conn.execute(_sql)
         for _sql in BLIND_AGENT_MIGRATIONS: await conn.execute(_sql)
+        # v4.1 — cross-agent pipeline grants + delegation log
+        for _sql in PIPELINE_MIGRATIONS:    await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class TenantSignup(BaseModel):
@@ -3789,7 +3808,7 @@ async def eval_stats(tenant=Depends(get_tenant)):
             " FROM eval_runs WHERE tenant_id=$1 AND status='completed'",
             tenant["id"])
         best = await conn.fetchrow(
-            "SELECT model, overall_score FROM model_eval_runs"
+            "SELECT model, overall_score FROM eval_runs"
             " WHERE tenant_id=$1 AND status='completed'"
             " ORDER BY overall_score DESC LIMIT 1",
             tenant["id"])
@@ -4120,4 +4139,118 @@ async def agent_demo_endpoint(body: dict, tenant=Depends(get_tenant)):
             "gdpr_compliant":               True,
             "pci_compliant":                True,
         }
+    }
+
+
+# ── v4.1 Cross-Agent Pipeline Endpoints ──────────────────────────────────────
+
+@app.post("/vault/grant")
+async def vault_grant_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Agent A grants specific tokens to Agent B.
+    Receiving agent gets the same tokens — never real values.
+    Codeastra enforces the grant at execution time.
+
+    Body: granting_agent, receiving_agent, tokens[], allowed_actions[], purpose, pipeline_id, ttl_seconds
+    """
+    return await grant_tokens_to_agent(
+        pool,
+        tenant_id       = tenant["id"],
+        granting_agent  = body.get("granting_agent"),
+        receiving_agent = body.get("receiving_agent"),
+        tokens          = body.get("tokens", []),
+        allowed_actions = body.get("allowed_actions", []),
+        purpose         = body.get("purpose"),
+        pipeline_id     = body.get("pipeline_id"),
+        ttl_seconds     = body.get("ttl_seconds", VAULT_TTL),
+    )
+
+
+@app.get("/vault/grants")
+async def vault_grants_endpoint(
+    agent_id:    str = None,
+    pipeline_id: str = None,
+    tenant=Depends(get_tenant)
+):
+    """List active grants. Filter by ?agent_id= or ?pipeline_id="""
+    async with pool.acquire() as conn:
+        if agent_id:
+            rows = await conn.fetch(
+                "SELECT * FROM agent_pipeline_grants "
+                "WHERE tenant_id=$1 AND (granting_agent=$2 OR receiving_agent=$2) "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "ORDER BY created_at DESC",
+                tenant["id"], agent_id
+            )
+        elif pipeline_id:
+            rows = await conn.fetch(
+                "SELECT * FROM agent_pipeline_grants "
+                "WHERE tenant_id=$1 AND pipeline_id=$2 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "ORDER BY created_at DESC",
+                tenant["id"], pipeline_id
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM agent_pipeline_grants "
+                "WHERE tenant_id=$1 AND revoked=FALSE "
+                "AND (expires_at IS NULL OR expires_at > NOW()) "
+                "ORDER BY created_at DESC LIMIT 100",
+                tenant["id"]
+            )
+    return {"grants": [dict(r) for r in rows], "count": len(rows)}
+
+
+@app.delete("/vault/grants/{grant_id}")
+async def vault_revoke_grant_endpoint(
+    grant_id:       str,
+    revoking_agent: str,
+    tenant=Depends(get_tenant)
+):
+    """Revoke a grant. The receiving agent immediately loses token access."""
+    return await revoke_grant(pool, tenant["id"], grant_id, revoking_agent)
+
+
+@app.post("/pipeline/action")
+async def pipeline_action_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Execute an action in a multi-agent pipeline.
+    Like /agent/action but checks cross-agent grants first.
+    Agent B and Agent C call this — not /agent/action.
+
+    Body: agent_id, action_type, params, pipeline_id, session_id, dry_run
+    """
+    return await execute_pipeline_action(
+        pool,
+        tenant_id   = tenant["id"],
+        agent_id    = body.get("agent_id"),
+        action_type = body.get("action_type"),
+        params      = body.get("params", {}),
+        pipeline_id = body.get("pipeline_id"),
+        session_id  = body.get("session_id"),
+        dry_run     = body.get("dry_run", False),
+    )
+
+
+@app.get("/pipeline/audit")
+async def pipeline_audit_endpoint(
+    token:       str = None,
+    pipeline_id: str = None,
+    limit:       int = 100,
+    tenant=Depends(get_tenant)
+):
+    """
+    Full chain of custody. Pass ?token= or ?pipeline_id=
+    Shows every agent that touched every token, in order.
+    This is your HIPAA/SOC2 compliance proof.
+    """
+    rows = await get_pipeline_audit(
+        pool, tenant["id"],
+        token=token, pipeline_id=pipeline_id, limit=limit
+    )
+    return {
+        "audit":   rows,
+        "count":   len(rows),
+        "filter":  {"token": token, "pipeline_id": pipeline_id},
+        "message": "Complete chain of custody. No agent saw real data.",
     }
