@@ -7361,12 +7361,10 @@ async def vault_store_fields(pool, tenant_id: str, data: dict,
     {"name": "John Smith", "ssn": "123-45-6789"} →
     {"name": "[CVT:NAME:A1B2C3]", "ssn": "[CVT:SSN:D4E5F6]"}
     """
-    from app.main import pool as _pool
-    _pool = pool
     token_map  = {}
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
 
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         for field, real_value in data.items():
             if real_value is None or real_value == "":
                 token_map[field] = real_value
@@ -7404,8 +7402,7 @@ async def vault_resolve(pool, tenant_id: str, token: str,
     Resolve token to real value. Called ONLY by Codeastra internally
     when executing agent actions. Never exposed to agents.
     """
-    from app.main import pool as _pool, redis_conn
-    _pool = pool
+    from app.main import redis_conn
 
     # Try Redis first
     try:
@@ -7414,7 +7411,7 @@ async def vault_resolve(pool, tenant_id: str, token: str,
             if raw:
                 data = json.loads(raw)
                 # Log access
-                async with _pool.acquire() as conn:
+                async with pool.acquire() as conn:
                     await conn.execute("""
                         INSERT INTO vault_access_log
                           (tenant_id,token,agent_id,action_type,authorized)
@@ -7425,7 +7422,7 @@ async def vault_resolve(pool, tenant_id: str, token: str,
         pass
 
     # Fall back to Postgres
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT real_value FROM agent_vault
             WHERE token=$1 AND tenant_id=$2
@@ -7457,11 +7454,9 @@ async def vault_read_as_agent(pool, tenant_id: str, agent_id: str,
     Agent requests data. ALWAYS returns tokens — never real values.
     This is how the agent reads — it thinks it sees data, it sees tokens.
     """
-    from app.main import pool as _pool
-    _pool = pool
     token_map = {}
 
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         for field, value in data.items():
             if _is_vault_token(str(value)):
                 token_map[field] = value
@@ -7729,9 +7724,7 @@ async def _run_action(action_type: str, resolved_params: dict,
 async def _log_blind_action(pool, tenant_id, agent_id, session_id,
                              action_type, params, tokens_resolved,
                              authorized, executed, block_reason, result=None):
-    from app.main import pool as _pool
-    _pool = pool
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO agent_action_log
               (tenant_id,agent_id,session_id,action_type,
@@ -7744,9 +7737,7 @@ async def _log_blind_action(pool, tenant_id, agent_id, session_id,
 
 
 async def vault_get_stats(pool, tenant_id: str) -> dict:
-    from app.main import pool as _pool
-    _pool = pool
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         total     = await conn.fetchval("SELECT COUNT(*) FROM agent_vault WHERE tenant_id=$1", tenant_id)
         accesses  = await conn.fetchval("SELECT COUNT(*) FROM vault_access_log WHERE tenant_id=$1", tenant_id)
         actions   = await conn.fetchval("SELECT COUNT(*) FROM agent_action_log WHERE tenant_id=$1", tenant_id)
@@ -7770,9 +7761,7 @@ async def vault_get_stats(pool, tenant_id: str) -> dict:
 
 
 async def set_agent_vault_policy(pool, tenant_id: str, agent_id: str, policies: list) -> dict:
-    from app.main import pool as _pool
-    _pool = pool
-    async with _pool.acquire() as conn:
+    async with pool.acquire() as conn:
         for p in policies:
             await conn.execute("""
                 INSERT INTO agent_token_policy
@@ -7789,4 +7778,3 @@ async def set_agent_vault_policy(pool, tenant_id: str, agent_id: str, policies: 
                 p.get("can_resolve", False),
                 p.get("can_export", False))
     return {"agent_id": agent_id, "policies_set": len(policies)}
-
