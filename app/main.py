@@ -175,6 +175,7 @@ try:
         resolve_content_sensitivity,
         _get_sensitivity_policy,
         _classify_field,
+        _FIELD_HINTS,
     )
 except ImportError:
     SENSITIVITY_POLICY_MIGRATIONS = []
