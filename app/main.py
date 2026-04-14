@@ -144,6 +144,28 @@ except ImportError:
     async def get_pipeline_audit(pool, tid, **kw): return []
     async def revoke_grant(pool, tid, **kw): return {"error": "v4.1 not loaded"}
 
+# ── v4.2 smart tokens ─────────────────────────────────────────────────────────
+try:
+    from app.v3 import (
+        SMART_TOKEN_MIGRATIONS,
+        mint_smart_token,
+        mint_smart_tokens_batch,
+        execute_smart_token,
+        get_smart_token_metadata,
+        revoke_smart_token,
+        get_smart_token_audit,
+        _SMART_DATA_TYPES,
+    )
+except ImportError:
+    SMART_TOKEN_MIGRATIONS = []
+    async def mint_smart_token(pool, tid, **kw): return {"error": "v4.2 not loaded"}
+    async def mint_smart_tokens_batch(pool, tid, **kw): return []
+    async def execute_smart_token(pool, tid, **kw): return {"error": "v4.2 not loaded"}
+    async def get_smart_token_metadata(pool, tid, **kw): return {}
+    async def revoke_smart_token(pool, tid, **kw): return {"error": "v4.2 not loaded"}
+    async def get_smart_token_audit(pool, tid, **kw): return []
+    _SMART_DATA_TYPES = {}
+
 
 # ── v3.8 fallback class definitions (in case v3.py import fails) ──────────────
 try:
@@ -408,6 +430,8 @@ async def init_db():
         for _sql in BLIND_AGENT_MIGRATIONS: await conn.execute(_sql)
         # v4.1 — cross-agent pipeline grants + delegation log
         for _sql in PIPELINE_MIGRATIONS:    await conn.execute(_sql)
+        # v4.2 — smart tokens with policy engine
+        for _sql in SMART_TOKEN_MIGRATIONS: await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class TenantSignup(BaseModel):
@@ -4253,4 +4277,233 @@ async def pipeline_audit_endpoint(
         "count":   len(rows),
         "filter":  {"token": token, "pipeline_id": pipeline_id},
         "message": "Complete chain of custody. No agent saw real data.",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.2 — SMART TOKEN ENDPOINTS
+# "The AI can act on the secret, without learning the secret."
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/vault/smart-token")
+async def smart_token_mint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Mint a smart token — policy-bound, semantically meaningful.
+
+    The agent receives the token metadata (what it is, where it can go).
+    The real value is vault-protected forever.
+
+    Body:
+        real_value:      str   — the actual sensitive value to protect
+        data_type:       str   — person_name | email | ssn | card_number | mrn | etc.
+        allowed_actions: list  — actions this token may be used for (empty = any)
+        allowed_targets: list  — URLs/endpoints that may receive real value (empty = any)
+        allowed_fields:  list  — form fields this token may fill (empty = any)
+        max_uses:        int   — how many times real value can be revealed (default 1)
+        ttl_seconds:     int   — token lifetime in seconds (default 86400)
+        semantic_label:  str   — human readable label override
+        agent_id:        str   — agent that will use this token
+        audit_reveal:    bool  — log every reveal (default true)
+
+    Example:
+        POST /vault/smart-token
+        {
+            "real_value":      "John Smith",
+            "data_type":       "patient_name",
+            "allowed_actions": ["fill_form", "send_email"],
+            "allowed_targets": ["https://hospital.com/intake"],
+            "allowed_fields":  ["first_name"],
+            "max_uses":        1,
+            "ttl_seconds":     30
+        }
+
+    Response (what agent sees — never real value):
+        {
+            "token_id":       "tok_PATI_a1b2c3d4e5",
+            "data_type":      "patient_name",
+            "semantic_label": "patient name",
+            "classification": "phi",
+            "policy": {
+                "allowed_actions": ["fill_form", "send_email"],
+                "allowed_fields":  ["first_name"],
+                "max_uses":        1,
+                "ttl_seconds":     30,
+                "reveal_mode":     "trusted_executor_only"
+            }
+        }
+    """
+    real_value = body.get("real_value")
+    data_type  = body.get("data_type")
+    if not real_value:
+        raise HTTPException(400, "real_value required")
+    if not data_type:
+        raise HTTPException(400, "data_type required")
+
+    return await mint_smart_token(
+        pool,
+        tenant_id       = tenant["id"],
+        real_value      = real_value,
+        data_type       = data_type,
+        agent_id        = body.get("agent_id"),
+        allowed_actions = body.get("allowed_actions", []),
+        allowed_targets = body.get("allowed_targets", []),
+        allowed_fields  = body.get("allowed_fields",  []),
+        max_uses        = int(body.get("max_uses",       1)),
+        ttl_seconds     = int(body.get("ttl_seconds", 86400)),
+        semantic_label  = body.get("semantic_label"),
+        audit_reveal    = body.get("audit_reveal", True),
+    )
+
+
+@app.post("/vault/smart-token/batch")
+async def smart_token_mint_batch(body: dict, tenant=Depends(get_tenant)):
+    """
+    Mint multiple smart tokens in one call.
+
+    Body:
+        agent_id: str  — optional agent for all tokens
+        tokens: [
+            {real_value, data_type, allowed_actions?, allowed_fields?,
+             allowed_targets?, max_uses?, ttl_seconds?},
+            ...
+        ]
+    """
+    tokens = body.get("tokens", [])
+    if not tokens:
+        raise HTTPException(400, "tokens array required")
+    if len(tokens) > 100:
+        raise HTTPException(400, "max 100 tokens per batch")
+
+    results = await mint_smart_tokens_batch(
+        pool,
+        tenant_id = tenant["id"],
+        tokens    = tokens,
+        agent_id  = body.get("agent_id"),
+    )
+    return {"tokens": results, "count": len(results)}
+
+
+@app.get("/vault/smart-token/{token_id}")
+async def smart_token_get(token_id: str, tenant=Depends(get_tenant)):
+    """
+    Inspect smart token metadata. Safe to call from agent — returns meaning only.
+    Never returns real value.
+    """
+    return await get_smart_token_metadata(pool, tenant["id"], token_id)
+
+
+@app.post("/vault/smart-token/execute")
+async def smart_token_execute(body: dict, tenant=Depends(get_tenant)):
+    """
+    Policy-gated JIT reveal. Called by trusted executor — NEVER by agent.
+
+    Runs all 5 policy gates:
+      1. Token not revoked
+      2. Token not expired
+      3. Uses remaining > 0
+      4. Action in allowed_actions
+      5. Target/field in allowed list
+
+    If all pass: returns real value, decrements uses, logs reveal.
+    If any fail: returns deny_reason, logs denial, never returns real value.
+    Token auto-revokes when uses_remaining hits 0.
+
+    Body:
+        token_id:    str — the smart token ID
+        action_type: str — action being performed
+        target_url:  str — URL receiving the real value
+        field_name:  str — form field being filled
+        agent_id:    str — agent requesting execution
+
+    Response on success:
+        {"authorized": true, "real_value": "John Smith", "uses_remaining": 0, "auto_revoked": true}
+
+    Response on failure:
+        {"authorized": false, "deny_reason": "Token expired", "real_value": null}
+    """
+    token_id = body.get("token_id")
+    if not token_id:
+        raise HTTPException(400, "token_id required")
+
+    return await execute_smart_token(
+        pool,
+        tenant_id   = tenant["id"],
+        token_id    = token_id,
+        action_type = body.get("action_type"),
+        target_url  = body.get("target_url"),
+        field_name  = body.get("field_name"),
+        agent_id    = body.get("agent_id"),
+    )
+
+
+@app.delete("/vault/smart-token/{token_id}")
+async def smart_token_revoke(
+    token_id: str,
+    reason:   str = "manual_revocation",
+    tenant=Depends(get_tenant)
+):
+    """Immediately revoke a smart token. No further reveals possible."""
+    return await revoke_smart_token(pool, tenant["id"], token_id, reason)
+
+
+@app.get("/vault/smart-token/{token_id}/audit")
+async def smart_token_audit(
+    token_id: str,
+    limit:    int = 100,
+    tenant=Depends(get_tenant)
+):
+    """Full reveal audit trail for a token. Every authorized and denied reveal."""
+    rows = await get_smart_token_audit(pool, tenant["id"], token_id=token_id, limit=limit)
+    return {"audit": rows, "count": len(rows), "token_id": token_id}
+
+
+@app.get("/vault/smart-tokens")
+async def smart_tokens_list(
+    agent_id: str = None,
+    status:   str = None,
+    limit:    int = 50,
+    tenant=Depends(get_tenant)
+):
+    """List smart tokens for this tenant. Filter by agent or status."""
+    async with pool.acquire() as conn:
+        where = ["tenant_id=$1"]
+        vals  = [tenant["id"]]
+        if agent_id:
+            vals.append(agent_id)
+            where.append(f"agent_id=${len(vals)}")
+        if status == "active":
+            where.append("revoked=FALSE AND uses_remaining > 0 AND (expires_at IS NULL OR expires_at > NOW())")
+        elif status == "revoked":
+            where.append("revoked=TRUE")
+        elif status == "expired":
+            where.append("expires_at < NOW()")
+        vals.append(limit)
+        rows = await conn.fetch(
+            f"SELECT token_id, data_type, semantic_label, classification, "
+            f"allowed_actions, allowed_fields, max_uses, uses_remaining, "
+            f"revoked, expires_at, created_at "
+            f"FROM smart_tokens WHERE {' AND '.join(where)} "
+            f"ORDER BY created_at DESC LIMIT ${len(vals)}",
+            *vals
+        )
+    return {
+        "tokens": [dict(r) for r in rows],
+        "count":  len(rows),
+        "note":   "real_value is vault-protected and never returned here",
+    }
+
+
+@app.get("/vault/smart-token-types")
+async def smart_token_types(tenant=Depends(get_tenant)):
+    """List all supported data types for smart tokens."""
+    return {
+        "types": [
+            {
+                "data_type":      dt,
+                "label":          meta["label"],
+                "classification": meta["classification"],
+            }
+            for dt, meta in _SMART_DATA_TYPES.items()
+        ],
+        "count": len(_SMART_DATA_TYPES),
     }
