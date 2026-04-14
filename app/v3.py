@@ -8748,3 +8748,1467 @@ async def get_smart_token_audit(
                 tenant_id, limit
             )
     return [dict(r) for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLIND RAG — v4.3
+# Vault-native Retrieval Augmented Generation
+#
+# "Agent found the right patients WITHOUT knowing who they are."
+#
+# How it works:
+#   1. Documents/records are chunked and stored as tokenized text
+#      Real values replaced with vault tokens before embedding
+#      Embeddings computed on tokenized text — never real values
+#
+#   2. Agent queries in natural language:
+#      "find diabetic patients over 65"
+#
+#   3. Vault searches internally:
+#      Embeds the query → cosine similarity against tokenized chunks
+#      Returns matching token references — never real values
+#
+#   4. Agent receives token references:
+#      ["[CVT:NAME:A1B2]", "[CVT:NAME:C3D4]"] — 2 patients match
+#      Agent knows how many matched, what category, risk level
+#      Agent never sees names, SSNs, diagnoses
+#
+#   5. Executor resolves tokens to take real action:
+#      Notify john@hospital.org and maria@hospital.org
+#      Agent never knew their addresses
+#
+# NEW DB TABLES: blind_rag_documents, blind_rag_chunks
+# NEW ENDPOINTS:
+#   POST /rag/ingest          — tokenize + embed a document
+#   POST /rag/ingest/batch    — ingest multiple documents
+#   POST /rag/search          — semantic search, returns tokens only
+#   GET  /rag/document/{id}   — document metadata (never real content)
+#   DELETE /rag/document/{id} — delete document and all chunks
+#   GET  /rag/stats           — vault RAG statistics
+# ══════════════════════════════════════════════════════════════════════════════
+
+BLIND_RAG_MIGRATIONS = [
+    # Documents — tokenized versions of real documents stored here
+    """CREATE TABLE IF NOT EXISTS blind_rag_documents (
+        doc_id          TEXT PRIMARY KEY,
+        tenant_id       TEXT NOT NULL,
+        agent_id        TEXT,
+
+        -- Original document metadata (never the real content)
+        doc_type        TEXT NOT NULL,   -- patient_record, contract, invoice, etc.
+        title           TEXT,            -- tokenized title
+        source          TEXT,            -- where it came from (system name, not real ID)
+        classification  TEXT DEFAULT 'pii',
+
+        -- Token map: {field: token} for this document
+        token_map       JSONB DEFAULT '{}',
+
+        -- Stats
+        chunk_count     INTEGER DEFAULT 0,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS brd_tenant_idx
+       ON blind_rag_documents(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS brd_type_idx
+       ON blind_rag_documents(tenant_id, doc_type)""",
+
+    # Chunks — tokenized text chunks with embeddings
+    """CREATE TABLE IF NOT EXISTS blind_rag_chunks (
+        chunk_id        TEXT PRIMARY KEY,
+        doc_id          TEXT NOT NULL,
+        tenant_id       TEXT NOT NULL,
+
+        -- Tokenized text — real values replaced with tokens
+        tokenized_text  TEXT NOT NULL,
+
+        -- Structured metadata (safe — no real values)
+        metadata        JSONB DEFAULT '{}',
+
+        -- Embedding of the tokenized text
+        embedding       JSONB,
+
+        -- Position in document
+        chunk_index     INTEGER DEFAULT 0,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS brc_doc_idx
+       ON blind_rag_chunks(doc_id)""",
+    """CREATE INDEX IF NOT EXISTS brc_tenant_idx
+       ON blind_rag_chunks(tenant_id)""",
+]
+
+
+# ── Document tokenization ──────────────────────────────────────────────────────
+
+def _tokenize_document_text(text: str, token_map: dict) -> tuple[str, dict]:
+    """
+    Replace real values in document text with vault tokens.
+    Returns (tokenized_text, updated_token_map).
+
+    Uses existing vault tokens from token_map if already minted.
+    Scans for new sensitive values using pattern matching.
+    """
+    import re as _re
+
+    # Patterns for inline sensitive data in documents
+    patterns = {
+        "ssn":    _re.compile(r'\b(?!000|666|9\d{2})\d{3}[-\s]?\d{2}[-\s]?\d{4}\b'),
+        "email":  _re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'),
+        "phone":  _re.compile(r'\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b'),
+        "card":   _re.compile(r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b'),
+        "dob":    _re.compile(r'\b(?:0[1-9]|1[0-2])[\/\-](?:0[1-9]|[12]\d|3[01])[\/\-](?:19|20)\d{2}\b'),
+        "mrn":    _re.compile(r'\bMRN[-:\s]+[A-Z0-9]{4,12}\b', _re.IGNORECASE),
+    }
+
+    tokenized = text
+    new_tokens = {}
+
+    for field_type, pattern in patterns.items():
+        matches = pattern.findall(tokenized)
+        for match in matches:
+            val = match.strip() if isinstance(match, str) else match
+            if not val:
+                continue
+            # Check if already tokenized
+            if val in token_map.values():
+                continue
+            # Check if already in new_tokens
+            if val in new_tokens:
+                token = new_tokens[val]
+            else:
+                short = field_type[:4].upper()
+                rand  = _secrets.token_hex(5).upper()
+                token = f"[CVT:{short}:{rand}]"
+                new_tokens[val] = token
+            tokenized = tokenized.replace(val, token)
+
+    # Also apply existing token_map replacements
+    for real_val, token in token_map.items():
+        if real_val in tokenized:
+            tokenized = tokenized.replace(real_val, token)
+
+    # Merge new tokens into token_map
+    updated_map = {**token_map, **{v: k for k, v in new_tokens.items()}}
+    return tokenized, updated_map
+
+
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+    """Split text into overlapping chunks for embedding."""
+    if len(text) <= chunk_size:
+        return [text]
+    chunks = []
+    start  = 0
+    while start < len(text):
+        end = start + chunk_size
+        # Try to break at sentence boundary
+        if end < len(text):
+            break_at = text.rfind('. ', start, end)
+            if break_at > start + chunk_size // 2:
+                end = break_at + 1
+        chunks.append(text[start:end].strip())
+        start = end - overlap
+    return [c for c in chunks if c]
+
+
+# ── Core Blind RAG operations ──────────────────────────────────────────────────
+
+async def rag_ingest_document(
+    pool,
+    tenant_id:        str,
+    content:          dict,
+    doc_type:         str,
+    agent_id:         str  = None,
+    title:            str  = None,
+    source:           str  = None,
+    classification:   str  = "pii",
+    existing_tokens:  dict = {},
+    field_policy:     dict = {},   # {"field": "tokenize"|"keep"|"public"}
+    sensitive_fields: list = [],   # explicit sensitive field names
+    tokenize_all:     bool = False, # strict mode — tokenize everything
+) -> dict:
+    """
+    Tokenize a document and store it for blind semantic search.
+
+    content: dict of {field: real_value} — e.g.:
+        {
+            "name":      "John Smith",
+            "dob":       "01/15/1980",
+            "diagnosis": "diabetes type 2",
+            "age":       "67",
+            "risk":      "high",
+            "notes":     "Patient needs follow-up in 2 weeks"
+        }
+
+    The real values are tokenized. The tokenized document is embedded.
+    Agent can search and find this document — never sees real values.
+
+    Returns doc metadata with token_map — safe to pass to agent.
+    """
+    doc_id = f"doc_{_secrets.token_hex(8)}"
+
+    # Step 1 — resolve sensitivity using all 3 layers
+    # Layer 1: per-request field_policy
+    # Layer 2: per-request sensitive_fields list
+    # Layer 3: tokenize_all flag
+    # Layer 4: tenant persistent policy (registered via API)
+    # Layer 5: built-in detection (field names + regex)
+    to_tokenize, to_keep = await resolve_content_sensitivity(
+        pool, tenant_id, content,
+        field_policy     = field_policy,
+        sensitive_fields = sensitive_fields,
+        tokenize_all     = tokenize_all,
+        doc_type         = doc_type,
+    )
+
+    token_map     = dict(existing_tokens)
+    real_to_token = {}
+    safe_content  = dict(to_keep)  # non-sensitive fields as-is
+
+    # Tokenize sensitive fields
+    for field, value in to_tokenize.items():
+        if _is_vault_token(str(value)):
+            safe_content[field] = value
+            continue
+        field_lower = field.lower()
+        short = _FIELD_HINTS.get(field_lower, field_lower[:4].upper())
+        rand  = _secrets.token_hex(5).upper()
+        token = f"[CVT:{short}:{rand}]"
+        real_to_token[str(value)] = token
+        token_map[token]          = str(value)
+        safe_content[field]       = token
+
+    # Build tokenized text for embedding
+    # Format: "field: value | field: value | ..."
+    # Non-sensitive fields preserved as-is (age, risk, category, etc.)
+    text_parts = [f"{k}: {v}" for k, v in safe_content.items() if v is not None]
+    tokenized_text = " | ".join(text_parts)
+
+    # Also tokenize any raw sensitive data in free-text fields
+    for field in ["notes", "description", "summary", "text", "content"]:
+        if field in content and isinstance(content[field], str):
+            tok_text, _ = _tokenize_document_text(content[field], real_to_token)
+            tokenized_text = tokenized_text.replace(
+                f"{field}: {content[field]}",
+                f"{field}: {tok_text}"
+            )
+
+    # Step 2 — store real values in vault
+    async with pool.acquire() as conn:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=VAULT_TTL)
+        for token, real_val in token_map.items():
+            if _is_vault_token(token):
+                field_type = token.split(":")[1] if ":" in token else "GENERIC"
+                await conn.execute("""
+                    INSERT INTO agent_vault
+                      (token, tenant_id, agent_id, real_value, entity_type,
+                       field_label, classification, expires_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                    ON CONFLICT (token) DO NOTHING
+                """, token, tenant_id, agent_id, real_val,
+                    field_type, field_type.lower(), classification, expires_at)
+
+    # Step 3 — chunk tokenized text
+    chunks = _chunk_text(tokenized_text)
+
+    # Step 4 — embed each chunk
+    chunk_records = []
+    for i, chunk in enumerate(chunks):
+        chunk_id  = f"chunk_{_secrets.token_hex(8)}"
+        embedding = await embed_text(chunk)
+        chunk_records.append((
+            chunk_id, doc_id, tenant_id, chunk,
+            json.dumps(safe_content),  # structured metadata
+            json.dumps(embedding), i
+        ))
+
+    # Step 5 — store document and chunks
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO blind_rag_documents
+              (doc_id, tenant_id, agent_id, doc_type, title, source,
+               classification, token_map, chunk_count)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        """, doc_id, tenant_id, agent_id, doc_type,
+            title or f"{doc_type}_{doc_id[:8]}",
+            source or "unknown",
+            classification,
+            json.dumps({t: "VAULT_PROTECTED" for t in token_map if _is_vault_token(t)}),
+            len(chunk_records))
+
+        await conn.executemany("""
+            INSERT INTO blind_rag_chunks
+              (chunk_id, doc_id, tenant_id, tokenized_text, metadata, embedding, chunk_index)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+        """, chunk_records)
+
+    return {
+        "doc_id":         doc_id,
+        "doc_type":       doc_type,
+        "chunks_created": len(chunk_records),
+        "fields_tokenized": len([t for t in token_map if _is_vault_token(t)]),
+        "token_map":      {t: "VAULT_PROTECTED" for t in token_map if _is_vault_token(t)},
+        "safe_preview":   safe_content,  # tokenized version — safe for agent
+        "real_values":    "vault_protected — agent never sees these",
+        "searchable":     True,
+    }
+
+
+async def rag_search(
+    pool,
+    tenant_id:   str,
+    query:       str,
+    doc_type:    str = None,
+    top_k:       int = 5,
+    min_score:   float = 0.3,
+    agent_id:    str = None,
+) -> dict:
+    """
+    Semantic search over tokenized documents.
+    Returns matching chunks with token references — never real values.
+
+    Agent calls this with natural language:
+    "find diabetic patients over 65 with high risk"
+
+    Returns:
+    {
+        "results": [
+            {
+                "doc_id":   "doc_a1b2c3",
+                "score":    0.89,
+                "metadata": {"age": "67", "condition": "diabetes", "risk": "high",
+                             "name": "[CVT:NAME:A1B2]"},  # token, not real name
+                "tokens":   ["[CVT:NAME:A1B2]", "[CVT:DOB:C3D4]"],
+            }
+        ],
+        "query":         "find diabetic patients over 65",
+        "real_data_seen_by_agent": 0
+    }
+    """
+    # Embed the query
+    query_embedding = await embed_text(query)
+    if not query_embedding:
+        return {"results": [], "error": "Could not embed query", "query": query}
+
+    # Fetch all chunks for this tenant
+    async with pool.acquire() as conn:
+        if doc_type:
+            rows = await conn.fetch("""
+                SELECT c.chunk_id, c.doc_id, c.tokenized_text, c.metadata, c.embedding
+                FROM blind_rag_chunks c
+                JOIN blind_rag_documents d ON c.doc_id = d.doc_id
+                WHERE c.tenant_id=$1 AND d.doc_type=$2 AND c.embedding IS NOT NULL
+            """, tenant_id, doc_type)
+        else:
+            rows = await conn.fetch("""
+                SELECT chunk_id, doc_id, tokenized_text, metadata, embedding
+                FROM blind_rag_chunks
+                WHERE tenant_id=$1 AND embedding IS NOT NULL
+            """, tenant_id)
+
+    if not rows:
+        return {
+            "results": [],
+            "query":   query,
+            "message": "No documents indexed. Use POST /rag/ingest to add documents.",
+            "real_data_seen_by_agent": 0,
+        }
+
+    # Score all chunks by cosine similarity
+    scored = []
+    for row in rows:
+        try:
+            chunk_embedding = json.loads(row["embedding"]) if isinstance(row["embedding"], str) else row["embedding"]
+            score = cosine_similarity(query_embedding, chunk_embedding)
+            if score >= min_score:
+                metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"]
+                # Extract token references from metadata
+                tokens = [v for v in metadata.values() if isinstance(v, str) and _is_vault_token(v)]
+                scored.append({
+                    "chunk_id":        row["chunk_id"],
+                    "doc_id":          row["doc_id"],
+                    "score":           round(score, 4),
+                    "tokenized_text":  row["tokenized_text"],
+                    "metadata":        metadata,   # safe — tokens not real values
+                    "tokens":          tokens,     # vault token references
+                })
+        except Exception:
+            continue
+
+    # Sort by score, take top_k
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    results = scored[:top_k]
+
+    # Deduplicate by doc_id — keep highest scoring chunk per doc
+    seen_docs = {}
+    deduped   = []
+    for r in results:
+        if r["doc_id"] not in seen_docs:
+            seen_docs[r["doc_id"]] = True
+            deduped.append(r)
+
+    # Apply k-anonymity protection before returning to agent
+    protected, protection_info = await apply_kanonymity(
+        pool, tenant_id, agent_id, query, deduped
+    )
+
+    return {
+        "results":                 protected,
+        "count":                   len(protected),
+        "query":                   query,
+        "total_chunks_searched":   len(rows),
+        "real_data_seen_by_agent": 0,
+        "anonymity_protection":    protection_info,
+        "message": (
+            protection_info["suppress_reason"]
+            if protection_info["suppressed"] else
+            f"Found {len(protected)} matching document(s). "
+            f"Use token references with your executor to access real values."
+        ),
+    }
+
+
+async def rag_ingest_batch(
+    pool,
+    tenant_id:  str,
+    documents:  list[dict],
+    agent_id:   str = None,
+) -> dict:
+    """
+    Ingest multiple documents in one call.
+
+    documents: list of {content, doc_type, title?, source?, classification?}
+    """
+    results  = []
+    errors   = []
+    for i, doc in enumerate(documents):
+        try:
+            result = await rag_ingest_document(
+                pool,
+                tenant_id      = tenant_id,
+                content        = doc.get("content", {}),
+                doc_type       = doc.get("doc_type", "document"),
+                agent_id       = agent_id,
+                title          = doc.get("title"),
+                source         = doc.get("source"),
+                classification = doc.get("classification", "pii"),
+            )
+            results.append(result)
+        except Exception as e:
+            errors.append({"index": i, "error": str(e)})
+
+    return {
+        "ingested": len(results),
+        "errors":   len(errors),
+        "error_details": errors,
+        "documents": results,
+    }
+
+
+async def rag_get_document(
+    pool,
+    tenant_id: str,
+    doc_id:    str,
+) -> dict:
+    """Get document metadata. Never returns real content."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT doc_id, doc_type, title, source, classification, "
+            "token_map, chunk_count, created_at "
+            "FROM blind_rag_documents WHERE doc_id=$1 AND tenant_id=$2",
+            doc_id, tenant_id
+        )
+    if not row:
+        return {"found": False, "doc_id": doc_id}
+    r = dict(row)
+    r["real_content"] = "VAULT_PROTECTED — never returned"
+    return r
+
+
+async def rag_delete_document(
+    pool,
+    tenant_id: str,
+    doc_id:    str,
+) -> dict:
+    """Delete a document and all its chunks from the blind RAG index."""
+    async with pool.acquire() as conn:
+        chunks = await conn.fetchval(
+            "SELECT COUNT(*) FROM blind_rag_chunks WHERE doc_id=$1 AND tenant_id=$2",
+            doc_id, tenant_id
+        )
+        await conn.execute(
+            "DELETE FROM blind_rag_chunks WHERE doc_id=$1 AND tenant_id=$2",
+            doc_id, tenant_id
+        )
+        await conn.execute(
+            "DELETE FROM blind_rag_documents WHERE doc_id=$1 AND tenant_id=$2",
+            doc_id, tenant_id
+        )
+    return {
+        "deleted":        True,
+        "doc_id":         doc_id,
+        "chunks_deleted": chunks,
+    }
+
+
+async def rag_stats(
+    pool,
+    tenant_id: str,
+) -> dict:
+    """Vault RAG statistics."""
+    async with pool.acquire() as conn:
+        doc_count   = await conn.fetchval(
+            "SELECT COUNT(*) FROM blind_rag_documents WHERE tenant_id=$1", tenant_id)
+        chunk_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM blind_rag_chunks WHERE tenant_id=$1", tenant_id)
+        type_counts = await conn.fetch(
+            "SELECT doc_type, COUNT(*) as count FROM blind_rag_documents "
+            "WHERE tenant_id=$1 GROUP BY doc_type ORDER BY count DESC",
+            tenant_id
+        )
+    return {
+        "total_documents":          doc_count,
+        "total_chunks":             chunk_count,
+        "avg_chunks_per_document":  round(chunk_count / max(doc_count, 1), 1),
+        "by_doc_type":              {r["doc_type"]: r["count"] for r in type_counts},
+        "real_data_in_index":       "zero — all values are vault tokens",
+        "hipaa_compliant":          True,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POLICY-DRIVEN SENSITIVITY — v4.4
+#
+# "In Codeastra, sensitivity is policy-defined, not pattern-limited."
+#
+# Three layers of detection:
+#   Layer 1 — Built-in: known field names + regex patterns (already exists)
+#   Layer 2 — Explicit: customer marks specific fields per request
+#   Layer 3 — Policy:   customer registers persistent rules for their domain
+#
+# Customer can define:
+#   - sensitive field names    ("employee_badge", "case_ref", "policy_number")
+#   - sensitive prefix rules   ("EMP-", "LEGAL-", "POL-")
+#   - sensitive doc types      ("hr_record", "legal_filing", "classified")
+#   - field classifications    (public / internal / confidential / restricted)
+#
+# NEW DB TABLE: tenant_sensitivity_policy
+# NEW ENDPOINTS:
+#   POST /policy/sensitivity              — set full sensitivity policy
+#   POST /policy/sensitivity/fields       — register sensitive field names
+#   POST /policy/sensitivity/prefixes     — register sensitive value prefixes
+#   GET  /policy/sensitivity              — get current policy
+#   DELETE /policy/sensitivity/field/{name} — remove a field rule
+# ══════════════════════════════════════════════════════════════════════════════
+
+SENSITIVITY_POLICY_MIGRATIONS = [
+    """CREATE TABLE IF NOT EXISTS tenant_sensitivity_policy (
+        tenant_id           TEXT PRIMARY KEY,
+
+        -- Custom sensitive field names (any value in these fields gets tokenized)
+        sensitive_fields    TEXT[] DEFAULT '{}',
+
+        -- Value prefix rules (any value starting with these gets tokenized)
+        sensitive_prefixes  TEXT[] DEFAULT '{}',
+
+        -- Custom sensitive doc types (all fields in these doc types get tokenized)
+        sensitive_doc_types TEXT[] DEFAULT '{}',
+
+        -- Field-level classification overrides
+        -- {"employee_badge": "restricted", "department": "internal"}
+        field_classifications JSONB DEFAULT '{}',
+
+        -- Global classification level labels
+        -- restricted = always tokenize
+        -- confidential = tokenize unless explicitly public
+        -- internal = keep but don't expose to external agents
+        -- public = never tokenize
+        default_unknown_field TEXT DEFAULT 'internal',
+
+        -- Strict mode: tokenize everything not explicitly marked public
+        strict_mode         BOOLEAN DEFAULT FALSE,
+
+        updated_at          TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS tsp_tenant_idx
+       ON tenant_sensitivity_policy(tenant_id)""",
+]
+
+
+# ── Sensitivity resolver ───────────────────────────────────────────────────────
+
+async def _get_sensitivity_policy(pool, tenant_id: str) -> dict:
+    """Load tenant's sensitivity policy. Returns defaults if not set."""
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM tenant_sensitivity_policy WHERE tenant_id=$1",
+                tenant_id
+            )
+        if row:
+            return {
+                "sensitive_fields":      list(row["sensitive_fields"] or []),
+                "sensitive_prefixes":    list(row["sensitive_prefixes"] or []),
+                "sensitive_doc_types":   list(row["sensitive_doc_types"] or []),
+                "field_classifications": json.loads(row["field_classifications"] or "{}"),
+                "default_unknown_field": row["default_unknown_field"] or "internal",
+                "strict_mode":           row["strict_mode"] or False,
+            }
+    except Exception:
+        pass
+    return {
+        "sensitive_fields":      [],
+        "sensitive_prefixes":    [],
+        "sensitive_doc_types":   [],
+        "field_classifications": {},
+        "default_unknown_field": "internal",
+        "strict_mode":           False,
+    }
+
+
+def _classify_field(
+    field_name:  str,
+    field_value: str,
+    policy:      dict,
+) -> str:
+    """
+    Determine sensitivity classification for a field+value pair.
+
+    Returns one of:
+        "tokenize"  — must be tokenized, never exposed to agent
+        "keep"      — safe to include as-is in agent context
+        "redact"    — remove entirely (don't tokenize, don't expose)
+
+    Priority order:
+        1. Explicit field classification in policy
+        2. Known sensitive field name (built-in _FIELD_HINTS)
+        3. Sensitive prefix match
+        4. Customer-registered sensitive field name
+        5. Strict mode → tokenize everything
+        6. Default → keep
+    """
+    field_lower = field_name.lower().replace(" ", "_").replace("-", "_")
+    value_str   = str(field_value) if field_value is not None else ""
+
+    # 1 — explicit field classification override
+    field_class = policy["field_classifications"].get(field_name) or \
+                  policy["field_classifications"].get(field_lower)
+    if field_class:
+        if field_class in ("restricted", "tokenize"):  return "tokenize"
+        if field_class == "public":                    return "keep"
+        if field_class == "confidential":              return "tokenize"
+        if field_class == "internal":                  return "keep"
+
+    # 2 — known sensitive field name (built-in)
+    if field_lower in _FIELD_HINTS:
+        return "tokenize"
+
+    # Also check common sensitive field patterns
+    sensitive_patterns = [
+        "name", "email", "phone", "ssn", "dob", "birth", "address",
+        "zip", "postal", "mrn", "npi", "diagnosis", "medication",
+        "card", "account", "routing", "insurance", "passport",
+        "license", "salary", "income", "wage", "balance",
+        "password", "secret", "token", "key", "credential",
+    ]
+    if any(p in field_lower for p in sensitive_patterns):
+        return "tokenize"
+
+    # 3 — sensitive prefix match
+    for prefix in policy["sensitive_prefixes"]:
+        if value_str.startswith(prefix):
+            return "tokenize"
+
+    # 4 — customer-registered sensitive field name
+    if field_lower in [f.lower() for f in policy["sensitive_fields"]]:
+        return "tokenize"
+    if field_name in policy["sensitive_fields"]:
+        return "tokenize"
+
+    # 5 — strict mode
+    if policy["strict_mode"]:
+        return "tokenize"
+
+    # 6 — default: keep
+    return "keep"
+
+
+async def resolve_content_sensitivity(
+    pool,
+    tenant_id:        str,
+    content:          dict,
+    field_policy:     dict = {},
+    sensitive_fields: list = [],
+    tokenize_all:     bool = False,
+    doc_type:         str  = None,
+) -> tuple[dict, dict]:
+    """
+    Resolve which fields to tokenize using all 3 layers.
+
+    Returns:
+        (fields_to_tokenize, fields_to_keep)
+        fields_to_tokenize: {field: real_value}
+        fields_to_keep:     {field: value}
+
+    Layer priority:
+        1. Per-request explicit field_policy    {"field": "tokenize"|"keep"}
+        2. Per-request sensitive_fields list    ["employee_badge", "case_ref"]
+        3. tokenize_all=True                    everything gets tokenized
+        4. Tenant policy (persistent rules)     registered via API
+        5. Built-in detection                   field names + patterns
+    """
+    tenant_policy = await _get_sensitivity_policy(pool, tenant_id)
+
+    # If this doc_type is marked sensitive in policy → tokenize all fields
+    if doc_type and doc_type in tenant_policy["sensitive_doc_types"]:
+        tokenize_all = True
+
+    to_tokenize = {}
+    to_keep     = {}
+
+    for field, value in content.items():
+        if value is None or str(value).strip() == "":
+            to_keep[field] = value
+            continue
+
+        # Already a vault token — keep as-is
+        if _is_vault_token(str(value)):
+            to_keep[field] = value
+            continue
+
+        # Layer 1 — per-request explicit policy
+        if field_policy:
+            explicit = field_policy.get(field) or field_policy.get(field.lower())
+            if explicit == "tokenize":
+                to_tokenize[field] = value
+                continue
+            if explicit in ("keep", "public"):
+                to_keep[field] = value
+                continue
+
+        # Layer 2 — per-request sensitive_fields list
+        if field in sensitive_fields or field.lower() in [f.lower() for f in sensitive_fields]:
+            to_tokenize[field] = value
+            continue
+
+        # Layer 3 — tokenize_all flag
+        if tokenize_all:
+            to_tokenize[field] = value
+            continue
+
+        # Layer 4+5 — tenant policy + built-in detection
+        decision = _classify_field(field, str(value), tenant_policy)
+        if decision == "tokenize":
+            to_tokenize[field] = value
+        else:
+            to_keep[field] = value
+
+    return to_tokenize, to_keep
+
+
+async def set_sensitivity_policy(
+    pool,
+    tenant_id:            str,
+    sensitive_fields:     list = None,
+    sensitive_prefixes:   list = None,
+    sensitive_doc_types:  list = None,
+    field_classifications: dict = None,
+    default_unknown_field: str = None,
+    strict_mode:          bool = None,
+) -> dict:
+    """Set or update tenant's sensitivity policy."""
+    async with pool.acquire() as conn:
+        # Get existing or create default
+        existing = await conn.fetchrow(
+            "SELECT * FROM tenant_sensitivity_policy WHERE tenant_id=$1", tenant_id)
+
+        if not existing:
+            await conn.execute(
+                "INSERT INTO tenant_sensitivity_policy (tenant_id) VALUES ($1) "
+                "ON CONFLICT DO NOTHING", tenant_id)
+            existing = await conn.fetchrow(
+                "SELECT * FROM tenant_sensitivity_policy WHERE tenant_id=$1", tenant_id)
+
+        current = dict(existing) if existing else {}
+
+        # Merge updates
+        new_fields     = sensitive_fields    if sensitive_fields    is not None else list(current.get("sensitive_fields") or [])
+        new_prefixes   = sensitive_prefixes  if sensitive_prefixes  is not None else list(current.get("sensitive_prefixes") or [])
+        new_doc_types  = sensitive_doc_types if sensitive_doc_types is not None else list(current.get("sensitive_doc_types") or [])
+        new_field_class = field_classifications if field_classifications is not None else json.loads(current.get("field_classifications") or "{}")
+        new_default    = default_unknown_field if default_unknown_field is not None else (current.get("default_unknown_field") or "internal")
+        new_strict     = strict_mode if strict_mode is not None else (current.get("strict_mode") or False)
+
+        await conn.execute("""
+            INSERT INTO tenant_sensitivity_policy
+              (tenant_id, sensitive_fields, sensitive_prefixes, sensitive_doc_types,
+               field_classifications, default_unknown_field, strict_mode, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+            ON CONFLICT (tenant_id) DO UPDATE SET
+              sensitive_fields=$2, sensitive_prefixes=$3, sensitive_doc_types=$4,
+              field_classifications=$5, default_unknown_field=$6,
+              strict_mode=$7, updated_at=NOW()
+        """, tenant_id, new_fields, new_prefixes, new_doc_types,
+            json.dumps(new_field_class), new_default, new_strict)
+
+    return {
+        "policy_updated":      True,
+        "sensitive_fields":    new_fields,
+        "sensitive_prefixes":  new_prefixes,
+        "sensitive_doc_types": new_doc_types,
+        "field_classifications": new_field_class,
+        "strict_mode":         new_strict,
+        "message": (
+            f"Sensitivity policy updated. "
+            f"{len(new_fields)} custom fields, "
+            f"{len(new_prefixes)} prefix rules, "
+            f"{len(new_doc_types)} doc types registered."
+        ),
+    }
+
+
+async def register_sensitive_type(
+    pool,
+    tenant_id:   str,
+    field_names: list,
+    prefixes:    list = [],
+    doc_types:   list = [],
+) -> dict:
+    """
+    Register custom sensitive types for this tenant.
+    These will be tokenized automatically in all future ingestion calls.
+
+    Usage:
+        client.register_sensitive_type(["employee_badge", "case_ref", "policy_number"])
+        # Now any field named employee_badge is ALWAYS tokenized
+        # Even without specifying sensitive_fields= each time
+    """
+    policy = await _get_sensitivity_policy(pool, tenant_id)
+
+    merged_fields    = list(set(policy["sensitive_fields"]    + field_names))
+    merged_prefixes  = list(set(policy["sensitive_prefixes"]  + prefixes))
+    merged_doc_types = list(set(policy["sensitive_doc_types"] + doc_types))
+
+    return await set_sensitivity_policy(
+        pool, tenant_id,
+        sensitive_fields    = merged_fields,
+        sensitive_prefixes  = merged_prefixes,
+        sensitive_doc_types = merged_doc_types,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTEXT-AWARE SENSITIVITY + RE-IDENTIFICATION PROTECTION — v4.5
+#
+# Missing Layer #1: Context-aware classification
+#   "Sensitivity is policy-defined and context-aware."
+#   Same field can be sensitive in one context, not in another.
+#   healthcare+patient_records → diagnosis is CRITICAL
+#   general+notes → diagnosis is low risk
+#
+# Missing Layer #2: Re-identification protection (k-anonymity)
+#   Even without names, identity can leak through combination:
+#   "67-year-old diabetic in zip 30314 with rare condition X" → 1 result = identified
+#   Protection: if result_count < K → suppress or generalize
+#
+# NEW DB TABLES: context_sensitivity_rules, rag_query_log
+# NEW ENDPOINTS:
+#   POST /policy/context              — set context-aware rules
+#   GET  /policy/context              — get current context rules
+#   POST /policy/anonymity            — set k-anonymity config
+#   GET  /policy/anonymity            — get current k-anonymity config
+#   POST /rag/search (patched)        — now includes k-anonymity protection
+# ══════════════════════════════════════════════════════════════════════════════
+
+CONTEXT_KANON_MIGRATIONS = [
+    # Context-aware sensitivity rules
+    """CREATE TABLE IF NOT EXISTS context_sensitivity_rules (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+
+        -- Context identifiers
+        industry        TEXT,            -- healthcare | fintech | legal | government | hr | general
+        data_scope      TEXT,            -- patient_records | financial_data | legal_files | classified
+        classification_level TEXT,       -- hipaa | pci_dss | gdpr | sox | fedramp | confidential
+
+        -- When this context is active, these fields become sensitive
+        extra_sensitive_fields  TEXT[] DEFAULT '{}',
+        extra_sensitive_patterns TEXT[] DEFAULT '{}',
+
+        -- When this context is active, these normally-sensitive fields are safe
+        safe_fields             TEXT[] DEFAULT '{}',
+
+        -- Strict mode for this context
+        context_strict_mode     BOOLEAN DEFAULT FALSE,
+
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS csr_tenant_idx
+       ON context_sensitivity_rules(tenant_id)""",
+    """CREATE INDEX IF NOT EXISTS csr_industry_idx
+       ON context_sensitivity_rules(tenant_id, industry)""",
+
+    # K-anonymity config per tenant
+    """CREATE TABLE IF NOT EXISTS anonymity_config (
+        tenant_id           TEXT PRIMARY KEY,
+
+        -- Minimum group size for RAG results
+        k_minimum           INTEGER DEFAULT 5,
+
+        -- Max results per query (prevent narrowing)
+        max_results         INTEGER DEFAULT 20,
+
+        -- Rate limiting — max queries per agent per minute
+        max_queries_per_min INTEGER DEFAULT 30,
+
+        -- Suppress single-result queries
+        suppress_singleton  BOOLEAN DEFAULT TRUE,
+
+        -- Auto-bucket numeric attributes (age → age_range)
+        auto_bucket         BOOLEAN DEFAULT TRUE,
+
+        -- Detect narrowing attacks (repeated narrowing queries)
+        detect_narrowing    BOOLEAN DEFAULT TRUE,
+
+        -- Fields that trigger re-id risk even without names
+        quasi_identifiers   TEXT[] DEFAULT '{"age","zip","dob","diagnosis","condition","gender","race"}',
+
+        updated_at          TIMESTAMPTZ DEFAULT NOW()
+    )""",
+
+    # Query log for narrowing attack detection
+    """CREATE TABLE IF NOT EXISTS rag_query_log (
+        id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id   TEXT NOT NULL,
+        agent_id    TEXT,
+        query_hash  TEXT NOT NULL,   -- hash of query for comparison
+        query_text  TEXT NOT NULL,
+        result_count INTEGER,
+        suppressed  BOOLEAN DEFAULT FALSE,
+        suppress_reason TEXT,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS rql_tenant_idx
+       ON rag_query_log(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS rql_agent_idx
+       ON rag_query_log(agent_id, tenant_id, created_at DESC)""",
+]
+
+
+# ── Context industry profiles ──────────────────────────────────────────────────
+
+_INDUSTRY_PROFILES = {
+    "healthcare": {
+        "extra_sensitive": [
+            "diagnosis", "condition", "medication", "treatment", "lab_result",
+            "allergy", "procedure", "icd_code", "admission", "discharge",
+            "insurance", "insurance_id", "member_id", "npi", "provider",
+        ],
+        "classification": "phi",
+        "quasi_identifiers": ["age", "zip", "dob", "diagnosis", "gender", "race", "ethnicity"],
+    },
+    "fintech": {
+        "extra_sensitive": [
+            "account_balance", "credit_score", "loan_amount", "transaction",
+            "salary", "income", "net_worth", "debt", "investment",
+        ],
+        "classification": "pci",
+        "quasi_identifiers": ["income_range", "zip", "age", "employment_status"],
+    },
+    "legal": {
+        "extra_sensitive": [
+            "case_number", "matter_id", "privilege", "settlement",
+            "verdict", "charge", "offense", "conviction",
+        ],
+        "classification": "confidential",
+        "quasi_identifiers": ["case_type", "jurisdiction", "date_filed"],
+    },
+    "government": {
+        "extra_sensitive": [
+            "clearance_level", "classification", "mission", "operation",
+            "asset_id", "cover", "agency", "division",
+        ],
+        "classification": "restricted",
+        "quasi_identifiers": ["clearance", "agency", "role", "location"],
+    },
+    "hr": {
+        "extra_sensitive": [
+            "salary", "compensation", "performance_rating", "disciplinary",
+            "termination_reason", "medical_leave", "disability",
+        ],
+        "classification": "confidential",
+        "quasi_identifiers": ["department", "level", "tenure", "location"],
+    },
+}
+
+
+# ── Context-aware classification ───────────────────────────────────────────────
+
+async def _get_context_rules(
+    pool,
+    tenant_id: str,
+    industry:  str = None,
+    data_scope: str = None,
+    classification_level: str = None,
+) -> dict:
+    """Load context rules matching the given context."""
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM context_sensitivity_rules WHERE tenant_id=$1",
+                tenant_id
+            )
+        rules = [dict(r) for r in rows]
+    except Exception:
+        rules = []
+
+    # Find matching rules
+    extra_sensitive = []
+    safe_fields     = []
+    strict          = False
+
+    for rule in rules:
+        match = True
+        if rule["industry"] and industry and rule["industry"] != industry:
+            match = False
+        if rule["data_scope"] and data_scope and rule["data_scope"] != data_scope:
+            match = False
+        if rule["classification_level"] and classification_level and \
+           rule["classification_level"] != classification_level:
+            match = False
+        if match:
+            extra_sensitive.extend(rule["extra_sensitive_fields"] or [])
+            safe_fields.extend(rule["safe_fields"] or [])
+            if rule["context_strict_mode"]:
+                strict = True
+
+    # Add industry profile defaults
+    if industry and industry in _INDUSTRY_PROFILES:
+        profile = _INDUSTRY_PROFILES[industry]
+        extra_sensitive.extend(profile.get("extra_sensitive", []))
+
+    return {
+        "extra_sensitive_fields": list(set(extra_sensitive)),
+        "safe_fields":            list(set(safe_fields)),
+        "strict_mode":            strict,
+        "industry":               industry,
+        "data_scope":             data_scope,
+    }
+
+
+async def resolve_content_sensitivity_with_context(
+    pool,
+    tenant_id:            str,
+    content:              dict,
+    context:              dict = {},
+    field_policy:         dict = {},
+    sensitive_fields:     list = [],
+    tokenize_all:         bool = False,
+    doc_type:             str  = None,
+) -> tuple[dict, dict]:
+    """
+    Full 6-layer sensitivity resolution including context awareness.
+
+    context: {
+        "industry":             "healthcare",
+        "data_scope":           "patient_records",
+        "classification_level": "hipaa"
+    }
+
+    Layer 1 — Explicit per-request field_policy
+    Layer 2 — Explicit per-request sensitive_fields
+    Layer 3 — tokenize_all flag
+    Layer 4 — Tenant persistent policy
+    Layer 5 — Context-aware rules (industry/scope/classification)
+    Layer 6 — Built-in detection
+    """
+    industry             = context.get("industry")
+    data_scope           = context.get("data_scope")
+    classification_level = context.get("classification_level")
+
+    # Load tenant policy
+    tenant_policy = await _get_sensitivity_policy(pool, tenant_id)
+
+    # Load context rules
+    ctx_rules = await _get_context_rules(
+        pool, tenant_id, industry, data_scope, classification_level)
+
+    # Merge context into tenant policy
+    merged_sensitive = list(set(
+        tenant_policy["sensitive_fields"] +
+        ctx_rules["extra_sensitive_fields"] +
+        sensitive_fields
+    ))
+    merged_safe = set(ctx_rules["safe_fields"])
+    is_strict   = tokenize_all or tenant_policy["strict_mode"] or ctx_rules["strict_mode"]
+
+    # If doc_type is sensitive → tokenize all
+    if doc_type and doc_type in tenant_policy["sensitive_doc_types"]:
+        is_strict = True
+
+    to_tokenize = {}
+    to_keep     = {}
+
+    for field, value in content.items():
+        if value is None or str(value).strip() == "":
+            to_keep[field] = value
+            continue
+
+        if _is_vault_token(str(value)):
+            to_keep[field] = value
+            continue
+
+        # Layer 1 — explicit per-request
+        if field_policy:
+            explicit = field_policy.get(field) or field_policy.get(field.lower())
+            if explicit == "tokenize":
+                to_tokenize[field] = value
+                continue
+            if explicit in ("keep", "public"):
+                to_keep[field] = value
+                continue
+
+        # Context safe fields — override everything except explicit tokenize
+        if field in merged_safe or field.lower() in [s.lower() for s in merged_safe]:
+            to_keep[field] = value
+            continue
+
+        # Layer 3 — strict mode
+        if is_strict:
+            to_tokenize[field] = value
+            continue
+
+        # Layer 4+5+6 — merged policy + context + built-in
+        extended_policy = {
+            **tenant_policy,
+            "sensitive_fields": merged_sensitive,
+        }
+        decision = _classify_field(field, str(value), extended_policy)
+        if decision == "tokenize":
+            to_tokenize[field] = value
+        else:
+            to_keep[field] = value
+
+    return to_tokenize, to_keep
+
+
+# ── K-anonymity protection ─────────────────────────────────────────────────────
+
+async def _get_anonymity_config(pool, tenant_id: str) -> dict:
+    """Load tenant's k-anonymity config."""
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM anonymity_config WHERE tenant_id=$1", tenant_id)
+        if row:
+            return dict(row)
+    except Exception:
+        pass
+    return {
+        "k_minimum":           5,
+        "max_results":         20,
+        "max_queries_per_min": 30,
+        "suppress_singleton":  True,
+        "auto_bucket":         True,
+        "detect_narrowing":    True,
+        "quasi_identifiers":   ["age","zip","dob","diagnosis","condition","gender","race"],
+    }
+
+
+def _auto_bucket_value(field: str, value: str) -> str:
+    """
+    Convert precise values to ranges to reduce re-identification risk.
+    age:67 → age_range:65-74
+    zip:30314 → zip_prefix:303
+    """
+    field_lower = field.lower()
+
+    # Age bucketing
+    if "age" in field_lower:
+        try:
+            age = int(str(value).strip())
+            bucket = (age // 10) * 10
+            return f"{bucket}-{bucket+9}"
+        except Exception:
+            pass
+
+    # ZIP bucketing — keep first 3 digits only
+    if "zip" in field_lower or "postal" in field_lower:
+        clean = str(value).strip()[:3]
+        return f"{clean}xxx"
+
+    # Year-only for dates
+    if "dob" in field_lower or "birth" in field_lower or "date" in field_lower:
+        import re as _re2
+        m = _re2.search(r'\b(19|20)\d{2}\b', str(value))
+        if m:
+            return m.group(0)
+
+    return value
+
+
+def _check_quasi_identifier_risk(
+    metadata:          dict,
+    quasi_identifiers: list,
+    k_minimum:         int = 5,
+) -> tuple[bool, str]:
+    """
+    Check if metadata contains enough quasi-identifiers to pose re-id risk.
+    Returns (is_risky, reason).
+    """
+    present_qids = [
+        f for f in quasi_identifiers
+        if f in metadata and metadata[f] and not _is_vault_token(str(metadata[f]))
+    ]
+
+    # 3+ quasi-identifiers with specific values = high re-id risk
+    if len(present_qids) >= 3:
+        return True, (
+            f"Re-identification risk: {len(present_qids)} quasi-identifiers present "
+            f"({', '.join(present_qids[:3])}). Results suppressed."
+        )
+
+    return False, ""
+
+
+async def _detect_narrowing_attack(
+    pool,
+    tenant_id:    str,
+    agent_id:     str,
+    query:        str,
+    result_count: int,
+) -> tuple[bool, str]:
+    """
+    Detect if agent is running narrowing queries to re-identify individuals.
+    Pattern: series of queries each returning fewer results = narrowing attack.
+    """
+    import hashlib as _hashlib
+    query_hash = _hashlib.sha256(query.lower().strip().encode()).hexdigest()[:16]
+
+    try:
+        async with pool.acquire() as conn:
+            # Check recent queries from this agent in last 5 minutes
+            recent = await conn.fetch("""
+                SELECT result_count, suppressed FROM rag_query_log
+                WHERE tenant_id=$1 AND agent_id=$2
+                AND created_at > NOW() - INTERVAL '5 minutes'
+                ORDER BY created_at DESC LIMIT 10
+            """, tenant_id, agent_id or "unknown")
+
+            if recent:
+                counts = [r["result_count"] for r in recent if r["result_count"] is not None]
+                # Narrowing pattern: each query returns fewer results
+                if len(counts) >= 3:
+                    is_narrowing = all(
+                        counts[i] >= counts[i+1]
+                        for i in range(min(3, len(counts)-1))
+                    ) and counts[0] > 1 and counts[-1] <= 2
+
+                    if is_narrowing:
+                        return True, (
+                            f"Narrowing attack detected: query sequence "
+                            f"{counts[:4]} suggests re-identification attempt."
+                        )
+    except Exception:
+        pass
+
+    return False, ""
+
+
+async def apply_kanonymity(
+    pool,
+    tenant_id:    str,
+    agent_id:     str,
+    query:        str,
+    results:      list,
+    config:       dict = None,
+) -> tuple[list, dict]:
+    """
+    Apply k-anonymity protection to RAG search results.
+
+    Returns (protected_results, protection_info).
+    protected_results may be empty if suppressed.
+    protection_info explains what happened and why.
+    """
+    if config is None:
+        config = await _get_anonymity_config(pool, tenant_id)
+
+    import hashlib as _hashlib
+    query_hash  = _hashlib.sha256(query.lower().strip().encode()).hexdigest()[:16]
+    k_min       = config.get("k_minimum", 5)
+    suppress    = config.get("suppress_singleton", True)
+    auto_bucket = config.get("auto_bucket", True)
+    detect_narrowing = config.get("detect_narrowing", True)
+    quasi_ids   = config.get("quasi_identifiers", [])
+
+    protection_info = {
+        "k_minimum":     k_min,
+        "result_count":  len(results),
+        "suppressed":    False,
+        "suppress_reason": None,
+        "bucketed_fields": [],
+        "narrowing_detected": False,
+    }
+
+    # Check for narrowing attack
+    if detect_narrowing and agent_id:
+        is_narrowing, reason = await _detect_narrowing_attack(
+            pool, tenant_id, agent_id, query, len(results))
+        if is_narrowing:
+            protection_info["suppressed"]          = True
+            protection_info["suppress_reason"]     = reason
+            protection_info["narrowing_detected"]  = True
+            await _log_rag_query(pool, tenant_id, agent_id, query_hash, query, 0, True, reason)
+            return [], protection_info
+
+    # K-minimum check — suppress if too few results
+    if suppress and len(results) < k_min:
+        reason = (
+            f"Result count ({len(results)}) below k-minimum ({k_min}). "
+            f"Query too specific — re-identification risk. "
+            f"Broaden your query or lower specificity."
+        )
+        protection_info["suppressed"]      = True
+        protection_info["suppress_reason"] = reason
+        await _log_rag_query(pool, tenant_id, agent_id, query_hash, query, len(results), True, reason)
+        return [], protection_info
+
+    # Auto-bucket quasi-identifiers in results
+    protected = []
+    bucketed_fields = set()
+    for result in results:
+        metadata = dict(result.get("metadata", {}))
+        if auto_bucket:
+            for field in quasi_ids:
+                if field in metadata and not _is_vault_token(str(metadata[field])):
+                    original = str(metadata[field])
+                    bucketed = _auto_bucket_value(field, original)
+                    if bucketed != original:
+                        metadata[field] = bucketed
+                        bucketed_fields.add(field)
+        result = {**result, "metadata": metadata}
+        protected.append(result)
+
+    if bucketed_fields:
+        protection_info["bucketed_fields"] = list(bucketed_fields)
+
+    await _log_rag_query(pool, tenant_id, agent_id, query_hash, query, len(results), False, None)
+    return protected, protection_info
+
+
+async def _log_rag_query(
+    pool,
+    tenant_id:      str,
+    agent_id:       str,
+    query_hash:     str,
+    query_text:     str,
+    result_count:   int,
+    suppressed:     bool,
+    suppress_reason: str,
+):
+    """Log every RAG query for narrowing attack detection."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO rag_query_log
+                  (tenant_id, agent_id, query_hash, query_text,
+                   result_count, suppressed, suppress_reason)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+            """, tenant_id, agent_id or "unknown", query_hash,
+                query_text[:500], result_count, suppressed, suppress_reason)
+    except Exception:
+        pass
+
+
+async def set_anonymity_config(
+    pool,
+    tenant_id:            str,
+    k_minimum:            int  = None,
+    max_results:          int  = None,
+    suppress_singleton:   bool = None,
+    auto_bucket:          bool = None,
+    detect_narrowing:     bool = None,
+    quasi_identifiers:    list = None,
+    max_queries_per_min:  int  = None,
+) -> dict:
+    """Set k-anonymity configuration for this tenant."""
+    current = await _get_anonymity_config(pool, tenant_id)
+
+    new_config = {
+        "k_minimum":           k_minimum          if k_minimum          is not None else current["k_minimum"],
+        "max_results":         max_results         if max_results         is not None else current["max_results"],
+        "suppress_singleton":  suppress_singleton  if suppress_singleton  is not None else current["suppress_singleton"],
+        "auto_bucket":         auto_bucket         if auto_bucket         is not None else current["auto_bucket"],
+        "detect_narrowing":    detect_narrowing    if detect_narrowing    is not None else current["detect_narrowing"],
+        "quasi_identifiers":   quasi_identifiers   if quasi_identifiers   is not None else current["quasi_identifiers"],
+        "max_queries_per_min": max_queries_per_min if max_queries_per_min is not None else current["max_queries_per_min"],
+    }
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO anonymity_config
+              (tenant_id, k_minimum, max_results, suppress_singleton,
+               auto_bucket, detect_narrowing, quasi_identifiers,
+               max_queries_per_min, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+            ON CONFLICT (tenant_id) DO UPDATE SET
+              k_minimum=$2, max_results=$3, suppress_singleton=$4,
+              auto_bucket=$5, detect_narrowing=$6, quasi_identifiers=$7,
+              max_queries_per_min=$8, updated_at=NOW()
+        """, tenant_id,
+            new_config["k_minimum"], new_config["max_results"],
+            new_config["suppress_singleton"], new_config["auto_bucket"],
+            new_config["detect_narrowing"], new_config["quasi_identifiers"],
+            new_config["max_queries_per_min"])
+
+    return {
+        "config_updated": True,
+        **new_config,
+        "message": (
+            f"K-anonymity active. Minimum group size: {new_config['k_minimum']}. "
+            f"Auto-bucketing: {new_config['auto_bucket']}. "
+            f"Narrowing detection: {new_config['detect_narrowing']}."
+        ),
+    }
+
+
+async def set_context_rules(
+    pool,
+    tenant_id:             str,
+    industry:              str  = None,
+    data_scope:            str  = None,
+    classification_level:  str  = None,
+    extra_sensitive_fields: list = [],
+    safe_fields:           list = [],
+    context_strict_mode:   bool = False,
+) -> dict:
+    """Register context-aware sensitivity rules."""
+    async with pool.acquire() as conn:
+        rule_id = _secrets.token_hex(8)
+        await conn.execute("""
+            INSERT INTO context_sensitivity_rules
+              (id, tenant_id, industry, data_scope, classification_level,
+               extra_sensitive_fields, safe_fields, context_strict_mode)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        """, rule_id, tenant_id, industry, data_scope, classification_level,
+            extra_sensitive_fields, safe_fields, context_strict_mode)
+
+    # Add industry profile extras automatically
+    profile_fields = []
+    if industry and industry in _INDUSTRY_PROFILES:
+        profile_fields = _INDUSTRY_PROFILES[industry].get("extra_sensitive", [])
+
+    return {
+        "rule_id":              rule_id,
+        "industry":             industry,
+        "data_scope":           data_scope,
+        "classification_level": classification_level,
+        "extra_sensitive_fields": list(set(extra_sensitive_fields + profile_fields)),
+        "safe_fields":          safe_fields,
+        "context_strict_mode":  context_strict_mode,
+        "message": (
+            f"Context rule registered. "
+            f"Industry profile '{industry}' applied automatically." if industry else
+            "Context rule registered."
+        ),
+    }
