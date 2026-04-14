@@ -8224,3 +8224,527 @@ async def revoke_grant(
         "tokens_revoked":   len(row["tokens"]),
         "message": f"{row['receiving_agent']} can no longer access these tokens.",
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SMART TOKENS — v4.2
+#
+# "The AI can act on the secret, without learning the secret."
+#
+# Smart tokens carry policy rules baked in:
+#   - what type of data they represent
+#   - where they are allowed to be used
+#   - who can trigger reveal
+#   - how many times they can be revealed
+#   - how long before they expire
+#   - whether the reveal is logged
+#
+# The agent sees meaning. Never the value.
+# The policy engine enforces all 5 gates before any reveal.
+# The trusted executor injects real value directly at the last mile.
+# Token self-destructs after execution.
+#
+# NEW DB TABLES: smart_tokens, smart_token_reveal_log
+# NEW ENDPOINTS:
+#   POST /vault/smart-token         — mint a smart token with policy
+#   POST /vault/smart-token/batch   — mint multiple smart tokens
+#   GET  /vault/smart-token/{id}    — inspect token metadata (never real value)
+#   POST /vault/smart-token/execute — policy-gated execution with JIT reveal
+#   GET  /vault/smart-token/audit   — full reveal audit trail
+# ══════════════════════════════════════════════════════════════════════════════
+
+SMART_TOKEN_MIGRATIONS = [
+    # Smart tokens — policy-bound tokens with semantic meaning
+    """CREATE TABLE IF NOT EXISTS smart_tokens (
+        token_id          TEXT PRIMARY KEY,
+        tenant_id         TEXT NOT NULL,
+        agent_id          TEXT,
+
+        -- The real value — encrypted, never exposed to agent
+        real_value        TEXT NOT NULL,
+
+        -- Semantic meaning — what the agent sees
+        data_type         TEXT NOT NULL,   -- person_name, email, ssn, address, card_number, etc.
+        semantic_label    TEXT,            -- human readable: "patient name", "billing address"
+        classification    TEXT DEFAULT 'pii',  -- pii, phi, pci
+
+        -- Policy rules — where/when/how this token can be revealed
+        allowed_actions   TEXT[] DEFAULT '{}',   -- empty = any action
+        allowed_targets   TEXT[] DEFAULT '{}',   -- URLs/endpoints allowed to receive real value
+        allowed_fields    TEXT[] DEFAULT '{}',   -- form fields this token may fill
+        reveal_mode       TEXT DEFAULT 'trusted_executor_only',
+        max_uses          INTEGER DEFAULT 1,     -- how many times real value can be revealed
+        uses_remaining    INTEGER DEFAULT 1,
+        ttl_seconds       INTEGER DEFAULT 86400,
+        audit_reveal      BOOLEAN DEFAULT TRUE,
+
+        -- Lifecycle
+        created_at        TIMESTAMPTZ DEFAULT NOW(),
+        expires_at        TIMESTAMPTZ,
+        revoked           BOOLEAN DEFAULT FALSE,
+        revoked_at        TIMESTAMPTZ,
+        revoked_reason    TEXT
+    )""",
+    """CREATE INDEX IF NOT EXISTS st_tenant_idx
+       ON smart_tokens(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS st_agent_idx
+       ON smart_tokens(agent_id, tenant_id)""",
+    """CREATE INDEX IF NOT EXISTS st_expires_idx
+       ON smart_tokens(expires_at)""",
+
+    # Full reveal audit log — every time a real value was revealed
+    """CREATE TABLE IF NOT EXISTS smart_token_reveal_log (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        token_id        TEXT NOT NULL,
+        agent_id        TEXT,
+        action_type     TEXT,
+        target_url      TEXT,
+        field_name      TEXT,
+        authorized      BOOLEAN NOT NULL,
+        deny_reason     TEXT,
+        uses_before     INTEGER,
+        uses_after      INTEGER,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS strl_tenant_idx
+       ON smart_token_reveal_log(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS strl_token_idx
+       ON smart_token_reveal_log(token_id)""",
+]
+
+
+# ── Token ID format ────────────────────────────────────────────────────────────
+
+def _smart_token_id(data_type: str) -> str:
+    """
+    Generate a smart token ID.
+    Format: tok_{TYPE}_{RANDOM}
+    Example: tok_name_a1b2c3d4e5
+    Agent sees the type — never the value.
+    """
+    short = data_type.upper()[:4]
+    rand  = _secrets.token_hex(5)
+    return f"tok_{short}_{rand}"
+
+
+# ── Data type registry ─────────────────────────────────────────────────────────
+
+_SMART_DATA_TYPES = {
+    # PII
+    "person_name":      {"label": "person name",       "classification": "pii"},
+    "first_name":       {"label": "first name",         "classification": "pii"},
+    "last_name":        {"label": "last name",          "classification": "pii"},
+    "email":            {"label": "email address",      "classification": "pii"},
+    "phone":            {"label": "phone number",       "classification": "pii"},
+    "address":          {"label": "street address",     "classification": "pii"},
+    "zip_code":         {"label": "zip/postal code",    "classification": "pii"},
+    "date_of_birth":    {"label": "date of birth",      "classification": "pii"},
+    "ssn":              {"label": "social security no", "classification": "pii"},
+    "passport":         {"label": "passport number",    "classification": "pii"},
+    "drivers_license":  {"label": "driver's license",  "classification": "pii"},
+    "ip_address":       {"label": "IP address",         "classification": "pii"},
+    "username":         {"label": "username",           "classification": "pii"},
+    "user_id":          {"label": "user ID",            "classification": "pii"},
+    # PHI
+    "patient_name":     {"label": "patient name",       "classification": "phi"},
+    "mrn":              {"label": "medical record no",  "classification": "phi"},
+    "npi":              {"label": "NPI number",         "classification": "phi"},
+    "diagnosis":        {"label": "diagnosis code",     "classification": "phi"},
+    "medication":       {"label": "medication name",    "classification": "phi"},
+    "lab_result":       {"label": "lab result",         "classification": "phi"},
+    "insurance_id":     {"label": "insurance ID",       "classification": "phi"},
+    "treatment":        {"label": "treatment info",     "classification": "phi"},
+    # PCI
+    "card_number":      {"label": "card number",        "classification": "pci"},
+    "card_cvv":         {"label": "card CVV",           "classification": "pci"},
+    "card_expiry":      {"label": "card expiry",        "classification": "pci"},
+    "account_number":   {"label": "account number",     "classification": "pci"},
+    "routing_number":   {"label": "routing number",     "classification": "pci"},
+    "iban":             {"label": "IBAN",               "classification": "pci"},
+}
+
+def _resolve_data_type(data_type: str) -> dict:
+    """Return metadata for a data type, with fallback for unknown types."""
+    return _SMART_DATA_TYPES.get(data_type, {
+        "label":          data_type.replace("_", " "),
+        "classification": "pii",
+    })
+
+
+# ── Core smart token operations ────────────────────────────────────────────────
+
+async def mint_smart_token(
+    pool,
+    tenant_id:       str,
+    real_value:      str,
+    data_type:       str,
+    agent_id:        str = None,
+    allowed_actions: list = [],
+    allowed_targets: list = [],
+    allowed_fields:  list = [],
+    max_uses:        int  = 1,
+    ttl_seconds:     int  = 86400,
+    semantic_label:  str  = None,
+    audit_reveal:    bool = True,
+) -> dict:
+    """
+    Mint a smart token — a policy-bound token that carries semantic meaning.
+
+    The agent receives:
+    {
+        "token_id":      "tok_NAME_a1b2c3",
+        "data_type":     "person_name",
+        "semantic_label": "patient name",
+        "classification": "phi",
+        "policy": {
+            "allowed_actions": ["fill_form", "send_email"],
+            "allowed_fields":  ["first_name"],
+            "max_uses":        1,
+            "ttl_seconds":     30,
+        }
+    }
+
+    The agent knows WHAT the data is and WHERE it can go.
+    The agent NEVER knows the actual value.
+    """
+    token_id   = _smart_token_id(data_type)
+    meta       = _resolve_data_type(data_type)
+    label      = semantic_label or meta["label"]
+    classif    = meta["classification"]
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO smart_tokens
+              (token_id, tenant_id, agent_id, real_value, data_type,
+               semantic_label, classification, allowed_actions, allowed_targets,
+               allowed_fields, max_uses, uses_remaining, ttl_seconds,
+               audit_reveal, expires_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        """, token_id, tenant_id, agent_id, str(real_value), data_type,
+            label, classif, allowed_actions, allowed_targets,
+            allowed_fields, max_uses, max_uses, ttl_seconds,
+            audit_reveal, expires_at)
+
+    # Return ONLY what the agent is allowed to see — never real_value
+    return {
+        "token_id":       token_id,
+        "data_type":      data_type,
+        "semantic_label": label,
+        "classification": classif,
+        "policy": {
+            "allowed_actions": allowed_actions or "any",
+            "allowed_targets": allowed_targets or "any",
+            "allowed_fields":  allowed_fields  or "any",
+            "max_uses":        max_uses,
+            "ttl_seconds":     ttl_seconds,
+            "reveal_mode":     "trusted_executor_only",
+            "audit":           audit_reveal,
+        },
+        "expires_at": expires_at.isoformat(),
+        "hint": f"This token represents a {label}. Real value is vault-protected.",
+    }
+
+
+async def mint_smart_tokens_batch(
+    pool,
+    tenant_id: str,
+    tokens:    list[dict],
+    agent_id:  str = None,
+) -> list[dict]:
+    """
+    Mint multiple smart tokens in one call.
+
+    tokens: list of {
+        real_value, data_type,
+        allowed_actions?, allowed_targets?, allowed_fields?,
+        max_uses?, ttl_seconds?, semantic_label?
+    }
+    """
+    results = []
+    for t in tokens:
+        result = await mint_smart_token(
+            pool,
+            tenant_id       = tenant_id,
+            real_value      = t["real_value"],
+            data_type       = t["data_type"],
+            agent_id        = agent_id or t.get("agent_id"),
+            allowed_actions = t.get("allowed_actions", []),
+            allowed_targets = t.get("allowed_targets", []),
+            allowed_fields  = t.get("allowed_fields",  []),
+            max_uses        = t.get("max_uses",        1),
+            ttl_seconds     = t.get("ttl_seconds",     86400),
+            semantic_label  = t.get("semantic_label"),
+            audit_reveal    = t.get("audit_reveal",    True),
+        )
+        results.append(result)
+    return results
+
+
+async def _run_policy_gates(
+    conn,
+    token_row:   dict,
+    action_type: str = None,
+    target_url:  str = None,
+    field_name:  str = None,
+    agent_id:    str = None,
+) -> tuple[bool, str]:
+    """
+    Run all 5 policy gates. Returns (authorized, deny_reason).
+
+    Gate 1: Token not revoked
+    Gate 2: Token not expired
+    Gate 3: Uses remaining
+    Gate 4: Action allowed
+    Gate 5: Target/field allowed
+    """
+    # Gate 1 — revoked?
+    if token_row["revoked"]:
+        return False, f"Token revoked at {token_row['revoked_at']}: {token_row['revoked_reason']}"
+
+    # Gate 2 — expired?
+    if token_row["expires_at"] and token_row["expires_at"] < datetime.now(timezone.utc):
+        return False, f"Token expired at {token_row['expires_at'].isoformat()}"
+
+    # Gate 3 — uses remaining?
+    if token_row["uses_remaining"] <= 0:
+        return False, f"Token has no uses remaining (max_uses={token_row['max_uses']})"
+
+    # Gate 4 — action allowed?
+    allowed_actions = token_row["allowed_actions"] or []
+    if allowed_actions and action_type and action_type not in allowed_actions:
+        return False, (
+            f"Action '{action_type}' not in allowed_actions {allowed_actions}. "
+            f"This token may only be used for: {', '.join(allowed_actions)}"
+        )
+
+    # Gate 5 — target/field allowed?
+    allowed_targets = token_row["allowed_targets"] or []
+    if allowed_targets and target_url:
+        match = any(target_url.startswith(t) for t in allowed_targets)
+        if not match:
+            return False, (
+                f"Target '{target_url}' not in allowed_targets {allowed_targets}. "
+                f"This token may only be used at: {', '.join(allowed_targets)}"
+            )
+
+    allowed_fields = token_row["allowed_fields"] or []
+    if allowed_fields and field_name and field_name not in allowed_fields:
+        return False, (
+            f"Field '{field_name}' not in allowed_fields {allowed_fields}. "
+            f"This token may only fill: {', '.join(allowed_fields)}"
+        )
+
+    return True, "all gates passed"
+
+
+async def execute_smart_token(
+    pool,
+    tenant_id:   str,
+    token_id:    str,
+    action_type: str = None,
+    target_url:  str = None,
+    field_name:  str = None,
+    agent_id:    str = None,
+) -> dict:
+    """
+    Policy-gated JIT reveal for smart token execution.
+
+    This is the ONLY function that can access a real value.
+    Called by the trusted executor — NEVER by the agent.
+
+    Flow:
+      1. Load token from vault
+      2. Run all 5 policy gates
+      3. If all pass: return real value, decrement uses, log reveal
+      4. If any fail: return error, log denial, never return real value
+      5. If uses_remaining hits 0: auto-revoke token
+
+    Returns:
+      On success: {"authorized": True, "real_value": "...", "uses_remaining": N}
+      On failure: {"authorized": False, "deny_reason": "...", "real_value": None}
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM smart_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+
+        if not row:
+            return {
+                "authorized":    False,
+                "deny_reason":   f"Token '{token_id}' not found",
+                "real_value":    None,
+                "token_id":      token_id,
+            }
+
+        token_row = dict(row)
+        uses_before = token_row["uses_remaining"]
+
+        # Run all 5 policy gates
+        authorized, reason = await _run_policy_gates(
+            conn, token_row, action_type, target_url, field_name, agent_id
+        )
+
+        if not authorized:
+            # Log denial
+            if token_row["audit_reveal"]:
+                await conn.execute("""
+                    INSERT INTO smart_token_reveal_log
+                      (tenant_id,token_id,agent_id,action_type,target_url,
+                       field_name,authorized,deny_reason,uses_before,uses_after)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
+                """, tenant_id, token_id, agent_id, action_type, target_url,
+                    field_name, False, reason, uses_before)
+
+            return {
+                "authorized":  False,
+                "deny_reason": reason,
+                "real_value":  None,
+                "token_id":    token_id,
+                "data_type":   token_row["data_type"],
+            }
+
+        # All gates passed — reveal real value
+        uses_after = uses_before - 1
+
+        # Decrement uses
+        await conn.execute(
+            "UPDATE smart_tokens SET uses_remaining=$1 WHERE token_id=$2 AND tenant_id=$3",
+            uses_after, token_id, tenant_id
+        )
+
+        # Auto-revoke if exhausted
+        if uses_after <= 0:
+            await conn.execute("""
+                UPDATE smart_tokens
+                SET revoked=TRUE, revoked_at=NOW(), revoked_reason='max_uses_reached'
+                WHERE token_id=$1 AND tenant_id=$2
+            """, token_id, tenant_id)
+
+        # Log successful reveal
+        if token_row["audit_reveal"]:
+            await conn.execute("""
+                INSERT INTO smart_token_reveal_log
+                  (tenant_id,token_id,agent_id,action_type,target_url,
+                   field_name,authorized,uses_before,uses_after)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            """, tenant_id, token_id, agent_id, action_type, target_url,
+                field_name, True, uses_before, uses_after)
+
+    return {
+        "authorized":    True,
+        "real_value":    token_row["real_value"],  # only returned here, never to agent
+        "token_id":      token_id,
+        "data_type":     token_row["data_type"],
+        "semantic_label": token_row["semantic_label"],
+        "uses_remaining": uses_after,
+        "auto_revoked":  uses_after <= 0,
+        "message":       "Real value revealed. Token uses decremented. Audit logged.",
+    }
+
+
+async def get_smart_token_metadata(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+) -> dict:
+    """
+    Return token metadata — NEVER the real value.
+    Safe to return to the agent for planning purposes.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT token_id, tenant_id, agent_id, data_type, semantic_label, "
+            "classification, allowed_actions, allowed_targets, allowed_fields, "
+            "max_uses, uses_remaining, ttl_seconds, audit_reveal, "
+            "created_at, expires_at, revoked, revoked_reason "
+            "FROM smart_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+
+    if not row:
+        return {"found": False, "token_id": token_id}
+
+    r = dict(row)
+    now = datetime.now(timezone.utc)
+    expired = r["expires_at"] and r["expires_at"] < now
+
+    return {
+        "found":          True,
+        "token_id":       r["token_id"],
+        "data_type":      r["data_type"],
+        "semantic_label": r["semantic_label"],
+        "classification": r["classification"],
+        "policy": {
+            "allowed_actions": r["allowed_actions"] or "any",
+            "allowed_targets": r["allowed_targets"] or "any",
+            "allowed_fields":  r["allowed_fields"]  or "any",
+            "max_uses":        r["max_uses"],
+            "uses_remaining":  r["uses_remaining"],
+            "ttl_seconds":     r["ttl_seconds"],
+        },
+        "status": (
+            "revoked"  if r["revoked"] else
+            "expired"  if expired else
+            "exhausted" if r["uses_remaining"] <= 0 else
+            "active"
+        ),
+        "expires_at":  r["expires_at"].isoformat() if r["expires_at"] else None,
+        "real_value":  "VAULT_PROTECTED — never exposed to agent",
+    }
+
+
+async def revoke_smart_token(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+    reason:    str = "manual_revocation",
+) -> dict:
+    """Immediately revoke a smart token. No further reveals possible."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT token_id FROM smart_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+        if not row:
+            return {"revoked": False, "error": "Token not found"}
+
+        await conn.execute("""
+            UPDATE smart_tokens
+            SET revoked=TRUE, revoked_at=NOW(), revoked_reason=$1
+            WHERE token_id=$2 AND tenant_id=$3
+        """, reason, token_id, tenant_id)
+
+    return {
+        "revoked":  True,
+        "token_id": token_id,
+        "reason":   reason,
+        "message":  "Token immediately revoked. No further reveals possible.",
+    }
+
+
+async def get_smart_token_audit(
+    pool,
+    tenant_id: str,
+    token_id:  str = None,
+    limit:     int = 100,
+) -> list:
+    """Full reveal audit trail. Every authorized and denied reveal, in order."""
+    async with pool.acquire() as conn:
+        if token_id:
+            rows = await conn.fetch(
+                "SELECT * FROM smart_token_reveal_log "
+                "WHERE tenant_id=$1 AND token_id=$2 "
+                "ORDER BY created_at ASC LIMIT $3",
+                tenant_id, token_id, limit
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM smart_token_reveal_log "
+                "WHERE tenant_id=$1 "
+                "ORDER BY created_at DESC LIMIT $2",
+                tenant_id, limit
+            )
+    return [dict(r) for r in rows]
