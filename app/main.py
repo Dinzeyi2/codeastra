@@ -144,6 +144,66 @@ except ImportError:
     async def get_pipeline_audit(pool, tid, **kw): return []
     async def revoke_grant(pool, tid, **kw): return {"error": "v4.1 not loaded"}
 
+# ── v4.5 context-aware + k-anonymity ────────────────────────────────────────
+try:
+    from app.v3 import (
+        CONTEXT_KANON_MIGRATIONS,
+        resolve_content_sensitivity_with_context,
+        set_anonymity_config,
+        set_context_rules,
+        _get_anonymity_config,
+        _get_context_rules,
+        apply_kanonymity,
+        _INDUSTRY_PROFILES,
+    )
+except ImportError:
+    CONTEXT_KANON_MIGRATIONS = []
+    async def resolve_content_sensitivity_with_context(pool,tid,content,**kw): return content,{}
+    async def set_anonymity_config(pool,tid,**kw): return {"error":"v4.5 not loaded"}
+    async def set_context_rules(pool,tid,**kw):    return {"error":"v4.5 not loaded"}
+    async def _get_anonymity_config(pool,tid):     return {}
+    async def _get_context_rules(pool,tid,**kw):   return {}
+    async def apply_kanonymity(pool,tid,aid,q,r,**kw): return r, {}
+    _INDUSTRY_PROFILES = {}
+
+# ── v4.4 policy-driven sensitivity ──────────────────────────────────────────
+try:
+    from app.v3 import (
+        SENSITIVITY_POLICY_MIGRATIONS,
+        set_sensitivity_policy,
+        register_sensitive_type,
+        resolve_content_sensitivity,
+        _get_sensitivity_policy,
+        _classify_field,
+    )
+except ImportError:
+    SENSITIVITY_POLICY_MIGRATIONS = []
+    async def set_sensitivity_policy(pool, tid, **kw): return {"error": "v4.4 not loaded"}
+    async def register_sensitive_type(pool, tid, **kw): return {"error": "v4.4 not loaded"}
+    async def resolve_content_sensitivity(pool, tid, content, **kw): return content, {}
+    async def _get_sensitivity_policy(pool, tid): return {}
+    def _classify_field(f, v, p): return "keep"
+
+# ── v4.3 blind RAG ───────────────────────────────────────────────────────────
+try:
+    from app.v3 import (
+        BLIND_RAG_MIGRATIONS,
+        rag_ingest_document,
+        rag_ingest_batch,
+        rag_search,
+        rag_get_document,
+        rag_delete_document,
+        rag_stats,
+    )
+except ImportError:
+    BLIND_RAG_MIGRATIONS = []
+    async def rag_ingest_document(pool, tid, **kw): return {"error": "v4.3 not loaded"}
+    async def rag_ingest_batch(pool, tid, **kw):    return {"error": "v4.3 not loaded"}
+    async def rag_search(pool, tid, **kw):          return {"results": []}
+    async def rag_get_document(pool, tid, **kw):    return {}
+    async def rag_delete_document(pool, tid, **kw): return {}
+    async def rag_stats(pool, tid):                 return {}
+
 # ── v4.2 smart tokens ─────────────────────────────────────────────────────────
 try:
     from app.v3 import (
@@ -432,6 +492,12 @@ async def init_db():
         for _sql in PIPELINE_MIGRATIONS:    await conn.execute(_sql)
         # v4.2 — smart tokens with policy engine
         for _sql in SMART_TOKEN_MIGRATIONS: await conn.execute(_sql)
+        # v4.3 — blind RAG
+        for _sql in BLIND_RAG_MIGRATIONS:    await conn.execute(_sql)
+        # v4.4 — policy-driven sensitivity
+        for _sql in SENSITIVITY_POLICY_MIGRATIONS: await conn.execute(_sql)
+        # v4.5 — context-aware + k-anonymity
+        for _sql in CONTEXT_KANON_MIGRATIONS:        await conn.execute(_sql)
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class TenantSignup(BaseModel):
@@ -4506,4 +4572,459 @@ async def smart_token_types(tenant=Depends(get_tenant)):
             for dt, meta in _SMART_DATA_TYPES.items()
         ],
         "count": len(_SMART_DATA_TYPES),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.3 — BLIND RAG ENDPOINTS
+# Vault-native semantic search. Agent finds documents without seeing real data.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/rag/ingest")
+async def rag_ingest_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Tokenize a document and index it for blind semantic search.
+
+    Real values are tokenized → stored in vault → never exposed to agent.
+    Embeddings computed on tokenized text.
+    Agent can search and find this document — sees only tokens.
+
+    Body:
+        content:        dict   — {field: real_value} document data
+        doc_type:       str    — patient_record | contract | invoice | etc.
+        title:          str    — optional document title
+        source:         str    — optional source system name
+        classification: str    — pii | phi | pci (default: pii)
+        agent_id:       str    — optional agent ID
+
+    Example:
+        POST /rag/ingest
+        {
+            "doc_type": "patient_record",
+            "content": {
+                "name":      "John Smith",
+                "age":       "67",
+                "diagnosis": "diabetes type 2",
+                "risk":      "high",
+                "mrn":       "MRN-4829103",
+                "notes":     "Patient needs follow-up every 3 months"
+            }
+        }
+
+    Response (safe for agent — no real values):
+        {
+            "doc_id":           "doc_a1b2c3d4",
+            "chunks_created":   2,
+            "fields_tokenized": 3,
+            "safe_preview":     {"name": "[CVT:NAME:A1B2]", "age": "67", ...}
+        }
+    """
+    content  = body.get("content", {})
+    doc_type = body.get("doc_type")
+    if not content:  raise HTTPException(400, "content required")
+    if not doc_type: raise HTTPException(400, "doc_type required")
+
+    return await rag_ingest_document(
+        pool,
+        tenant_id      = tenant["id"],
+        content        = content,
+        doc_type       = doc_type,
+        agent_id       = body.get("agent_id"),
+        title          = body.get("title"),
+        source         = body.get("source"),
+        classification = body.get("classification", "pii"),
+    )
+
+
+@app.post("/rag/ingest/batch")
+async def rag_ingest_batch_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Ingest multiple documents in one call. Max 50 per batch.
+
+    Body:
+        agent_id:  str   — optional
+        documents: list  — [{content, doc_type, title?, source?, classification?}]
+    """
+    documents = body.get("documents", [])
+    if not documents:        raise HTTPException(400, "documents array required")
+    if len(documents) > 50:  raise HTTPException(400, "max 50 documents per batch")
+
+    return await rag_ingest_batch(
+        pool,
+        tenant_id = tenant["id"],
+        documents = documents,
+        agent_id  = body.get("agent_id"),
+    )
+
+
+@app.post("/rag/search")
+async def rag_search_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Semantic search over tokenized documents.
+    Returns matching documents with token references — NEVER real values.
+
+    Agent calls this with natural language queries.
+    Vault searches internally. Agent sees only tokens and metadata.
+
+    Body:
+        query:      str   — natural language search query (required)
+        doc_type:   str   — filter by document type (optional)
+        top_k:      int   — max results to return (default 5)
+        min_score:  float — minimum similarity score 0.0-1.0 (default 0.3)
+
+    Example:
+        POST /rag/search
+        {"query": "find diabetic patients over 65 with high risk"}
+
+    Response:
+        {
+            "results": [
+                {
+                    "doc_id":   "doc_a1b2c3",
+                    "score":    0.89,
+                    "metadata": {
+                        "name":      "[CVT:NAME:A1B2]",
+                        "age":       "67",
+                        "diagnosis": "diabetes type 2",
+                        "risk":      "high"
+                    },
+                    "tokens": ["[CVT:NAME:A1B2]", "[CVT:MRN:C3D4]"]
+                }
+            ],
+            "real_data_seen_by_agent": 0
+        }
+    """
+    query = body.get("query")
+    if not query: raise HTTPException(400, "query required")
+
+    return await rag_search(
+        pool,
+        tenant_id = tenant["id"],
+        query     = query,
+        doc_type  = body.get("doc_type"),
+        top_k     = int(body.get("top_k",     5)),
+        min_score = float(body.get("min_score", 0.3)),
+        agent_id  = body.get("agent_id"),
+    )
+
+
+@app.get("/rag/document/{doc_id}")
+async def rag_get_document_endpoint(doc_id: str, tenant=Depends(get_tenant)):
+    """Get document metadata. Never returns real content."""
+    return await rag_get_document(pool, tenant["id"], doc_id)
+
+
+@app.delete("/rag/document/{doc_id}")
+async def rag_delete_document_endpoint(doc_id: str, tenant=Depends(get_tenant)):
+    """Delete a document and all its chunks from the blind RAG index."""
+    return await rag_delete_document(pool, tenant["id"], doc_id)
+
+
+@app.get("/rag/stats")
+async def rag_stats_endpoint(tenant=Depends(get_tenant)):
+    """Vault RAG statistics — documents indexed, chunks, by type."""
+    return await rag_stats(pool, tenant["id"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.4 — POLICY-DRIVEN SENSITIVITY ENDPOINTS
+# "Sensitivity is policy-defined, not pattern-limited."
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/policy/sensitivity/fields")
+async def register_sensitive_fields(body: dict, tenant=Depends(get_tenant)):
+    """
+    Register custom sensitive field names for your tenant.
+    Any field with these names will ALWAYS be tokenized — automatically.
+
+    No need to specify sensitive_fields= on every request.
+    Register once. Protected forever.
+
+    Body:
+        fields:    list — field names to mark as sensitive
+        prefixes:  list — value prefixes to mark as sensitive (e.g. "EMP-", "LEGAL-")
+        doc_types: list — document types where ALL fields are sensitive
+
+    Example:
+        POST /policy/sensitivity/fields
+        {
+            "fields":    ["employee_badge", "case_ref", "policy_number"],
+            "prefixes":  ["EMP-", "LEGAL-", "POL-", "CASE-"],
+            "doc_types": ["hr_record", "legal_filing", "classified"]
+        }
+
+    After this call:
+        Any field named "employee_badge" → always tokenized
+        Any value starting with "EMP-"   → always tokenized
+        Any document of type "hr_record" → all fields tokenized
+    """
+    return await register_sensitive_type(
+        pool,
+        tenant_id   = tenant["id"],
+        field_names = body.get("fields",    []),
+        prefixes    = body.get("prefixes",  []),
+        doc_types   = body.get("doc_types", []),
+    )
+
+
+@app.post("/policy/sensitivity")
+async def set_sensitivity_policy_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Set full sensitivity policy for your tenant.
+
+    Body:
+        sensitive_fields:      list  — field names always tokenized
+        sensitive_prefixes:    list  — value prefixes always tokenized
+        sensitive_doc_types:   list  — doc types where all fields are tokenized
+        field_classifications: dict  — {"field": "restricted"|"confidential"|"internal"|"public"}
+        strict_mode:           bool  — tokenize everything not explicitly public
+        default_unknown_field: str   — "internal" | "public" (default: internal)
+
+    Field classification levels:
+        restricted   = always tokenize (SSNs, card numbers, MRNs)
+        confidential = tokenize (names, emails, DOBs)
+        internal     = keep in context but don't export (department, role)
+        public       = never tokenize (age range, general category)
+
+    Example:
+        {
+            "sensitive_fields":      ["employee_badge", "case_ref"],
+            "sensitive_prefixes":    ["EMP-", "LEGAL-"],
+            "field_classifications": {
+                "employee_badge": "restricted",
+                "department":     "internal",
+                "office_floor":   "public"
+            },
+            "strict_mode": false
+        }
+    """
+    return await set_sensitivity_policy(
+        pool,
+        tenant_id              = tenant["id"],
+        sensitive_fields       = body.get("sensitive_fields"),
+        sensitive_prefixes     = body.get("sensitive_prefixes"),
+        sensitive_doc_types    = body.get("sensitive_doc_types"),
+        field_classifications  = body.get("field_classifications"),
+        default_unknown_field  = body.get("default_unknown_field"),
+        strict_mode            = body.get("strict_mode"),
+    )
+
+
+@app.get("/policy/sensitivity")
+async def get_sensitivity_policy_endpoint(tenant=Depends(get_tenant)):
+    """Get current sensitivity policy for this tenant."""
+    policy = await _get_sensitivity_policy(pool, tenant["id"])
+    return {
+        "policy":  policy,
+        "message": "Sensitivity is policy-defined, not pattern-limited.",
+    }
+
+
+@app.post("/policy/sensitivity/test")
+async def test_sensitivity_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Test how your policy classifies a set of fields.
+    Shows exactly what would be tokenized vs kept — without actually tokenizing.
+
+    Body:
+        content:          dict — {field: value} to test
+        field_policy:     dict — optional per-request overrides
+        sensitive_fields: list — optional per-request sensitive fields
+        tokenize_all:     bool — optional strict mode flag
+
+    Example:
+        POST /policy/sensitivity/test
+        {
+            "content": {
+                "employee_badge": "EMP-77291",
+                "name":           "John Smith",
+                "department":     "Oncology",
+                "age_range":      "65-75"
+            }
+        }
+
+    Response:
+        {
+            "would_tokenize": {"employee_badge": "EMP-77291", "name": "John Smith"},
+            "would_keep":     {"department": "Oncology", "age_range": "65-75"},
+            "reason": {"employee_badge": "sensitive_prefix_match", "name": "built_in_detection"}
+        }
+    """
+    content = body.get("content", {})
+    if not content:
+        raise HTTPException(400, "content required")
+
+    to_tokenize, to_keep = await resolve_content_sensitivity(
+        pool, tenant["id"], content,
+        field_policy     = body.get("field_policy", {}),
+        sensitive_fields = body.get("sensitive_fields", []),
+        tokenize_all     = body.get("tokenize_all", False),
+    )
+
+    policy = await _get_sensitivity_policy(pool, tenant["id"])
+    reasons = {}
+    for field, value in to_tokenize.items():
+        field_lower = field.lower()
+        if field_lower in [f.lower() for f in policy["sensitive_fields"]]:
+            reasons[field] = "customer_policy_field"
+        elif any(str(value).startswith(p) for p in policy["sensitive_prefixes"]):
+            reasons[field] = "customer_policy_prefix"
+        elif field_lower in _FIELD_HINTS or any(s in field_lower for s in ["name","email","ssn","card","mrn"]):
+            reasons[field] = "built_in_detection"
+        elif body.get("tokenize_all"):
+            reasons[field] = "tokenize_all_mode"
+        else:
+            reasons[field] = "field_policy_override"
+
+    return {
+        "would_tokenize": {k: "WILL_BE_VAULTED" for k in to_tokenize},
+        "would_keep":     to_keep,
+        "tokenize_count": len(to_tokenize),
+        "keep_count":     len(to_keep),
+        "reasons":        reasons,
+        "policy_active":  len(policy["sensitive_fields"]) > 0 or policy["strict_mode"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.5 — CONTEXT-AWARE SENSITIVITY + K-ANONYMITY ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/policy/context")
+async def set_context_rules_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Register context-aware sensitivity rules.
+
+    Same field can be sensitive in one context, not another.
+    "diagnosis=flu" → low risk in general context
+    "diagnosis=HIV" → CRITICAL in healthcare+patient_records context
+
+    Industry profiles auto-applied:
+        healthcare → adds diagnosis, medication, lab_result, etc.
+        fintech    → adds credit_score, salary, transaction, etc.
+        legal      → adds case_number, privilege, settlement, etc.
+        government → adds clearance_level, classification, operation, etc.
+        hr         → adds salary, performance_rating, disciplinary, etc.
+
+    Body:
+        industry:               str  — healthcare|fintech|legal|government|hr
+        data_scope:             str  — patient_records|financial_data|classified
+        classification_level:   str  — hipaa|pci_dss|gdpr|fedramp|confidential
+        extra_sensitive_fields: list — additional fields for this context
+        safe_fields:            list — fields safe in this context (override built-in)
+        context_strict_mode:    bool — tokenize all in this context
+    """
+    return await set_context_rules(
+        pool,
+        tenant_id              = tenant["id"],
+        industry               = body.get("industry"),
+        data_scope             = body.get("data_scope"),
+        classification_level   = body.get("classification_level"),
+        extra_sensitive_fields = body.get("extra_sensitive_fields", []),
+        safe_fields            = body.get("safe_fields", []),
+        context_strict_mode    = body.get("context_strict_mode", False),
+    )
+
+
+@app.get("/policy/context")
+async def get_context_rules_endpoint(
+    industry: str = None,
+    tenant=Depends(get_tenant)
+):
+    """Get context rules. Optionally filter by industry."""
+    rules = await _get_context_rules(pool, tenant["id"], industry=industry)
+    profiles = {k: v for k, v in _INDUSTRY_PROFILES.items()} if not industry \
+               else {industry: _INDUSTRY_PROFILES.get(industry, {})}
+    return {
+        "active_rules":      rules,
+        "industry_profiles": profiles,
+        "supported_industries": list(_INDUSTRY_PROFILES.keys()),
+    }
+
+
+@app.post("/policy/anonymity")
+async def set_anonymity_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Configure k-anonymity protection for RAG search.
+
+    Protects against re-identification attacks even when names are tokenized.
+    Example: "67yo diabetic in zip 30314 with rare condition X" → 1 result = identified
+    Solution: suppress results below k-minimum, auto-bucket quasi-identifiers.
+
+    Body:
+        k_minimum:           int  — min results to return (default 5)
+        suppress_singleton:  bool — suppress single-result queries (default true)
+        auto_bucket:         bool — convert age/zip to ranges (default true)
+        detect_narrowing:    bool — detect narrowing attack patterns (default true)
+        quasi_identifiers:   list — fields that pose re-id risk
+        max_queries_per_min: int  — rate limit per agent (default 30)
+
+    Example:
+        {"k_minimum": 5, "auto_bucket": true, "detect_narrowing": true}
+
+    After this:
+        Query returning 3 results → suppressed (below k=5)
+        age:67 → auto-bucketed to age:65-74
+        zip:30314 → auto-bucketed to zip:303xxx
+        Narrowing sequence detected → blocked
+    """
+    return await set_anonymity_config(
+        pool,
+        tenant_id            = tenant["id"],
+        k_minimum            = body.get("k_minimum"),
+        max_results          = body.get("max_results"),
+        suppress_singleton   = body.get("suppress_singleton"),
+        auto_bucket          = body.get("auto_bucket"),
+        detect_narrowing     = body.get("detect_narrowing"),
+        quasi_identifiers    = body.get("quasi_identifiers"),
+        max_queries_per_min  = body.get("max_queries_per_min"),
+    )
+
+
+@app.get("/policy/anonymity")
+async def get_anonymity_endpoint(tenant=Depends(get_tenant)):
+    """Get current k-anonymity configuration."""
+    config = await _get_anonymity_config(pool, tenant["id"])
+    return {
+        "config":  config,
+        "message": "K-anonymity protects against re-identification even with tokenized data.",
+    }
+
+
+@app.post("/policy/context/test")
+async def test_context_sensitivity_endpoint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Test context-aware sensitivity classification.
+    Shows exactly what gets tokenized given a specific context.
+
+    Body:
+        content:  dict — {field: value}
+        context:  dict — {industry, data_scope, classification_level}
+
+    Example:
+        {
+            "content": {"diagnosis": "diabetes", "age": "67", "name": "John"},
+            "context": {"industry": "healthcare", "data_scope": "patient_records"}
+        }
+    """
+    content = body.get("content", {})
+    context = body.get("context", {})
+    if not content:
+        raise HTTPException(400, "content required")
+
+    to_tokenize, to_keep = await resolve_content_sensitivity_with_context(
+        pool, tenant["id"], content,
+        context          = context,
+        field_policy     = body.get("field_policy", {}),
+        sensitive_fields = body.get("sensitive_fields", []),
+        tokenize_all     = body.get("tokenize_all", False),
+    )
+
+    return {
+        "context":         context,
+        "would_tokenize":  {k: "WILL_BE_VAULTED" for k in to_tokenize},
+        "would_keep":      to_keep,
+        "tokenize_count":  len(to_tokenize),
+        "keep_count":      len(to_keep),
+        "message": "Context-aware classification applied.",
     }
