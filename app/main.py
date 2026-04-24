@@ -933,6 +933,7 @@ async def protect_text(body: TextProtectRequest, request: Request,
     """
     Chrome extension calls this with raw email body.
     Returns tokenized text + list of entities found.
+    Uses the same vault + tokenize_pii already imported in main.py.
     """
     if not body.text or not body.text.strip():
         return {"protected_text": body.text, "entities": []}
@@ -940,21 +941,23 @@ async def protect_text(body: TextProtectRequest, request: Request,
     tenant_id = tenant["id"]
     text      = body.text
 
-    # Use the existing tokenize_pii function from v3
-    from v3 import tokenize_pii
-    async with pool.acquire() as conn:
-        tokenized, entity_map = await tokenize_pii(text, tenant_id)
+    # Use tokenize_pii which is already imported at top of main.py
+    tokenized, entity_map = await tokenize_pii(text, tenant_id)
 
-    entities = [
-        {"token": tok, "original": real, "type": etype}
-        for tok, (real, etype) in entity_map.items()
-    ] if isinstance(entity_map, dict) else []
+    entities = []
+    if isinstance(entity_map, dict):
+        for tok, val in entity_map.items():
+            if isinstance(val, tuple):
+                real, etype = val
+            else:
+                real, etype = val, "AUTO"
+            entities.append({"token": tok, "original": real, "type": etype})
 
     return {
-        "protected_text": tokenized,
-        "original_text":  text,
-        "entities":       entities,
-        "count":          len(entities),
+        "protected_text":          tokenized,
+        "original_text":           text,
+        "entities":                entities,
+        "count":                   len(entities),
         "real_data_seen_by_agent": 0,
     }
 
