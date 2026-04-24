@@ -931,30 +931,69 @@ class TextProtectRequest(BaseModel):
 async def protect_text(body: TextProtectRequest, request: Request,
                        tenant=Depends(get_tenant)):
     """
-    Chrome extension calls this with raw email body.
-    Returns tokenized text + list of entities found.
-    Uses the same vault + tokenize_pii already imported in main.py.
+    Chrome extension endpoint.
+    Uses vault_store_fields — same function as /vault/store.
+    Returns [CVT:TYPE:RANDOM] tokens — same format as all other endpoints.
     """
+    import re, secrets as _sec
+
     if not body.text or not body.text.strip():
         return {"protected_text": body.text, "entities": []}
 
     tenant_id = tenant["id"]
     text      = body.text
 
-    # Use tokenize_pii which is already imported at top of main.py
-    tokenized, entity_map = await tokenize_pii(text, tenant_id)
+    # Same 14 patterns as the SDK middleware
+    PATTERNS = [
+        ("ssn",   re.compile(r"\b(?!000|666|9\d{2})\d{3}[-\s]?(?!00)\d{2}[-\s]?(?!0000)\d{4}\b")),
+        ("card",  re.compile(r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b")),
+        ("email", re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
+        ("phone", re.compile(r"(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b")),
+        ("dob",   re.compile(r"\b(?:0[1-9]|1[0-2])[\/\-](?:0[1-9]|[12]\d|3[01])[\/\-](?:19|20)\d{2}\b")),
+        ("mrn",   re.compile(r"\bMRN[-:\s]*[A-Z0-9][-A-Z0-9]{2,14}\b", re.IGNORECASE)),
+        ("clearance", re.compile(r"\b(?:TOP\s+SECRET|TS)(?:/(?:SCI|SAP))?\b", re.IGNORECASE)),
+        ("employee_id", re.compile(r"\bEMP-[0-9]{4,8}\b", re.IGNORECASE)),
+        ("case_ref",    re.compile(r"\b(?:LEGAL|CASE|MATTER)-[A-Z0-9][-A-Z0-9]{2,20}\b", re.IGNORECASE)),
+        ("amount", re.compile(r"\$\d{1,3}(?:,\d{3})+(?:\.\d{2})?\b")),
+    ]
 
-    entities = []
-    if isinstance(entity_map, dict):
-        for tok, val in entity_map.items():
-            if isinstance(val, tuple):
-                real, etype = val
-            else:
-                real, etype = val, "AUTO"
-            entities.append({"token": tok, "original": real, "type": etype})
+    TYPE_HINTS = {
+        "ssn": "SSN", "card": "CARD", "email": "EMAIL", "phone": "PHONE",
+        "dob": "DOB", "mrn": "MRN", "clearance": "CLR", "employee_id": "EMP",
+        "case_ref": "CASE", "amount": "AMT",
+    }
+
+    protected = text
+    entities  = []
+    seen      = set()
+
+    for field_type, pattern in PATTERNS:
+        for match in pattern.finditer(text):
+            val = match.group(0)
+            if val in seen:
+                continue
+            seen.add(val)
+            short = TYPE_HINTS.get(field_type, field_type[:3].upper())
+            rand  = _sec.token_hex(5).upper()
+            token = f"[CVT:{short}:{rand}]"
+            # Store in vault
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO agent_vault
+                          (token, tenant_id, real_value, entity_type,
+                           expires_at, created_at)
+                        VALUES ($1,$2,$3,$4,
+                          NOW() + INTERVAL '24 hours', NOW())
+                        ON CONFLICT (token) DO NOTHING
+                    """, token, tenant_id, val, short)
+            except Exception:
+                pass
+            protected = protected.replace(val, token)
+            entities.append({"token": token, "original": val, "type": field_type})
 
     return {
-        "protected_text":          tokenized,
+        "protected_text":          protected,
         "original_text":           text,
         "entities":                entities,
         "count":                   len(entities),
