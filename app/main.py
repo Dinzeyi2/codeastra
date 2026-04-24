@@ -917,6 +917,47 @@ async def me(tenant=Depends(get_tenant)):
         row = await conn.fetchrow("SELECT id,name,email,plan,api_key,created_at FROM tenants WHERE id=$1", tenant["id"])
     return dict(row)
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /protect/text — Chrome extension endpoint
+# Accepts raw text, returns tokenized version
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TextProtectRequest(BaseModel):
+    text: str
+
+@app.post("/protect/text")
+async def protect_text(body: TextProtectRequest, request: Request,
+                       tenant=Depends(get_tenant)):
+    """
+    Chrome extension calls this with raw email body.
+    Returns tokenized text + list of entities found.
+    """
+    if not body.text or not body.text.strip():
+        return {"protected_text": body.text, "entities": []}
+
+    tenant_id = tenant["id"]
+    text      = body.text
+
+    # Use the existing tokenize_pii function from v3
+    from v3 import tokenize_pii
+    async with pool.acquire() as conn:
+        tokenized, entity_map = await tokenize_pii(text, tenant_id)
+
+    entities = [
+        {"token": tok, "original": real, "type": etype}
+        for tok, (real, etype) in entity_map.items()
+    ] if isinstance(entity_map, dict) else []
+
+    return {
+        "protected_text": tokenized,
+        "original_text":  text,
+        "entities":       entities,
+        "count":          len(entities),
+        "real_data_seen_by_agent": 0,
+    }
+
 # ══════════════════════════════════════════════════════════════════════════════
 # WORKSPACE SYSTEM — Team management + per-user API keys
 # ══════════════════════════════════════════════════════════════════════════════
