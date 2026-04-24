@@ -918,6 +918,96 @@ async def me(tenant=Depends(get_tenant)):
     return dict(row)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# WORKSPACE SYSTEM — Team management + per-user API keys
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WorkspaceCreate(BaseModel):
+    name:     str
+    industry: Optional[str] = None
+    plan:     str = "starter"
+
+class MemberInvite(BaseModel):
+    email:     str
+    full_name: Optional[str] = None
+    role:      str = "member"
+
+class KeyGenerate(BaseModel):
+    member_email: str
+    label:        Optional[str] = None
+
+class KeyRevoke(BaseModel):
+    reason: Optional[str] = "manual"
+
+@app.post("/workspace/create")
+async def workspace_create(body: WorkspaceCreate, tenant=Depends(get_tenant)):
+    from workspace_system import create_workspace, run_workspace_migrations
+    await run_workspace_migrations(pool)
+    return await create_workspace(pool, tenant["id"], body.name,
+                                  body.industry, body.plan)
+
+@app.get("/workspace/me")
+async def workspace_me(tenant=Depends(get_tenant)):
+    from workspace_system import get_workspace
+    return await get_workspace(pool, tenant["id"])
+
+@app.post("/workspace/invite")
+async def workspace_invite(body: MemberInvite, tenant=Depends(get_tenant)):
+    from workspace_system import invite_member
+    return await invite_member(pool, tenant["id"], body.email,
+                               body.full_name, body.role)
+
+@app.get("/workspace/members")
+async def workspace_members(tenant=Depends(get_tenant)):
+    from workspace_system import list_members
+    return await list_members(pool, tenant["id"])
+
+@app.post("/workspace/keys/generate")
+async def workspace_key_generate(body: KeyGenerate, tenant=Depends(get_tenant)):
+    from workspace_system import generate_key_for_member
+    return await generate_key_for_member(pool, tenant["id"],
+                                         body.member_email, body.label)
+
+@app.delete("/workspace/keys/{key_id}")
+async def workspace_key_revoke(key_id: str, body: KeyRevoke = KeyRevoke(),
+                                tenant=Depends(get_tenant)):
+    from workspace_system import revoke_key
+    return await revoke_key(pool, tenant["id"], key_id, body.reason)
+
+@app.get("/workspace/usage")
+async def workspace_usage(tenant=Depends(get_tenant)):
+    from workspace_system import get_usage_stats
+    return await get_usage_stats(pool, tenant["id"])
+
+@app.post("/workspace/keys/verify")
+async def workspace_key_verify(request: Request):
+    """
+    Called by Chrome extension to verify a workspace key is valid.
+    Returns member info if valid.
+    Public endpoint — no auth required (key IS the auth).
+    """
+    from workspace_system import verify_workspace_key
+    body = await request.json()
+    raw_key = body.get("api_key", "")
+    if not raw_key:
+        return JSONResponse(status_code=400, content={"error": "missing api_key"})
+    result = await verify_workspace_key(pool, raw_key)
+    if not result:
+        return JSONResponse(status_code=401,
+                            content={"error": "invalid_key",
+                                     "detail": "Key not found, revoked, or expired."})
+    return {
+        "valid":          True,
+        "email":          result["email"],
+        "full_name":      result["full_name"],
+        "role":           result["role"],
+        "workspace":      result["workspace_name"],
+        "industry":       result["industry"],
+        "allowed_actions": result["allowed_actions"],
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PROTECT + INVOKE
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/protect")
