@@ -1000,6 +1000,47 @@ async def protect_text(body: TextProtectRequest, request: Request,
         "real_data_seen_by_agent": 0,
     }
 
+
+@app.post("/vault/resolve")
+async def vault_resolve_token(request: Request, tenant=Depends(get_tenant)):
+    """
+    Simple token resolution for Chrome extension.
+    Accepts: {"token": "[CVT:SSN:xxx]"}
+    Returns: {"real_value": "234-56-7890", "authorized": true}
+    """
+    body = await request.json()
+    token = body.get("token", "").strip()
+
+    if not token:
+        return JSONResponse(status_code=400,
+                           content={"error": "token required"})
+
+    tenant_id = tenant["id"]
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT real_value, entity_type, expires_at
+            FROM agent_vault
+            WHERE token = $1 AND tenant_id = $2
+        """, token, tenant_id)
+
+    if not row:
+        return JSONResponse(status_code=404,
+                           content={"authorized": False,
+                                    "error": "Token not found or expired"})
+
+    from datetime import datetime, timezone
+    if row["expires_at"] and row["expires_at"] < datetime.now(timezone.utc):
+        return JSONResponse(status_code=403,
+                           content={"authorized": False,
+                                    "error": "Token expired"})
+
+    return {
+        "authorized":  True,
+        "real_value":  row["real_value"],
+        "entity_type": row["entity_type"],
+        "token":       token,
+    }
 # ══════════════════════════════════════════════════════════════════════════════
 # WORKSPACE SYSTEM — Team management + per-user API keys
 # ══════════════════════════════════════════════════════════════════════════════
