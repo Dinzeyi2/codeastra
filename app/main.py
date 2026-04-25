@@ -1041,6 +1041,47 @@ async def vault_resolve_token(request: Request, tenant=Depends(get_tenant)):
         "entity_type": row["entity_type"],
         "token":       token,
     }
+
+@app.post("/vault/resolve-batch")
+async def vault_resolve_batch(request: Request, tenant=Depends(get_tenant)):
+    """
+    Resolve multiple tokens at once.
+    Called by Chrome extension auto-reveal.
+    Only returns values the caller's tenant owns.
+    Input:  {"tokens": ["[CVT:SSN:xxx]", "[CVT:EMAIL:xxx]", ...]}
+    Output: {"results": {"[CVT:SSN:xxx]": "234-56-7890", "[CVT:EMAIL:xxx]": null}}
+    null means not found / different tenant / expired.
+    """
+    from datetime import datetime, timezone
+    body   = await request.json()
+    tokens = body.get("tokens", [])
+    if not tokens:
+        return {"results": {}}
+
+    tenant_id = tenant["id"]
+    results   = {}
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT token, real_value, expires_at
+            FROM agent_vault
+            WHERE token = ANY($1::text[])
+              AND tenant_id = $2
+        """, tokens, tenant_id)
+
+    now = datetime.now(timezone.utc)
+    found = {}
+    for row in rows:
+        if row["expires_at"] and row["expires_at"] < now:
+            found[row["token"]] = None   # expired
+        else:
+            found[row["token"]] = row["real_value"]
+
+    # Return all requested tokens — None for ones not found/authorized
+    for tok in tokens:
+        results[tok] = found.get(tok, None)
+
+    return {"results": results}
 # ══════════════════════════════════════════════════════════════════════════════
 # WORKSPACE SYSTEM — Team management + per-user API keys
 # ══════════════════════════════════════════════════════════════════════════════
