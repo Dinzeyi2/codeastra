@@ -5284,3 +5284,1320 @@ async def test_context_sensitivity_endpoint(body: dict, tenant=Depends(get_tenan
         "keep_count":      len(to_keep),
         "message": "Context-aware classification applied.",
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OMEGA TOKEN ENDPOINTS — v5.0
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from app.v3 import (
+        OMEGA_TOKEN_MIGRATIONS,
+        mint_omega_token,
+        mint_omega_tokens_batch,
+        execute_omega_token,
+        get_omega_token_metadata,
+        revoke_omega_token,
+        get_omega_token_audit,
+        omega_token_transition,
+        omega_token_approve,
+        get_omega_stats,
+    )
+except ImportError:
+    OMEGA_TOKEN_MIGRATIONS = []
+    async def mint_omega_token(pool, tid, **kw):          return {"error": "omega not loaded"}
+    async def mint_omega_tokens_batch(pool, tid, **kw):   return []
+    async def execute_omega_token(pool, tid, **kw):       return {"error": "omega not loaded"}
+    async def get_omega_token_metadata(pool, tid, **kw):  return {}
+    async def revoke_omega_token(pool, tid, **kw):        return {"error": "omega not loaded"}
+    async def get_omega_token_audit(pool, tid, **kw):     return {}
+    async def omega_token_transition(pool, tid, **kw):    return {"error": "omega not loaded"}
+    async def omega_token_approve(pool, tid, **kw):       return {"error": "omega not loaded"}
+    async def get_omega_stats(pool, tid):                 return {}
+
+
+# ── Run omega migrations on startup ───────────────────────────────────────────
+
+@app.on_event("startup")
+async def run_omega_migrations():
+    try:
+        async with pool.acquire() as conn:
+            for sql in OMEGA_TOKEN_MIGRATIONS:
+                await conn.execute(sql)
+    except Exception as e:
+        print(f"[omega] migration warning: {e}")
+
+
+# ── POST /omega/mint ───────────────────────────────────────────────────────────
+
+@app.post("/omega/mint")
+async def omega_mint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Mint an OmegaToken — one token with any combination of 7 paradigms:
+    composite, conditional, federated, temporal, agentic, proof, orchestration.
+
+    Required: real_value, data_type
+    Optional: any paradigm config + base policy
+    """
+    if "real_value" not in body:
+        raise HTTPException(400, "real_value required")
+    if "data_type" not in body:
+        raise HTTPException(400, "data_type required")
+
+    try:
+        return await mint_omega_token(
+            pool,
+            tenant_id          = tenant["id"],
+            real_value         = body["real_value"],
+            data_type          = body["data_type"],
+            agent_id           = body.get("agent_id"),
+            allowed_actions    = body.get("allowed_actions", []),
+            allowed_targets    = body.get("allowed_targets", []),
+            allowed_fields     = body.get("allowed_fields",  []),
+            max_uses           = body.get("max_uses",        1),
+            ttl_seconds        = body.get("ttl_seconds",     86400),
+            semantic_label     = body.get("semantic_label"),
+            audit_reveal       = body.get("audit_reveal",    True),
+            composite_graph    = body.get("composite_graph"),
+            conditions         = body.get("conditions"),
+            federated_policy   = body.get("federated_policy"),
+            lifecycle_phases   = body.get("lifecycle_phases"),
+            initial_phase      = body.get("initial_phase"),
+            agent_instructions = body.get("agent_instructions"),
+            proof_facts        = body.get("proof_facts"),
+            pipeline_policy    = body.get("pipeline_policy"),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── POST /omega/mint/batch ─────────────────────────────────────────────────────
+
+@app.post("/omega/mint/batch")
+async def omega_mint_batch(body: dict, tenant=Depends(get_tenant)):
+    """Mint up to 100 OmegaTokens in one call."""
+    tokens = body.get("tokens", [])
+    if not tokens:
+        raise HTTPException(400, "tokens list required")
+    if len(tokens) > 100:
+        raise HTTPException(400, "Maximum 100 tokens per batch")
+    try:
+        return {
+            "results": await mint_omega_tokens_batch(
+                pool, tenant["id"], tokens, body.get("agent_id")
+            ),
+            "count": len(tokens),
+        }
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── GET /omega/{token_id} ──────────────────────────────────────────────────────
+
+@app.get("/omega/{token_id}")
+async def omega_get(token_id: str, tenant=Depends(get_tenant)):
+    """
+    Inspect OmegaToken metadata. Safe for agent consumption.
+    Never returns real_value.
+    """
+    result = await get_omega_token_metadata(pool, tenant["id"], token_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+# ── POST /omega/{token_id}/execute ────────────────────────────────────────────
+
+@app.post("/omega/{token_id}/execute")
+async def omega_execute(token_id: str, body: dict, tenant=Depends(get_tenant)):
+    """
+    Policy-gated execution of an OmegaToken. Runs all 9 gates.
+    Called by trusted executor ONLY — never by agent.
+
+    Body:
+      action_type: str       — what action is being taken
+      target_url:  str       — where real value will be sent
+      field_name:  str       — which field to fill
+      agent_id:    str       — which agent is requesting (for orchestration gate)
+      org_id:      str       — which org is requesting (for federated gate)
+      context:     dict      — runtime context for conditional evaluation
+      proof_only:  bool      — if True: return proof facts, skip gates, skip real value
+    """
+    return await execute_omega_token(
+        pool,
+        tenant_id   = tenant["id"],
+        token_id    = token_id,
+        action_type = body.get("action_type"),
+        target_url  = body.get("target_url"),
+        field_name  = body.get("field_name"),
+        agent_id    = body.get("agent_id"),
+        org_id      = body.get("org_id"),
+        context     = body.get("context", {}),
+        proof_only  = body.get("proof_only", False),
+    )
+
+
+# ── POST /omega/{token_id}/approve ────────────────────────────────────────────
+
+@app.post("/omega/{token_id}/approve")
+async def omega_approve(token_id: str, body: dict, tenant=Depends(get_tenant)):
+    """
+    Federated paradigm: record an org's approval for this token.
+    Required: org_id
+    Optional: approved_by (person/system granting approval)
+    """
+    if "org_id" not in body:
+        raise HTTPException(400, "org_id required")
+    result = await omega_token_approve(
+        pool, tenant["id"], token_id,
+        org_id      = body["org_id"],
+        approved_by = body.get("approved_by"),
+    )
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+# ── POST /omega/{token_id}/transition ─────────────────────────────────────────
+
+@app.post("/omega/{token_id}/transition")
+async def omega_transition(token_id: str, body: dict, tenant=Depends(get_tenant)):
+    """
+    Temporal paradigm: advance token to next lifecycle phase.
+    Required: to_phase
+    Optional: triggered_by
+    """
+    if "to_phase" not in body:
+        raise HTTPException(400, "to_phase required")
+    result = await omega_token_transition(
+        pool, tenant["id"], token_id,
+        to_phase     = body["to_phase"],
+        triggered_by = body.get("triggered_by"),
+    )
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+# ── GET /omega/{token_id}/proof ───────────────────────────────────────────────
+
+@app.get("/omega/{token_id}/proof")
+async def omega_proof(token_id: str, tenant=Depends(get_tenant)):
+    """
+    Proof paradigm: return derived facts without revealing real value.
+    No policy gates required — proofs are safe for agent consumption.
+    """
+    result = await execute_omega_token(
+        pool, tenant["id"], token_id, proof_only=True
+    )
+    if not result.get("authorized"):
+        raise HTTPException(400, result.get("deny_reason", "Proof not available"))
+    return result
+
+
+# ── GET /omega/{token_id}/instructions ────────────────────────────────────────
+
+@app.get("/omega/{token_id}/instructions")
+async def omega_instructions(token_id: str, tenant=Depends(get_tenant)):
+    """
+    Agentic paradigm: return agent instructions for this token.
+    Safe for agent consumption — no real value returned.
+    """
+    meta = await get_omega_token_metadata(pool, tenant["id"], token_id)
+    if "error" in meta:
+        raise HTTPException(404, meta["error"])
+    if "agent_context" not in meta:
+        raise HTTPException(400, "Token does not have agentic paradigm configured")
+    return {
+        "token_id":       token_id,
+        "agent_context":  meta["agent_context"],
+        "data_type":      meta["data_type"],
+        "semantic_label": meta["semantic_label"],
+    }
+
+
+# ── GET /omega/{token_id}/pipeline ────────────────────────────────────────────
+
+@app.get("/omega/{token_id}/pipeline")
+async def omega_pipeline(
+    token_id: str,
+    agent_id: str = None,
+    tenant=Depends(get_tenant)
+):
+    """
+    Orchestration paradigm: return pipeline permissions.
+    If agent_id provided: return only that agent's permissions.
+    """
+    meta = await get_omega_token_metadata(pool, tenant["id"], token_id)
+    if "error" in meta:
+        raise HTTPException(404, meta["error"])
+    if "pipeline_agents" not in meta:
+        raise HTTPException(400, "Token does not have orchestration paradigm configured")
+
+    # Get full pipeline from DB
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT pipeline_policy FROM omega_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant["id"]
+        )
+    import json
+    pipeline = row["pipeline_policy"] if isinstance(row["pipeline_policy"], dict) \
+               else json.loads(row["pipeline_policy"])
+
+    if agent_id:
+        perms = pipeline.get(agent_id, [])
+        return {
+            "token_id":   token_id,
+            "agent_id":   agent_id,
+            "permissions": perms,
+            "has_access": bool(perms),
+        }
+    return {
+        "token_id":        token_id,
+        "pipeline_policy": pipeline,
+        "agents":          list(pipeline.keys()),
+    }
+
+
+# ── GET /omega/{token_id}/audit ───────────────────────────────────────────────
+
+@app.get("/omega/{token_id}/audit")
+async def omega_audit(token_id: str, tenant=Depends(get_tenant)):
+    """Full audit trail for an OmegaToken — reveals, events, approvals."""
+    return await get_omega_token_audit(pool, tenant["id"], token_id)
+
+
+# ── DELETE /omega/{token_id} ──────────────────────────────────────────────────
+
+@app.delete("/omega/{token_id}")
+async def omega_revoke(
+    token_id: str,
+    reason: str = "manual_revocation",
+    tenant=Depends(get_tenant)
+):
+    """Immediately revoke an OmegaToken. No further reveals possible."""
+    result = await revoke_omega_token(pool, tenant["id"], token_id, reason)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+# ── GET /omega/stats ──────────────────────────────────────────────────────────
+
+@app.get("/omega/stats")
+async def omega_statistics(tenant=Depends(get_tenant)):
+    """OmegaToken usage statistics."""
+    return await get_omega_stats(pool, tenant["id"])
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THINKING TOKEN ENDPOINTS — v6.0
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from app.v3 import (
+        THINKING_TOKEN_MIGRATIONS,
+        mint_thinking_token,
+        mint_thinking_tokens_batch,
+        query_thinking_tokens,
+        query_thinking_cohort,
+        get_thinking_token_metadata,
+        get_thinking_token_memory,
+        get_thinking_token_audit,
+        check_thinking_signals,
+        evolve_thinking_token,
+        revoke_thinking_token,
+        get_thinking_stats,
+    )
+except ImportError:
+    THINKING_TOKEN_MIGRATIONS = []
+    async def mint_thinking_token(pool, tid, **kw):         return {"error": "thinking not loaded"}
+    async def mint_thinking_tokens_batch(pool, tid, **kw):  return []
+    async def query_thinking_tokens(pool, tid, **kw):       return {"matched_tokens": []}
+    async def query_thinking_cohort(pool, tid, **kw):       return {"matched_tokens": []}
+    async def get_thinking_token_metadata(pool, tid, **kw): return {}
+    async def get_thinking_token_memory(pool, tid, **kw):   return {}
+    async def get_thinking_token_audit(pool, tid, **kw):    return {}
+    async def check_thinking_signals(pool, tid, **kw):      return {"signals": []}
+    async def evolve_thinking_token(pool, tid, **kw):       return {}
+    async def revoke_thinking_token(pool, tid, **kw):       return {}
+    async def get_thinking_stats(pool, tid):                return {}
+
+
+@app.on_event("startup")
+async def run_thinking_migrations():
+    try:
+        async with pool.acquire() as conn:
+            for sql in THINKING_TOKEN_MIGRATIONS:
+                await conn.execute(sql)
+    except Exception as e:
+        print(f"[thinking] migration warning: {e}")
+
+
+# ── POST /think/mint ──────────────────────────────────────────────────────────
+
+@app.post("/think/mint")
+async def thinking_mint(body: dict, tenant=Depends(get_tenant)):
+    """
+    Mint a ThinkingToken.
+
+    Required:
+      real_value: str   — the actual sensitive data (goes to vault, never seen again)
+      data_type:  str   — person_name, ssn, email, etc.
+      facts:      dict  — derived truths about the real value
+
+    Optional:
+      cohort_id:         str   — group this token with others
+      rules:             list  — explicit matching rules
+      signal_conditions: list  — when to proactively flag
+      max_uses:          int   — -1 = unlimited
+      ttl_seconds:       int
+
+    Example facts for a user record:
+      {
+        "birth_year": 1994,
+        "age": 30,
+        "risk": "high",
+        "region": "atlanta",
+        "department": "engineering",
+        "salary_band": "senior",
+        "over_18": true,
+        "subscribed": true
+      }
+    """
+    if "real_value" not in body:
+        raise HTTPException(400, "real_value required")
+    if "data_type" not in body:
+        raise HTTPException(400, "data_type required")
+    if "facts" not in body or not isinstance(body["facts"], dict):
+        raise HTTPException(400, "facts dict required — derived truths about the real value")
+
+    try:
+        return await mint_thinking_token(
+            pool,
+            tenant_id         = tenant["id"],
+            real_value        = body["real_value"],
+            data_type         = body["data_type"],
+            facts             = body["facts"],
+            agent_id          = body.get("agent_id"),
+            cohort_id         = body.get("cohort_id"),
+            rules             = body.get("rules"),
+            signal_conditions = body.get("signal_conditions"),
+            allowed_actions   = body.get("allowed_actions", []),
+            max_uses          = body.get("max_uses",    -1),
+            ttl_seconds       = body.get("ttl_seconds", 2592000),
+            semantic_label    = body.get("semantic_label"),
+            audit_queries     = body.get("audit_queries", True),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── POST /think/mint/batch ────────────────────────────────────────────────────
+
+@app.post("/think/mint/batch")
+async def thinking_mint_batch(body: dict, tenant=Depends(get_tenant)):
+    """
+    Mint up to 100 ThinkingTokens in one call.
+
+    Body: {
+      tokens: [{real_value, data_type, facts, cohort_id?, rules?, ...}, ...],
+      cohort_id?: str   — apply to all tokens if not set per-token
+      agent_id?:  str
+    }
+    """
+    tokens = body.get("tokens", [])
+    if not tokens:
+        raise HTTPException(400, "tokens list required")
+    if len(tokens) > 100:
+        raise HTTPException(400, "Maximum 100 tokens per batch")
+    for i, t in enumerate(tokens):
+        if "real_value" not in t:
+            raise HTTPException(400, f"tokens[{i}] missing real_value")
+        if "data_type" not in t:
+            raise HTTPException(400, f"tokens[{i}] missing data_type")
+        if "facts" not in t or not isinstance(t["facts"], dict):
+            raise HTTPException(400, f"tokens[{i}] missing facts dict")
+    try:
+        results = await mint_thinking_tokens_batch(
+            pool, tenant["id"], tokens,
+            agent_id  = body.get("agent_id"),
+            cohort_id = body.get("cohort_id"),
+        )
+        return {"results": results, "count": len(results)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── POST /think/query ─────────────────────────────────────────────────────────
+
+@app.post("/think/query")
+async def thinking_query(body: dict, tenant=Depends(get_tenant)):
+    """
+    Ask a natural language question. Tokens evaluate themselves.
+    Returns matching token_ids. Never returns real values.
+
+    Body: {
+      query:           str   — "find all users born in 1994 who are high risk"
+      cohort_id?:      str   — limit to a cohort
+      data_type?:      str   — limit to a data type
+      token_ids?:      list  — limit to specific tokens
+      session_id?:     str
+      top_k?:          int   — max results (default 100)
+      include_reasons?: bool — include why each token matched
+    }
+
+    Supported query patterns:
+      "born in 1994"
+      "age over 30" / "age under 25"
+      "high risk" / "low risk"
+      "salary above 100000"
+      "from Atlanta"
+      "department engineering"
+      "subscribed" / "not subscribed"
+      "diagnosis diabetes"
+      "score between 80 and 100"
+    """
+    if "query" not in body:
+        raise HTTPException(400, "query required")
+
+    return await query_thinking_tokens(
+        pool,
+        tenant_id       = tenant["id"],
+        query           = body["query"],
+        cohort_id       = body.get("cohort_id"),
+        data_type       = body.get("data_type"),
+        token_ids       = body.get("token_ids"),
+        session_id      = body.get("session_id"),
+        top_k           = body.get("top_k", 100),
+        include_reasons = body.get("include_reasons", False),
+    )
+
+
+# ── POST /think/cohort ────────────────────────────────────────────────────────
+
+@app.post("/think/cohort")
+async def thinking_cohort_query(body: dict, tenant=Depends(get_tenant)):
+    """
+    Query a named cohort of ThinkingTokens.
+
+    Body: {
+      cohort_id: str
+      query:     str
+      top_k?:    int
+      include_reasons?: bool
+    }
+    """
+    if "cohort_id" not in body:
+        raise HTTPException(400, "cohort_id required")
+    if "query" not in body:
+        raise HTTPException(400, "query required")
+
+    return await query_thinking_cohort(
+        pool,
+        tenant_id       = tenant["id"],
+        cohort_id       = body["cohort_id"],
+        query           = body["query"],
+        session_id      = body.get("session_id"),
+        top_k           = body.get("top_k", 100),
+        include_reasons = body.get("include_reasons", False),
+    )
+
+
+# ── GET /think/{token_id} ─────────────────────────────────────────────────────
+
+@app.get("/think/{token_id}")
+async def thinking_get(token_id: str, tenant=Depends(get_tenant)):
+    """
+    Inspect a ThinkingToken. Safe for agent consumption.
+    Returns facts summary, query stats, evolution version.
+    Never returns real_value.
+    """
+    result = await get_thinking_token_metadata(pool, tenant["id"], token_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+# ── GET /think/{token_id}/memory ──────────────────────────────────────────────
+
+@app.get("/think/{token_id}/memory")
+async def thinking_memory(
+    token_id:   str,
+    session_id: str = None,
+    limit:      int = 50,
+    tenant=Depends(get_tenant)
+):
+    """
+    What has this token learned?
+    Returns query history, match patterns, evolution data.
+    """
+    result = await get_thinking_token_memory(
+        pool, tenant["id"], token_id, session_id, limit
+    )
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+# ── POST /think/{token_id}/evolve ─────────────────────────────────────────────
+
+@app.post("/think/{token_id}/evolve")
+async def thinking_evolve(token_id: str, tenant=Depends(get_tenant)):
+    """
+    Manually trigger an evolution cycle.
+    Token recomputes its learned patterns from full query history.
+    """
+    result = await evolve_thinking_token(pool, tenant["id"], token_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+# ── POST /think/signal ────────────────────────────────────────────────────────
+
+@app.post("/think/signal")
+async def thinking_signal(body: dict, tenant=Depends(get_tenant)):
+    """
+    Ask tokens if any of them want to proactively signal.
+    Tokens check their own signal_conditions autonomously.
+    Returns list of tokens that raised their hand.
+
+    Body: {
+      cohort_id?: str
+      data_type?: str
+    }
+    """
+    return await check_thinking_signals(
+        pool,
+        tenant_id = tenant["id"],
+        cohort_id = body.get("cohort_id"),
+        data_type = body.get("data_type"),
+    )
+
+
+# ── GET /think/{token_id}/audit ───────────────────────────────────────────────
+
+@app.get("/think/{token_id}/audit")
+async def thinking_audit(token_id: str, limit: int = 100, tenant=Depends(get_tenant)):
+    """Full query history for a ThinkingToken."""
+    return await get_thinking_token_audit(pool, tenant["id"], token_id, limit)
+
+
+# ── DELETE /think/{token_id} ──────────────────────────────────────────────────
+
+@app.delete("/think/{token_id}")
+async def thinking_revoke(
+    token_id: str,
+    reason:   str = "manual_revocation",
+    tenant=Depends(get_tenant)
+):
+    """Revoke a ThinkingToken. It will no longer respond to queries."""
+    result = await revoke_thinking_token(pool, tenant["id"], token_id, reason)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+# ── GET /think/stats ──────────────────────────────────────────────────────────
+
+@app.get("/think/stats")
+async def thinking_statistics(tenant=Depends(get_tenant)):
+    """System-wide ThinkingToken statistics."""
+    return await get_thinking_stats(pool, tenant["id"])
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OLLAMA HYBRID ENDPOINTS — v6.1
+# Replaces /think/query and /think/cohort with hybrid versions.
+# Rule-based first. Ollama fallback for complex queries.
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from app.v3 import (
+        query_thinking_tokens_hybrid,
+        get_ollama_status,
+        ollama_is_available,
+        _OLLAMA_MODEL,
+        _OLLAMA_URL,
+    )
+except ImportError:
+    async def query_thinking_tokens_hybrid(pool, tid, **kw): return {"matched_tokens": [], "error": "hybrid not loaded"}
+    async def get_ollama_status(): return {"available": False}
+    async def ollama_is_available(): return False
+    _OLLAMA_MODEL = "phi3.5"
+    _OLLAMA_URL   = "http://ollama:11434"
+
+
+# ── POST /think/query/hybrid ──────────────────────────────────────────────────
+# This is the NEW primary query endpoint.
+# Use this instead of /think/query for production.
+
+@app.post("/think/query/hybrid")
+async def thinking_query_hybrid(body: dict, tenant=Depends(get_tenant)):
+    """
+    Hybrid ThinkingToken query — production endpoint.
+
+    Rule-based first (instant, free, no external calls).
+    Ollama fallback ONLY when rule-based can't parse the query.
+    Ollama sees: facts dict only. Never real_value. Ever.
+
+    Body:
+      query:           str   — natural language question
+      cohort_id?:      str   — limit to cohort
+      data_type?:      str   — limit to data type
+      token_ids?:      list  — limit to specific tokens
+      session_id?:     str
+      top_k?:          int   — max results (default 100)
+      include_reasons?: bool
+      use_ollama?:     bool  — set False to force rule-based only (default True)
+
+    Simple queries → rule-based → free, <1ms per token:
+      "born in 1994"
+      "age over 30"
+      "high risk"
+      "salary above 100000"
+      "from Atlanta"
+
+    Complex queries → Ollama fallback → facts only sent, ~200ms total:
+      "patients who might need urgent attention"
+      "users showing signs of churn"
+      "employees likely eligible for promotion"
+    """
+    if "query" not in body:
+        raise HTTPException(400, "query required")
+
+    return await query_thinking_tokens_hybrid(
+        pool,
+        tenant_id       = tenant["id"],
+        query           = body["query"],
+        cohort_id       = body.get("cohort_id"),
+        data_type       = body.get("data_type"),
+        token_ids       = body.get("token_ids"),
+        session_id      = body.get("session_id"),
+        top_k           = body.get("top_k", 100),
+        include_reasons = body.get("include_reasons", False),
+        use_ollama      = body.get("use_ollama", True),
+    )
+
+
+# ── POST /think/cohort/hybrid ─────────────────────────────────────────────────
+
+@app.post("/think/cohort/hybrid")
+async def thinking_cohort_hybrid(body: dict, tenant=Depends(get_tenant)):
+    """
+    Hybrid cohort query. Rule-based first, Ollama fallback.
+    Same as /think/query/hybrid but scoped to a cohort.
+    """
+    if "cohort_id" not in body:
+        raise HTTPException(400, "cohort_id required")
+    if "query" not in body:
+        raise HTTPException(400, "query required")
+
+    result = await query_thinking_tokens_hybrid(
+        pool,
+        tenant_id       = tenant["id"],
+        query           = body["query"],
+        cohort_id       = body["cohort_id"],
+        session_id      = body.get("session_id"),
+        top_k           = body.get("top_k", 100),
+        include_reasons = body.get("include_reasons", False),
+        use_ollama      = body.get("use_ollama", True),
+    )
+    result["cohort_id"] = body["cohort_id"]
+    return result
+
+
+# ── GET /think/ollama/status ──────────────────────────────────────────────────
+
+@app.get("/think/ollama/status")
+async def thinking_ollama_status(tenant=Depends(get_tenant)):
+    """
+    Check Ollama service status.
+    Shows available models, active model, and data safety confirmation.
+    """
+    return await get_ollama_status()
+
+
+# ── GET /think/ollama/setup ───────────────────────────────────────────────────
+
+@app.get("/think/ollama/setup")
+async def thinking_ollama_setup(tenant=Depends(get_tenant)):
+    """
+    Railway setup instructions for Ollama.
+    Returns exact steps to add Ollama to your Railway project.
+    """
+    status = await get_ollama_status()
+    return {
+        "ollama_available": status.get("available", False),
+        "current_url":      _OLLAMA_URL,
+        "current_model":    _OLLAMA_MODEL,
+        "data_safety": {
+            "real_value_sent_to_ollama": False,
+            "facts_sent_to_ollama":      True,
+            "agent_sees_real_value":     False,
+            "guarantee": "Ollama only receives derived facts you define at mint time. Real values stay in PostgreSQL vault.",
+        },
+        "railway_setup_steps": [
+            {
+                "step": 1,
+                "action": "Add Ollama service to Railway project",
+                "detail": "In Railway dashboard → New Service → Docker Image → ollama/ollama",
+            },
+            {
+                "step": 2,
+                "action": "Set Ollama service name",
+                "detail": "Name it 'ollama' so Railway DNS resolves to http://ollama:11434",
+            },
+            {
+                "step": 3,
+                "action": "Pull the model on first boot",
+                "detail": "Add start command: ollama serve & sleep 5 && ollama pull phi3.5 && wait",
+                "alternative": "ollama pull llama3.2:1b  (smaller, faster, less accurate)",
+            },
+            {
+                "step": 4,
+                "action": "Set env vars on your main Codeastra service",
+                "detail": "OLLAMA_URL=http://ollama:11434\nOLLAMA_MODEL=phi3.5",
+            },
+            {
+                "step": 5,
+                "action": "Verify",
+                "detail": "GET /think/ollama/status → should show available: true",
+            },
+        ],
+        "model_recommendations": [
+            {
+                "model":    "phi3.5",
+                "size":     "2.2GB RAM",
+                "speed":    "~150ms per query",
+                "accuracy": "excellent for YES/NO classification",
+                "cost":     "$0 — runs on Railway server",
+                "recommended": True,
+            },
+            {
+                "model":    "llama3.2:1b",
+                "size":     "1.3GB RAM",
+                "speed":    "~80ms per query",
+                "accuracy": "good for simple queries",
+                "cost":     "$0 — runs on Railway server",
+                "recommended": False,
+                "note":     "Use if Railway RAM is tight",
+            },
+            {
+                "model":    "llama3.2:3b",
+                "size":     "2.0GB RAM",
+                "speed":    "~200ms per query",
+                "accuracy": "very good",
+                "cost":     "$0 — runs on Railway server",
+                "recommended": False,
+            },
+        ],
+        "what_ollama_sees": {
+            "example_prompt": (
+                "You are a data matcher. Answer only YES or NO.\n"
+                "Facts: birth_year=1994, risk=high, diagnosis=diabetes, region=south\n"
+                "Query: patients who might need urgent attention\n"
+                "Do these facts match this query? Answer YES or NO only."
+            ),
+            "real_value_in_prompt": False,
+            "ssn_in_prompt":        False,
+            "name_in_prompt":       False,
+        },
+    }
+
+
+# ── POST /think/ollama/test ───────────────────────────────────────────────────
+
+@app.post("/think/ollama/test")
+async def thinking_ollama_test(body: dict, tenant=Depends(get_tenant)):
+    """
+    Test Ollama evaluation directly.
+    Provide facts and a query — see what Ollama returns.
+    Real values NEVER sent — only use derived facts here.
+
+    Body:
+      facts: dict   — e.g. {"birth_year": 1994, "risk": "high"}
+      query: str    — e.g. "patients who need urgent attention"
+    """
+    if "facts" not in body:
+        raise HTTPException(400, "facts dict required")
+    if "query" not in body:
+        raise HTTPException(400, "query required")
+
+    # Safety check — refuse if facts look like they contain real values
+    dangerous_keys = ["ssn", "name", "card", "password", "mrn", "dob", "email", "phone"]
+    facts = body["facts"]
+    flagged = [k for k in facts if any(d in k.lower() for d in dangerous_keys)]
+    if flagged:
+        raise HTTPException(400, (
+            f"Facts contain potentially sensitive keys: {flagged}. "
+            f"Facts should only contain derived values like birth_year, risk, region. "
+            f"Never put real values in facts."
+        ))
+
+    available = await ollama_is_available()
+    if not available:
+        raise HTTPException(503, (
+            "Ollama service not available. "
+            "See GET /think/ollama/setup for Railway setup instructions."
+        ))
+
+    from app.v3 import _ollama_evaluate
+    matched, reason = await _ollama_evaluate(facts, body["query"])
+
+    return {
+        "facts":           facts,
+        "query":           body["query"],
+        "matched":         matched,
+        "reason":          reason,
+        "model":           _OLLAMA_MODEL,
+        "real_value_sent": False,
+        "data_safe":       True,
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THINKING EXECUTOR ENDPOINTS — v7.0
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from app.v3 import (
+        THINKING_EXECUTOR_MIGRATIONS,
+        run_thinking_executor,
+        run_thinking_executor_cohort,
+        register_executor_integration,
+        register_executor_rule,
+        get_executor_learning,
+        _SUPPORTED_INTEGRATIONS,
+    )
+except ImportError:
+    THINKING_EXECUTOR_MIGRATIONS = []
+    async def run_thinking_executor(pool, tid, **kw):         return {"error": "executor not loaded"}
+    async def run_thinking_executor_cohort(pool, tid, **kw):  return {"error": "executor not loaded"}
+    async def register_executor_integration(pool, tid, **kw): return {"error": "executor not loaded"}
+    async def register_executor_rule(pool, tid, **kw):        return {"error": "executor not loaded"}
+    async def get_executor_learning(pool, tid):               return {}
+    _SUPPORTED_INTEGRATIONS = {}
+
+
+@app.on_event("startup")
+async def run_executor_migrations():
+    try:
+        async with pool.acquire() as conn:
+            for sql in THINKING_EXECUTOR_MIGRATIONS:
+                await conn.execute(sql)
+    except Exception as e:
+        print(f"[executor] migration warning: {e}")
+
+
+# ── POST /executor/integrations ───────────────────────────────────────────────
+
+@app.post("/executor/integrations")
+async def executor_add_integration(body: dict, tenant=Depends(get_tenant)):
+    """
+    Register a real-world integration.
+    The Thinking Executor will use this to fire actions automatically.
+
+    Supported integrations:
+      Communication: vapi, twilio, sendgrid, resend
+      Payments:      stripe, plaid
+      Healthcare:    epic
+      Documents:     docusign
+      CRM:           salesforce, hubspot, zendesk
+      Custom:        webhook
+
+    Body:
+      name:      str   — integration name (e.g. "vapi")
+      config:    dict  — API keys and settings
+      test_mode: bool  — if True: no real calls made (default False)
+
+    Example — Vapi:
+      {"name": "vapi", "config": {"api_key": "...", "phone_number_id": "...", "assistant_id": "..."}}
+
+    Example — Twilio SMS:
+      {"name": "twilio", "config": {"account_sid": "...", "auth_token": "...", "from_number": "+1..."}}
+
+    Example — Stripe:
+      {"name": "stripe", "config": {"secret_key": "sk_live_..."}}
+    """
+    if "name" not in body:
+        raise HTTPException(400, "name required")
+    if "config" not in body:
+        raise HTTPException(400, "config dict required")
+    try:
+        return await register_executor_integration(
+            pool, tenant["id"],
+            name      = body["name"],
+            config    = body["config"],
+            test_mode = body.get("test_mode", False),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── GET /executor/integrations ────────────────────────────────────────────────
+
+@app.get("/executor/integrations")
+async def executor_list_integrations(tenant=Depends(get_tenant)):
+    """List all configured integrations for this tenant."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name, enabled, test_mode, created_at, updated_at "
+            "FROM executor_integrations WHERE tenant_id=$1 ORDER BY name",
+            tenant["id"]
+        )
+    return {
+        "integrations": [
+            {
+                "id":        r["id"],
+                "name":      r["name"],
+                "label":     _SUPPORTED_INTEGRATIONS.get(r["name"], {}).get("label", r["name"]),
+                "enabled":   r["enabled"],
+                "test_mode": r["test_mode"],
+                "actions":   _SUPPORTED_INTEGRATIONS.get(r["name"], {}).get("actions", []),
+                "created_at": r["created_at"].isoformat(),
+            } for r in rows
+        ],
+        "count": len(rows),
+        "available_integrations": list(_SUPPORTED_INTEGRATIONS.keys()),
+    }
+
+
+# ── DELETE /executor/integrations/{id} ────────────────────────────────────────
+
+@app.delete("/executor/integrations/{integration_id}")
+async def executor_remove_integration(integration_id: str, tenant=Depends(get_tenant)):
+    """Remove an integration."""
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM executor_integrations WHERE id=$1 AND tenant_id=$2",
+            integration_id, tenant["id"]
+        )
+    if res == "DELETE 0":
+        raise HTTPException(404, "Integration not found")
+    return {"deleted": integration_id}
+
+
+# ── POST /executor/rules ──────────────────────────────────────────────────────
+
+@app.post("/executor/rules")
+async def executor_add_rule(body: dict, tenant=Depends(get_tenant)):
+    """
+    Add a decision rule. When a token's facts match → fire an integration action.
+
+    Body:
+      name:            str   — rule label
+      integration:     str   — which integration to fire (vapi, twilio, stripe, etc.)
+      action_type:     str   — what action (call, sms, email, charge, etc.)
+      conditions:      list  — when to fire: [{field, op, value}]
+      action_template: dict  — what to send (with {field} placeholders)
+      priority:        int   — higher = checked first (default 0)
+      data_type:       str   — limit to this token type (optional)
+      cohort_id:       str   — limit to this cohort (optional)
+
+    Example — Call high risk patients via Vapi:
+    {
+      "name": "call_high_risk_patients",
+      "integration": "vapi",
+      "action_type": "call",
+      "conditions": [
+        {"field": "risk", "op": "eq", "value": "high"},
+        {"field": "age", "op": "gte", "value": 18}
+      ],
+      "action_template": {
+        "assistant_message": "Hello {name}, this is Dr. Johnson's office calling..."
+      },
+      "priority": 10
+    }
+
+    Example — SMS medium risk via Twilio:
+    {
+      "name": "sms_medium_risk",
+      "integration": "twilio",
+      "action_type": "sms",
+      "conditions": [{"field": "risk", "op": "eq", "value": "medium"}],
+      "action_template": {"body": "Hi {name}, please call us at 404-555-0100."},
+      "priority": 5
+    }
+
+    Example — Charge card via Stripe:
+    {
+      "name": "charge_premium_users",
+      "integration": "stripe",
+      "action_type": "charge",
+      "conditions": [{"field": "plan", "op": "eq", "value": "premium"}],
+      "action_template": {"amount_cents": 9900, "currency": "usd"},
+      "priority": 10
+    }
+    """
+    required = ["integration", "action_type", "conditions", "action_template"]
+    for f in required:
+        if f not in body:
+            raise HTTPException(400, f"{f} required")
+    if not isinstance(body["conditions"], list):
+        raise HTTPException(400, "conditions must be a list")
+
+    try:
+        return await register_executor_rule(
+            pool, tenant["id"],
+            integration      = body["integration"],
+            action_type      = body["action_type"],
+            conditions       = body["conditions"],
+            action_template  = body["action_template"],
+            name             = body.get("name"),
+            priority         = body.get("priority", 0),
+            data_type        = body.get("data_type"),
+            cohort_id        = body.get("cohort_id"),
+            on_success_chain = body.get("on_success_chain"),
+            on_failure_chain = body.get("on_failure_chain"),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ── GET /executor/rules ───────────────────────────────────────────────────────
+
+@app.get("/executor/rules")
+async def executor_list_rules(tenant=Depends(get_tenant)):
+    """List all decision rules."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name, integration, action_type, conditions, priority, "
+            "data_type, cohort_id, enabled, created_at "
+            "FROM executor_action_rules WHERE tenant_id=$1 ORDER BY priority DESC",
+            tenant["id"]
+        )
+    return {
+        "rules": [
+            {
+                "id":          r["id"],
+                "name":        r["name"],
+                "integration": r["integration"],
+                "action_type": r["action_type"],
+                "conditions":  r["conditions"],
+                "priority":    r["priority"],
+                "data_type":   r["data_type"],
+                "cohort_id":   r["cohort_id"],
+                "enabled":     r["enabled"],
+            } for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+# ── DELETE /executor/rules/{id} ───────────────────────────────────────────────
+
+@app.delete("/executor/rules/{rule_id}")
+async def executor_remove_rule(rule_id: str, tenant=Depends(get_tenant)):
+    """Remove a decision rule."""
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM executor_action_rules WHERE id=$1 AND tenant_id=$2",
+            rule_id, tenant["id"]
+        )
+    if res == "DELETE 0":
+        raise HTTPException(404, "Rule not found")
+    return {"deleted": rule_id}
+
+
+# ── POST /executor/run ────────────────────────────────────────────────────────
+
+@app.post("/executor/run")
+async def executor_run(body: dict, tenant=Depends(get_tenant)):
+    """
+    Run the Thinking Executor on a single token.
+
+    The executor:
+      1. Opens the vault (gets real value)
+      2. Reads facts — decides which rule matches
+      3. Fires the integration with real value
+      4. Logs everything
+      5. Returns result — real value NEVER in response
+
+    Body:
+      token_id:    str   — which token to run
+      dry_run:     bool  — if True: decide but don't fire (default False)
+      force_rules: list  — use only these rule IDs (optional)
+
+    Example response:
+    {
+      "token_id": "tht_PATI_a1b2",
+      "matched_rules": 1,
+      "actions_taken": 1,
+      "actions_succeeded": 1,
+      "results": [
+        {
+          "integration": "vapi",
+          "action_type": "call",
+          "success": true,
+          "real_value_seen_by_agent": false
+        }
+      ],
+      "real_value_seen_by_agent": false
+    }
+    """
+    if "token_id" not in body:
+        raise HTTPException(400, "token_id required")
+
+    result = await run_thinking_executor(
+        pool,
+        tenant_id    = tenant["id"],
+        token_id     = body["token_id"],
+        session_id   = body.get("session_id"),
+        dry_run      = body.get("dry_run", False),
+        force_rules  = body.get("force_rules"),
+    )
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+# ── POST /executor/run/cohort ─────────────────────────────────────────────────
+
+@app.post("/executor/run/cohort")
+async def executor_run_cohort(body: dict, tenant=Depends(get_tenant)):
+    """
+    Run the Thinking Executor on an entire cohort.
+    Processes all tokens concurrently (max 10 at a time).
+    Real values sent to integrations. Agent never sees any.
+
+    Body:
+      cohort_id: str   — which cohort to process
+      dry_run:   bool  — if True: decide but don't fire (default False)
+      limit:     int   — max tokens to process (default 1000)
+
+    Example: Hospital runs executor on all 50,000 patients.
+    Vapi calls high risk ones. Twilio SMS medium risk. SendGrid emails low risk.
+    Agent never saw one name, phone, or email address.
+    """
+    if "cohort_id" not in body:
+        raise HTTPException(400, "cohort_id required")
+
+    return await run_thinking_executor_cohort(
+        pool,
+        tenant_id  = tenant["id"],
+        cohort_id  = body["cohort_id"],
+        session_id = body.get("session_id"),
+        dry_run    = body.get("dry_run", False),
+        limit      = body.get("limit", 1000),
+    )
+
+
+# ── GET /executor/log ─────────────────────────────────────────────────────────
+
+@app.get("/executor/log")
+async def executor_log(
+    limit:     int = 100,
+    token_id:  str = None,
+    tenant=Depends(get_tenant)
+):
+    """Full audit log of all executor actions."""
+    async with pool.acquire() as conn:
+        if token_id:
+            rows = await conn.fetch(
+                "SELECT * FROM executor_action_log "
+                "WHERE tenant_id=$1 AND token_id=$2 "
+                "ORDER BY created_at DESC LIMIT $3",
+                tenant["id"], token_id, limit
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM executor_action_log "
+                "WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT $2",
+                tenant["id"], limit
+            )
+    return {
+        "log": [
+            {
+                "id":            r["id"],
+                "token_id":      r["token_id"],
+                "integration":   r["integration"],
+                "action_type":   r["action_type"],
+                "success":       r["success"],
+                "duration_ms":   r["duration_ms"],
+                "error_message": r["error_message"],
+                "real_value_seen_by_agent": r["real_value_seen_by_agent"],
+                "real_value_in_log":        r["real_value_in_log"],
+                "created_at":    r["created_at"].isoformat(),
+            } for r in rows
+        ],
+        "count": len(rows),
+        "real_data_seen_by_agent": 0,
+    }
+
+
+# ── GET /executor/learning ────────────────────────────────────────────────────
+
+@app.get("/executor/learning")
+async def executor_learning_stats(tenant=Depends(get_tenant)):
+    """What has the executor learned? Which actions work best?"""
+    return await get_executor_learning(pool, tenant["id"])
+
+
+# ── GET /executor/status ──────────────────────────────────────────────────────
+
+@app.get("/executor/status")
+async def executor_status(tenant=Depends(get_tenant)):
+    """Integration health check — which integrations are configured and active."""
+    async with pool.acquire() as conn:
+        integrations = await conn.fetch(
+            "SELECT name, enabled, test_mode, updated_at "
+            "FROM executor_integrations WHERE tenant_id=$1",
+            tenant["id"]
+        )
+        rules = await conn.fetchval(
+            "SELECT COUNT(*) FROM executor_action_rules WHERE tenant_id=$1 AND enabled=TRUE",
+            tenant["id"]
+        )
+        actions_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM executor_action_log "
+            "WHERE tenant_id=$1 AND created_at > NOW() - INTERVAL '24 hours'",
+            tenant["id"]
+        )
+        success_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM executor_action_log "
+            "WHERE tenant_id=$1 AND success=TRUE "
+            "AND created_at > NOW() - INTERVAL '24 hours'",
+            tenant["id"]
+        )
+
+    return {
+        "integrations": [
+            {
+                "name":      r["name"],
+                "enabled":   r["enabled"],
+                "test_mode": r["test_mode"],
+                "label":     _SUPPORTED_INTEGRATIONS.get(r["name"], {}).get("label", r["name"]),
+            } for r in integrations
+        ],
+        "active_rules":      rules,
+        "actions_last_24h":  actions_today,
+        "success_last_24h":  success_today,
+        "real_data_seen_by_agent": 0,
+    }
+
+
+# ── GET /executor/supported ───────────────────────────────────────────────────
+
+@app.get("/executor/supported")
+async def executor_supported_integrations(tenant=Depends(get_tenant)):
+    """List all supported integrations with setup requirements."""
+    return {
+        "integrations": [
+            {
+                "name":     name,
+                "label":    spec["label"],
+                "category": spec["category"],
+                "actions":  spec["actions"],
+                "required_config": spec["required"],
+                "optional_config": spec["optional"],
+                "docs":     spec["docs"],
+            }
+            for name, spec in _SUPPORTED_INTEGRATIONS.items()
+        ],
+        "count": len(_SUPPORTED_INTEGRATIONS),
+    }
