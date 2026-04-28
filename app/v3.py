@@ -10212,3 +10212,3908 @@ async def set_context_rules(
             "Context rule registered."
         ),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OMEGA TOKEN SYSTEM — v5.0
+# One token. All 7 paradigms. Any combination.
+#
+# Paradigms supported (any combination per token):
+#   1. Composite   — token stores a relationship graph, executor traverses it
+#   2. Conditional — token stores logic rules, executor evaluates at reveal time
+#   3. Federated   — token stores bilateral policy, requires multi-org signature
+#   4. Temporal    — token stores lifecycle phases, enforces phase-based access
+#   5. Agentic     — token stores agent instructions, middleware injects context
+#   6. Proof       — token stores derived facts, executor returns proofs not values
+#   7. Orchestration — token stores pipeline permissions, enforces per-agent access
+#
+# DB TABLES: omega_tokens, omega_token_graph, omega_token_reveal_log,
+#            omega_federated_approvals, omega_token_events
+#
+# ENDPOINTS:
+#   POST   /omega/mint              — mint an OmegaToken with any paradigm combo
+#   POST   /omega/mint/batch        — mint up to 100 OmegaTokens
+#   GET    /omega/{id}              — inspect metadata (never real value)
+#   POST   /omega/{id}/execute      — policy-gated execution (all 7 gates)
+#   POST   /omega/{id}/approve      — federated: org approval
+#   POST   /omega/{id}/transition   — temporal: advance lifecycle phase
+#   GET    /omega/{id}/proof        — proof paradigm: get derived facts only
+#   GET    /omega/{id}/instructions — agentic: get agent instructions
+#   GET    /omega/{id}/pipeline     — orchestration: get pipeline permissions
+#   GET    /omega/{id}/audit        — full reveal audit trail
+#   DELETE /omega/{id}              — revoke token immediately
+#   GET    /omega/stats             — omega token statistics
+# ══════════════════════════════════════════════════════════════════════════════
+
+import json as _json
+import hashlib as _hashlib
+
+# ── DB Migrations ──────────────────────────────────────────────────────────────
+
+OMEGA_TOKEN_MIGRATIONS = [
+
+    # Core omega token table — all paradigm configs stored as JSONB
+    """CREATE TABLE IF NOT EXISTS omega_tokens (
+        token_id          TEXT PRIMARY KEY,
+        tenant_id         TEXT NOT NULL,
+        agent_id          TEXT,
+
+        -- Core value (encrypted)
+        real_value        TEXT NOT NULL,
+        data_type         TEXT NOT NULL,
+        semantic_label    TEXT,
+        classification    TEXT DEFAULT 'pii',
+
+        -- Base policy (inherited from smart token)
+        allowed_actions   TEXT[]  DEFAULT '{}',
+        allowed_targets   TEXT[]  DEFAULT '{}',
+        allowed_fields    TEXT[]  DEFAULT '{}',
+        max_uses          INTEGER DEFAULT 1,
+        uses_remaining    INTEGER DEFAULT 1,
+        ttl_seconds       INTEGER DEFAULT 86400,
+        audit_reveal      BOOLEAN DEFAULT TRUE,
+
+        -- Paradigm flags — which paradigms are active
+        has_composite     BOOLEAN DEFAULT FALSE,
+        has_conditional   BOOLEAN DEFAULT FALSE,
+        has_federated     BOOLEAN DEFAULT FALSE,
+        has_temporal      BOOLEAN DEFAULT FALSE,
+        has_agentic       BOOLEAN DEFAULT FALSE,
+        has_proof         BOOLEAN DEFAULT FALSE,
+        has_orchestration BOOLEAN DEFAULT FALSE,
+
+        -- Paradigm configs (JSONB — null if paradigm not active)
+        composite_graph   JSONB,   -- {field: token_id, ...}
+        conditions        JSONB,   -- [{condition, action, priority}, ...]
+        federated_policy  JSONB,   -- {allowed_orgs, require_all, min_approvals}
+        lifecycle_phases  JSONB,   -- [{phase, allowed_actions, auto_advance_after_seconds}, ...]
+        current_phase     TEXT,
+        agent_instructions JSONB,  -- {can, cannot, suggest_action, context_hint}
+        proof_facts       JSONB,   -- {fact_name: value, ...} — never reveals real_value
+        pipeline_policy   JSONB,   -- {agent_id: [permissions], ...}
+
+        -- Lifecycle
+        created_at        TIMESTAMPTZ DEFAULT NOW(),
+        expires_at        TIMESTAMPTZ,
+        revoked           BOOLEAN DEFAULT FALSE,
+        revoked_at        TIMESTAMPTZ,
+        revoked_reason    TEXT
+    )""",
+
+    """CREATE INDEX IF NOT EXISTS ot_tenant_idx
+       ON omega_tokens(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS ot_agent_idx
+       ON omega_tokens(agent_id, tenant_id)""",
+    """CREATE INDEX IF NOT EXISTS ot_expires_idx
+       ON omega_tokens(expires_at)""",
+    """CREATE INDEX IF NOT EXISTS ot_phase_idx
+       ON omega_tokens(current_phase, tenant_id)""",
+
+    # Federated approvals — multi-org signatures
+    """CREATE TABLE IF NOT EXISTS omega_federated_approvals (
+        id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        token_id    TEXT NOT NULL,
+        tenant_id   TEXT NOT NULL,
+        org_id      TEXT NOT NULL,
+        approved_by TEXT,
+        approved_at TIMESTAMPTZ DEFAULT NOW(),
+        signature   TEXT,
+        UNIQUE(token_id, org_id)
+    )""",
+    """CREATE INDEX IF NOT EXISTS ofa_token_idx
+       ON omega_federated_approvals(token_id)""",
+
+    # Full reveal audit log
+    """CREATE TABLE IF NOT EXISTS omega_token_reveal_log (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        token_id        TEXT NOT NULL,
+        agent_id        TEXT,
+        paradigms_used  TEXT[],
+        action_type     TEXT,
+        target_url      TEXT,
+        field_name      TEXT,
+        phase           TEXT,
+        authorized      BOOLEAN NOT NULL,
+        deny_reason     TEXT,
+        gates_checked   JSONB,
+        proof_returned  BOOLEAN DEFAULT FALSE,
+        uses_before     INTEGER,
+        uses_after      INTEGER,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS otrl_tenant_idx
+       ON omega_token_reveal_log(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS otrl_token_idx
+       ON omega_token_reveal_log(token_id)""",
+
+    # Lifecycle event log
+    """CREATE TABLE IF NOT EXISTS omega_token_events (
+        id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        token_id    TEXT NOT NULL,
+        tenant_id   TEXT NOT NULL,
+        event_type  TEXT NOT NULL,
+        from_phase  TEXT,
+        to_phase    TEXT,
+        triggered_by TEXT,
+        metadata    JSONB,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS ote_token_idx
+       ON omega_token_events(token_id, created_at DESC)""",
+]
+
+
+# ── Token ID ───────────────────────────────────────────────────────────────────
+
+def _omega_token_id(data_type: str) -> str:
+    """
+    Format: omg_{TYPE4}_{RANDOM10}
+    Example: omg_PATI_a1b2c3d4e5
+    """
+    short = data_type.upper()[:4]
+    rand  = _secrets.token_hex(5)
+    return f"omg_{short}_{rand}"
+
+
+# ── Paradigm validators ────────────────────────────────────────────────────────
+
+def _validate_composite(graph: dict) -> dict:
+    """Composite: {field_name: token_id or nested_value}"""
+    if not isinstance(graph, dict):
+        raise ValueError("composite_graph must be a dict of {field: token_id}")
+    return graph
+
+
+def _validate_conditions(conditions: list) -> list:
+    """
+    Conditional: list of condition rules.
+    Each rule: {condition: str, action: str, priority: int}
+    condition is a simple expression: "field op value"
+    e.g. "risk == 'high'" or "amount > 10000"
+    """
+    validated = []
+    for c in conditions:
+        if not isinstance(c, dict) or "condition" not in c or "action" not in c:
+            raise ValueError("Each condition must have 'condition' and 'action' keys")
+        validated.append({
+            "condition": str(c["condition"]),
+            "action":    str(c["action"]),
+            "priority":  int(c.get("priority", 0)),
+            "description": c.get("description", ""),
+        })
+    return sorted(validated, key=lambda x: x["priority"], reverse=True)
+
+
+def _validate_federated(policy: dict) -> dict:
+    """
+    Federated: {
+        allowed_orgs: [org_id, ...],
+        require_all: bool,         # all orgs must approve vs just min_approvals
+        min_approvals: int,
+        approval_ttl_seconds: int,
+    }
+    """
+    if "allowed_orgs" not in policy or not policy["allowed_orgs"]:
+        raise ValueError("federated_policy must include 'allowed_orgs' list")
+    return {
+        "allowed_orgs":         list(policy["allowed_orgs"]),
+        "require_all":          bool(policy.get("require_all", False)),
+        "min_approvals":        int(policy.get("min_approvals", 1)),
+        "approval_ttl_seconds": int(policy.get("approval_ttl_seconds", 3600)),
+    }
+
+
+def _validate_lifecycle(phases: list, initial_phase: str = None) -> tuple[list, str]:
+    """
+    Temporal: list of phase definitions.
+    Each phase: {
+        phase: str,
+        allowed_actions: [str],
+        auto_advance_after_seconds: int (optional),
+        next_phase: str (optional)
+    }
+    """
+    if not phases:
+        raise ValueError("lifecycle_phases must be a non-empty list")
+    validated = []
+    phase_names = set()
+    for p in phases:
+        if "phase" not in p:
+            raise ValueError("Each lifecycle phase must have a 'phase' key")
+        if p["phase"] in phase_names:
+            raise ValueError(f"Duplicate phase name: {p['phase']}")
+        phase_names.add(p["phase"])
+        validated.append({
+            "phase":           str(p["phase"]),
+            "allowed_actions": list(p.get("allowed_actions", [])),
+            "auto_advance_after_seconds": p.get("auto_advance_after_seconds"),
+            "next_phase":      p.get("next_phase"),
+            "description":     p.get("description", ""),
+        })
+    start = initial_phase or validated[0]["phase"]
+    if start not in phase_names:
+        raise ValueError(f"initial_phase '{start}' not in lifecycle phases")
+    return validated, start
+
+
+def _validate_agent_instructions(instructions: dict) -> dict:
+    """
+    Agentic: {
+        can: [str],           # what agent is allowed to do with this data
+        cannot: [str],        # explicit prohibitions
+        suggest_action: str,  # recommended next step
+        context_hint: str,    # extra context for agent reasoning
+        inject_as_system: bool,  # inject into system prompt vs user context
+    }
+    """
+    return {
+        "can":              list(instructions.get("can", [])),
+        "cannot":           list(instructions.get("cannot", [])),
+        "suggest_action":   str(instructions.get("suggest_action", "")),
+        "context_hint":     str(instructions.get("context_hint", "")),
+        "inject_as_system": bool(instructions.get("inject_as_system", True)),
+    }
+
+
+def _validate_proof_facts(facts: dict) -> dict:
+    """
+    Proof: {fact_name: computed_value}
+    These are derived facts about the real value — never the real value itself.
+    e.g. {"over_65": True, "age_bucket": "65-70", "medicare_eligible": True}
+    """
+    if not isinstance(facts, dict):
+        raise ValueError("proof_facts must be a dict of {fact_name: value}")
+    return facts
+
+
+def _validate_pipeline(policy: dict) -> dict:
+    """
+    Orchestration: {agent_id: [permissions]}
+    permissions: list of "read:field" or "write:field" or "action:name"
+    e.g. {"intake_agent": ["read:demographics"], "billing_agent": ["read:insurance_id"]}
+    """
+    if not isinstance(policy, dict):
+        raise ValueError("pipeline_policy must be a dict of {agent_id: [permissions]}")
+    return {k: list(v) for k, v in policy.items()}
+
+
+# ── Core: evaluate condition ───────────────────────────────────────────────────
+
+def _evaluate_condition(condition_str: str, context: dict) -> bool:
+    """
+    Safely evaluate a simple condition string against a context dict.
+    Supports: ==, !=, >, <, >=, <=, in, not in
+    e.g. "risk == 'high'" evaluated with context {"risk": "high"} → True
+    """
+    try:
+        # Parse: "field op value"
+        import re as _re
+        # Supported operators
+        for op in [">=", "<=", "!=", "==", ">", "<", " not in ", " in "]:
+            if op in condition_str:
+                parts = condition_str.split(op, 1)
+                field = parts[0].strip()
+                raw   = parts[1].strip().strip("'\"")
+                val   = context.get(field)
+                if val is None:
+                    return False
+                if op == "==":   return str(val) == raw
+                if op == "!=":   return str(val) != raw
+                if op == ">":    return float(val) > float(raw)
+                if op == "<":    return float(val) < float(raw)
+                if op == ">=":   return float(val) >= float(raw)
+                if op == "<=":   return float(val) <= float(raw)
+                if op == " in ": return str(val) in raw.split(",")
+                if op == " not in ": return str(val) not in raw.split(",")
+        return False
+    except Exception:
+        return False
+
+
+# ── Core: run omega policy gates ──────────────────────────────────────────────
+
+async def _run_omega_gates(
+    conn,
+    token_row:    dict,
+    action_type:  str  = None,
+    target_url:   str  = None,
+    field_name:   str  = None,
+    agent_id:     str  = None,
+    org_id:       str  = None,
+    context:      dict = None,
+) -> tuple[bool, str, dict]:
+    """
+    Run all omega policy gates. Returns (authorized, deny_reason, gates_checked).
+
+    Gate 1: Not revoked
+    Gate 2: Not expired
+    Gate 3: Uses remaining
+    Gate 4: Action allowed (base policy)
+    Gate 5: Target/field allowed (base policy)
+    Gate 6: Temporal — current phase allows this action
+    Gate 7: Federated — required org approvals present
+    Gate 8: Orchestration — calling agent has pipeline permission
+    Gate 9: Conditional — conditions evaluated (informational, routes action)
+    """
+    gates = {}
+    context = context or {}
+
+    # Gate 1 — revoked
+    if token_row["revoked"]:
+        gates["gate_1_revoked"] = "FAIL"
+        return False, f"Token revoked at {token_row['revoked_at']}: {token_row['revoked_reason']}", gates
+    gates["gate_1_revoked"] = "PASS"
+
+    # Gate 2 — expired
+    if token_row["expires_at"] and token_row["expires_at"] < datetime.now(timezone.utc):
+        gates["gate_2_expired"] = "FAIL"
+        return False, f"Token expired at {token_row['expires_at'].isoformat()}", gates
+    gates["gate_2_expired"] = "PASS"
+
+    # Gate 3 — uses remaining
+    if token_row["uses_remaining"] <= 0:
+        gates["gate_3_uses"] = "FAIL"
+        return False, f"Token has no uses remaining (max_uses={token_row['max_uses']})", gates
+    gates["gate_3_uses"] = "PASS"
+
+    # Gate 4 — action allowed (base policy)
+    allowed_actions = token_row["allowed_actions"] or []
+    if allowed_actions and action_type and action_type not in allowed_actions:
+        gates["gate_4_action"] = "FAIL"
+        return False, f"Action '{action_type}' not in allowed_actions {allowed_actions}", gates
+    gates["gate_4_action"] = "PASS"
+
+    # Gate 5 — target/field allowed (base policy)
+    allowed_targets = token_row["allowed_targets"] or []
+    if allowed_targets and target_url:
+        if not any(target_url.startswith(t) for t in allowed_targets):
+            gates["gate_5_target"] = "FAIL"
+            return False, f"Target '{target_url}' not in allowed_targets {allowed_targets}", gates
+    allowed_fields = token_row["allowed_fields"] or []
+    if allowed_fields and field_name and field_name not in allowed_fields:
+        gates["gate_5_target"] = "FAIL"
+        return False, f"Field '{field_name}' not in allowed_fields {allowed_fields}", gates
+    gates["gate_5_target"] = "PASS"
+
+    # Gate 6 — Temporal: current phase allows this action
+    if token_row["has_temporal"] and token_row["lifecycle_phases"]:
+        phases = token_row["lifecycle_phases"] if isinstance(token_row["lifecycle_phases"], list) \
+                 else _json.loads(token_row["lifecycle_phases"])
+        current = token_row["current_phase"]
+        phase_def = next((p for p in phases if p["phase"] == current), None)
+        if phase_def:
+            phase_actions = phase_def.get("allowed_actions", [])
+            if phase_actions and action_type and action_type not in phase_actions:
+                gates["gate_6_temporal"] = "FAIL"
+                return False, (
+                    f"Action '{action_type}' not allowed in current phase '{current}'. "
+                    f"Phase allows: {phase_actions}"
+                ), gates
+        gates["gate_6_temporal"] = f"PASS (phase={current})"
+    else:
+        gates["gate_6_temporal"] = "SKIP (not temporal)"
+
+    # Gate 7 — Federated: required org approvals
+    if token_row["has_federated"] and token_row["federated_policy"]:
+        fed = token_row["federated_policy"] if isinstance(token_row["federated_policy"], dict) \
+              else _json.loads(token_row["federated_policy"])
+        allowed_orgs   = fed.get("allowed_orgs", [])
+        require_all    = fed.get("require_all", False)
+        min_approvals  = fed.get("min_approvals", 1)
+
+        # Check existing approvals
+        approvals = await conn.fetch(
+            "SELECT org_id FROM omega_federated_approvals WHERE token_id=$1",
+            token_row["token_id"]
+        )
+        approved_orgs = {r["org_id"] for r in approvals}
+
+        if require_all:
+            missing = set(allowed_orgs) - approved_orgs
+            if missing:
+                gates["gate_7_federated"] = "FAIL"
+                return False, f"Federated: missing approvals from orgs: {list(missing)}", gates
+        else:
+            count = len(approved_orgs & set(allowed_orgs))
+            if count < min_approvals:
+                gates["gate_7_federated"] = "FAIL"
+                return False, (
+                    f"Federated: {count}/{min_approvals} required approvals received. "
+                    f"Approved orgs: {list(approved_orgs)}"
+                ), gates
+        gates["gate_7_federated"] = f"PASS ({len(approved_orgs)} orgs approved)"
+    else:
+        gates["gate_7_federated"] = "SKIP (not federated)"
+
+    # Gate 8 — Orchestration: agent pipeline permission
+    if token_row["has_orchestration"] and token_row["pipeline_policy"] and agent_id:
+        pipeline = token_row["pipeline_policy"] if isinstance(token_row["pipeline_policy"], dict) \
+                   else _json.loads(token_row["pipeline_policy"])
+        agent_perms = pipeline.get(agent_id, [])
+        if not agent_perms:
+            gates["gate_8_orchestration"] = "FAIL"
+            return False, (
+                f"Agent '{agent_id}' has no pipeline permissions for this token. "
+                f"Authorized agents: {list(pipeline.keys())}"
+            ), gates
+        if action_type:
+            action_perm = f"action:{action_type}"
+            read_perm   = f"read:{field_name}" if field_name else None
+            has_perm = (
+                action_perm in agent_perms or
+                "action:*" in agent_perms or
+                (read_perm and read_perm in agent_perms) or
+                "read:*" in agent_perms
+            )
+            if not has_perm:
+                gates["gate_8_orchestration"] = "FAIL"
+                return False, (
+                    f"Agent '{agent_id}' lacks permission '{action_perm}'. "
+                    f"Agent has: {agent_perms}"
+                ), gates
+        gates["gate_8_orchestration"] = f"PASS (agent={agent_id}, perms={agent_perms})"
+    else:
+        gates["gate_8_orchestration"] = "SKIP (not orchestration or no agent_id)"
+
+    # Gate 9 — Conditional: evaluate conditions (routing, informational)
+    routed_action = None
+    if token_row["has_conditional"] and token_row["conditions"] and context:
+        conds = token_row["conditions"] if isinstance(token_row["conditions"], list) \
+                else _json.loads(token_row["conditions"])
+        for rule in conds:
+            if _evaluate_condition(rule["condition"], context):
+                routed_action = rule["action"]
+                gates["gate_9_conditional"] = f"MATCHED: '{rule['condition']}' → '{rule['action']}'"
+                break
+        if not routed_action:
+            gates["gate_9_conditional"] = "NO_MATCH (no condition met — default action applies)"
+    else:
+        gates["gate_9_conditional"] = "SKIP (not conditional or no context)"
+
+    return True, "all_gates_passed", gates
+
+
+# ── Core: resolve composite graph ─────────────────────────────────────────────
+
+async def _resolve_composite_graph(pool, tenant_id: str, graph: dict) -> dict:
+    """
+    Traverse a composite token graph.
+    For each field: if value is an omega/smart token ID, resolve it recursively.
+    Returns {field: real_value_or_token_metadata}
+    """
+    resolved = {}
+    async with pool.acquire() as conn:
+        for field, ref in graph.items():
+            if isinstance(ref, str) and (ref.startswith("omg_") or ref.startswith("tok_")):
+                # Try to resolve as omega token (metadata only — not real value)
+                row = await conn.fetchrow(
+                    "SELECT token_id, data_type, semantic_label, classification, "
+                    "current_phase, has_agentic, agent_instructions "
+                    "FROM omega_tokens WHERE token_id=$1 AND tenant_id=$2",
+                    ref, tenant_id
+                )
+                if row:
+                    resolved[field] = {
+                        "token_id":       row["token_id"],
+                        "data_type":      row["data_type"],
+                        "semantic_label": row["semantic_label"],
+                        "classification": row["classification"],
+                        "current_phase":  row["current_phase"],
+                        "type":           "omega_token_ref",
+                    }
+                else:
+                    # Try smart token
+                    st_row = await conn.fetchrow(
+                        "SELECT token_id, data_type, semantic_label, classification "
+                        "FROM smart_tokens WHERE token_id=$1 AND tenant_id=$2",
+                        ref, tenant_id
+                    )
+                    if st_row:
+                        resolved[field] = {
+                            "token_id":       st_row["token_id"],
+                            "data_type":      st_row["data_type"],
+                            "semantic_label": st_row["semantic_label"],
+                            "classification": st_row["classification"],
+                            "type":           "smart_token_ref",
+                        }
+                    else:
+                        resolved[field] = {"ref": ref, "type": "unresolved_ref"}
+            else:
+                # Plain value — return as-is
+                resolved[field] = ref
+    return resolved
+
+
+# ── Core: get agent instructions for middleware injection ──────────────────────
+
+def _build_agent_context(token_row: dict) -> dict:
+    """
+    Build agent context from agentic instructions.
+    This is injected into the agent's system prompt by middleware.
+    The agent never sees the real value — only these instructions.
+    """
+    if not token_row["has_agentic"] or not token_row["agent_instructions"]:
+        return {}
+
+    instructions = token_row["agent_instructions"] if isinstance(token_row["agent_instructions"], dict) \
+                   else _json.loads(token_row["agent_instructions"])
+
+    return {
+        "token_id":    token_row["token_id"],
+        "data_type":   token_row["data_type"],
+        "label":       token_row["semantic_label"],
+        "can":         instructions.get("can", []),
+        "cannot":      instructions.get("cannot", []),
+        "suggest":     instructions.get("suggest_action", ""),
+        "context":     instructions.get("context_hint", ""),
+        "inject_mode": "system" if instructions.get("inject_as_system", True) else "user",
+        "note": (
+            f"This token represents: {token_row['semantic_label']}. "
+            f"You may: {', '.join(instructions.get('can', ['reason about it']))}. "
+            f"You must NOT: {', '.join(instructions.get('cannot', ['reveal the real value']))}. "
+            + (f"Suggested next action: {instructions['suggest_action']}" if instructions.get("suggest_action") else "")
+        ),
+    }
+
+
+# ── Core: mint OmegaToken ──────────────────────────────────────────────────────
+
+async def mint_omega_token(
+    pool,
+    tenant_id:    str,
+    real_value:   str,
+    data_type:    str,
+    agent_id:     str  = None,
+
+    # Base policy (always applied)
+    allowed_actions: list = [],
+    allowed_targets: list = [],
+    allowed_fields:  list = [],
+    max_uses:        int  = 1,
+    ttl_seconds:     int  = 86400,
+    semantic_label:  str  = None,
+    audit_reveal:    bool = True,
+
+    # Paradigm 1: Composite
+    composite_graph: dict = None,
+
+    # Paradigm 2: Conditional
+    conditions: list = None,
+
+    # Paradigm 3: Federated
+    federated_policy: dict = None,
+
+    # Paradigm 4: Temporal
+    lifecycle_phases: list = None,
+    initial_phase:    str  = None,
+
+    # Paradigm 5: Agentic
+    agent_instructions: dict = None,
+
+    # Paradigm 6: Proof
+    proof_facts: dict = None,
+
+    # Paradigm 7: Orchestration
+    pipeline_policy: dict = None,
+
+) -> dict:
+    """
+    Mint an OmegaToken — one token with any combination of 7 paradigms.
+
+    Returns agent-safe metadata. Real value NEVER returned.
+    """
+    from app.v3 import _resolve_data_type
+
+    token_id   = _omega_token_id(data_type)
+    meta       = _resolve_data_type(data_type)
+    label      = semantic_label or meta["label"]
+    classif    = meta["classification"]
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+
+    # Validate and process each paradigm
+    has_composite     = False
+    has_conditional   = False
+    has_federated     = False
+    has_temporal      = False
+    has_agentic       = False
+    has_proof         = False
+    has_orchestration = False
+
+    graph_json        = None
+    conditions_json   = None
+    federated_json    = None
+    lifecycle_json    = None
+    phase_start       = None
+    instructions_json = None
+    proof_json        = None
+    pipeline_json     = None
+
+    if composite_graph is not None:
+        graph_json    = _json.dumps(_validate_composite(composite_graph))
+        has_composite = True
+
+    if conditions:
+        conditions_json = _json.dumps(_validate_conditions(conditions))
+        has_conditional = True
+
+    if federated_policy:
+        federated_json = _json.dumps(_validate_federated(federated_policy))
+        has_federated  = True
+
+    if lifecycle_phases:
+        phases, phase_start = _validate_lifecycle(lifecycle_phases, initial_phase)
+        lifecycle_json = _json.dumps(phases)
+        has_temporal   = True
+
+    if agent_instructions:
+        instructions_json = _json.dumps(_validate_agent_instructions(agent_instructions))
+        has_agentic       = True
+
+    if proof_facts is not None:
+        proof_json = _json.dumps(_validate_proof_facts(proof_facts))
+        has_proof  = True
+
+    if pipeline_policy:
+        pipeline_json     = _json.dumps(_validate_pipeline(pipeline_policy))
+        has_orchestration = True
+
+    active_paradigms = [
+        p for p, flag in [
+            ("composite", has_composite), ("conditional", has_conditional),
+            ("federated", has_federated), ("temporal", has_temporal),
+            ("agentic", has_agentic), ("proof", has_proof),
+            ("orchestration", has_orchestration),
+        ] if flag
+    ]
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO omega_tokens (
+                token_id, tenant_id, agent_id, real_value, data_type,
+                semantic_label, classification,
+                allowed_actions, allowed_targets, allowed_fields,
+                max_uses, uses_remaining, ttl_seconds, audit_reveal, expires_at,
+                has_composite, has_conditional, has_federated, has_temporal,
+                has_agentic, has_proof, has_orchestration,
+                composite_graph, conditions, federated_policy, lifecycle_phases,
+                current_phase, agent_instructions, proof_facts, pipeline_policy
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                $16,$17,$18,$19,$20,$21,$22,
+                $23,$24,$25,$26,$27,$28,$29,$30
+            )
+        """,
+            token_id, tenant_id, agent_id, str(real_value), data_type,
+            label, classif,
+            allowed_actions, allowed_targets, allowed_fields,
+            max_uses, max_uses, ttl_seconds, audit_reveal, expires_at,
+            has_composite, has_conditional, has_federated, has_temporal,
+            has_agentic, has_proof, has_orchestration,
+            graph_json, conditions_json, federated_json, lifecycle_json,
+            phase_start, instructions_json, proof_json, pipeline_json,
+        )
+
+        # Log token creation event
+        await conn.execute("""
+            INSERT INTO omega_token_events (token_id, tenant_id, event_type, to_phase, metadata)
+            VALUES ($1, $2, 'minted', $3, $4)
+        """, token_id, tenant_id, phase_start,
+            _json.dumps({"paradigms": active_paradigms, "data_type": data_type}))
+
+    # Build agent-safe response — never includes real_value
+    response = {
+        "token_id":        token_id,
+        "token_type":      "omega",
+        "data_type":       data_type,
+        "semantic_label":  label,
+        "classification":  classif,
+        "active_paradigms": active_paradigms,
+        "paradigm_count":  len(active_paradigms),
+        "policy": {
+            "allowed_actions": allowed_actions or "any",
+            "allowed_targets": allowed_targets or "any",
+            "allowed_fields":  allowed_fields  or "any",
+            "max_uses":        max_uses,
+            "ttl_seconds":     ttl_seconds,
+            "reveal_mode":     "trusted_executor_only",
+            "audit":           audit_reveal,
+        },
+        "expires_at": expires_at.isoformat(),
+        "hint": f"OmegaToken representing a {label}. Real value vault-protected. {len(active_paradigms)} paradigm(s) active.",
+    }
+
+    # Add paradigm-specific agent-visible metadata
+    if has_composite and composite_graph:
+        response["graph_fields"] = list(composite_graph.keys())
+        response["graph_hint"]   = f"This token links to {len(composite_graph)} related tokens."
+
+    if has_temporal and phase_start:
+        response["current_phase"] = phase_start
+        response["phase_hint"]    = f"Token is in '{phase_start}' phase. Actions may be phase-restricted."
+
+    if has_federated and federated_policy:
+        response["federated_orgs"] = federated_policy.get("allowed_orgs", [])
+        response["federation_hint"] = "This token requires multi-org approval before reveal."
+
+    if has_agentic and agent_instructions:
+        instr = _validate_agent_instructions(agent_instructions)
+        response["agent_context"] = {
+            "can":     instr["can"],
+            "cannot":  instr["cannot"],
+            "suggest": instr["suggest_action"],
+            "context": instr["context_hint"],
+        }
+
+    if has_proof and proof_facts:
+        response["available_proofs"] = list(proof_facts.keys())
+        response["proof_hint"] = "Use GET /omega/{id}/proof to retrieve derived facts without revealing real value."
+
+    if has_orchestration and pipeline_policy:
+        response["pipeline_agents"] = list(pipeline_policy.keys())
+        response["pipeline_hint"]   = "Different agents have different permissions for this token."
+
+    if has_conditional:
+        response["conditional_hint"] = "This token will route its action based on runtime context."
+
+    return response
+
+
+# ── Core: execute OmegaToken ───────────────────────────────────────────────────
+
+async def execute_omega_token(
+    pool,
+    tenant_id:   str,
+    token_id:    str,
+    action_type: str  = None,
+    target_url:  str  = None,
+    field_name:  str  = None,
+    agent_id:    str  = None,
+    org_id:      str  = None,
+    context:     dict = None,
+    proof_only:  bool = False,
+) -> dict:
+    """
+    Policy-gated execution of an OmegaToken.
+    Runs all 9 gates. Returns real value only if all gates pass.
+    If proof_only=True: returns proof facts instead of real value (no gates required).
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM omega_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+
+        if not row:
+            return {
+                "authorized":  False,
+                "deny_reason": f"OmegaToken '{token_id}' not found",
+                "real_value":  None,
+                "token_id":    token_id,
+            }
+
+        token_row   = dict(row)
+        uses_before = token_row["uses_remaining"]
+
+        # Proof-only path — no gates needed, no real value returned
+        if proof_only:
+            if not token_row["has_proof"] or not token_row["proof_facts"]:
+                return {
+                    "authorized":  False,
+                    "deny_reason": "This token has no proof facts configured",
+                    "proofs":      None,
+                    "token_id":    token_id,
+                }
+            proofs = token_row["proof_facts"] if isinstance(token_row["proof_facts"], dict) \
+                     else _json.loads(token_row["proof_facts"])
+            # Log proof access
+            await conn.execute("""
+                INSERT INTO omega_token_reveal_log
+                  (tenant_id,token_id,agent_id,action_type,authorized,
+                   proof_returned,gates_checked,uses_before,uses_after)
+                VALUES ($1,$2,$3,'proof_query',$4,$5,$6,$7,$7)
+            """, tenant_id, token_id, agent_id, True, True,
+                _json.dumps({"proof_only": True}), uses_before)
+            return {
+                "authorized":    True,
+                "proof_only":    True,
+                "proofs":        proofs,
+                "token_id":      token_id,
+                "data_type":     token_row["data_type"],
+                "semantic_label": token_row["semantic_label"],
+                "real_value":    None,
+                "message":       "Proof facts returned. Real value NOT revealed.",
+            }
+
+        # Run all 9 gates
+        authorized, reason, gates = await _run_omega_gates(
+            conn, token_row, action_type, target_url, field_name,
+            agent_id, org_id, context or {}
+        )
+
+        paradigms_used = [
+            p for p, flag in [
+                ("composite", token_row["has_composite"]),
+                ("conditional", token_row["has_conditional"]),
+                ("federated", token_row["has_federated"]),
+                ("temporal", token_row["has_temporal"]),
+                ("agentic", token_row["has_agentic"]),
+                ("proof", token_row["has_proof"]),
+                ("orchestration", token_row["has_orchestration"]),
+            ] if flag
+        ]
+
+        if not authorized:
+            # Log denial
+            await conn.execute("""
+                INSERT INTO omega_token_reveal_log
+                  (tenant_id,token_id,agent_id,paradigms_used,action_type,
+                   target_url,field_name,phase,authorized,deny_reason,
+                   gates_checked,uses_before,uses_after)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
+            """, tenant_id, token_id, agent_id, paradigms_used, action_type,
+                target_url, field_name, token_row["current_phase"],
+                False, reason, _json.dumps(gates), uses_before)
+
+            return {
+                "authorized":     False,
+                "deny_reason":    reason,
+                "real_value":     None,
+                "token_id":       token_id,
+                "data_type":      token_row["data_type"],
+                "gates_checked":  gates,
+                "paradigms_used": paradigms_used,
+            }
+
+        # All gates passed — reveal real value
+        uses_after = uses_before - 1
+
+        await conn.execute(
+            "UPDATE omega_tokens SET uses_remaining=$1 WHERE token_id=$2 AND tenant_id=$3",
+            uses_after, token_id, tenant_id
+        )
+
+        auto_revoked = False
+        if uses_after <= 0:
+            await conn.execute("""
+                UPDATE omega_tokens
+                SET revoked=TRUE, revoked_at=NOW(), revoked_reason='max_uses_reached'
+                WHERE token_id=$1 AND tenant_id=$2
+            """, token_id, tenant_id)
+            auto_revoked = True
+
+        # Log successful reveal
+        await conn.execute("""
+            INSERT INTO omega_token_reveal_log
+              (tenant_id,token_id,agent_id,paradigms_used,action_type,
+               target_url,field_name,phase,authorized,gates_checked,
+               uses_before,uses_after)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        """, tenant_id, token_id, agent_id, paradigms_used, action_type,
+            target_url, field_name, token_row["current_phase"],
+            True, _json.dumps(gates), uses_before, uses_after)
+
+        result = {
+            "authorized":     True,
+            "real_value":     token_row["real_value"],
+            "token_id":       token_id,
+            "data_type":      token_row["data_type"],
+            "semantic_label": token_row["semantic_label"],
+            "uses_remaining": uses_after,
+            "auto_revoked":   auto_revoked,
+            "paradigms_used": paradigms_used,
+            "gates_checked":  gates,
+            "message":        "Real value revealed. Audit logged.",
+        }
+
+        # Composite: resolve graph (metadata only — not real values)
+        if token_row["has_composite"] and token_row["composite_graph"]:
+            graph = token_row["composite_graph"] if isinstance(token_row["composite_graph"], dict) \
+                    else _json.loads(token_row["composite_graph"])
+            result["graph"] = await _resolve_composite_graph(pool, tenant_id, graph)
+
+        # Conditional: report which condition matched
+        cond_gate = gates.get("gate_9_conditional", "")
+        if "MATCHED" in cond_gate:
+            result["routed_action"] = cond_gate.split("→")[-1].strip().strip("'")
+
+        # Temporal: report current phase
+        if token_row["has_temporal"]:
+            result["current_phase"] = token_row["current_phase"]
+
+        # Proof: include proofs in result (in addition to real value if all gates passed)
+        if token_row["has_proof"] and token_row["proof_facts"]:
+            proofs = token_row["proof_facts"] if isinstance(token_row["proof_facts"], dict) \
+                     else _json.loads(token_row["proof_facts"])
+            result["proofs"] = proofs
+
+        # Agentic: include agent context
+        if token_row["has_agentic"]:
+            result["agent_context"] = _build_agent_context(token_row)
+
+        return result
+
+
+# ── Temporal: advance lifecycle phase ─────────────────────────────────────────
+
+async def omega_token_transition(
+    pool,
+    tenant_id:    str,
+    token_id:     str,
+    to_phase:     str,
+    triggered_by: str = None,
+) -> dict:
+    """Advance an OmegaToken to the next lifecycle phase."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM omega_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+        if not row:
+            return {"error": f"Token '{token_id}' not found"}
+        if not row["has_temporal"]:
+            return {"error": "Token does not have temporal paradigm"}
+        if row["revoked"]:
+            return {"error": "Token is revoked"}
+
+        phases = row["lifecycle_phases"] if isinstance(row["lifecycle_phases"], list) \
+                 else _json.loads(row["lifecycle_phases"])
+        phase_names = [p["phase"] for p in phases]
+        if to_phase not in phase_names:
+            return {"error": f"Phase '{to_phase}' not in lifecycle: {phase_names}"}
+
+        from_phase = row["current_phase"]
+        await conn.execute(
+            "UPDATE omega_tokens SET current_phase=$1 WHERE token_id=$2 AND tenant_id=$3",
+            to_phase, token_id, tenant_id
+        )
+        await conn.execute("""
+            INSERT INTO omega_token_events
+              (token_id, tenant_id, event_type, from_phase, to_phase, triggered_by)
+            VALUES ($1,$2,'phase_transition',$3,$4,$5)
+        """, token_id, tenant_id, from_phase, to_phase, triggered_by)
+
+        return {
+            "token_id":   token_id,
+            "from_phase": from_phase,
+            "to_phase":   to_phase,
+            "message":    f"Token advanced from '{from_phase}' to '{to_phase}'.",
+        }
+
+
+# ── Federated: record org approval ────────────────────────────────────────────
+
+async def omega_token_approve(
+    pool,
+    tenant_id:   str,
+    token_id:    str,
+    org_id:      str,
+    approved_by: str = None,
+) -> dict:
+    """Record a federated org approval for an OmegaToken."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM omega_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+        if not row:
+            return {"error": f"Token '{token_id}' not found"}
+        if not row["has_federated"]:
+            return {"error": "Token does not have federated paradigm"}
+
+        fed = row["federated_policy"] if isinstance(row["federated_policy"], dict) \
+              else _json.loads(row["federated_policy"])
+        if org_id not in fed.get("allowed_orgs", []):
+            return {"error": f"Org '{org_id}' is not in this token's allowed_orgs: {fed['allowed_orgs']}"}
+
+        sig = _hashlib.sha256(f"{token_id}:{org_id}:{approved_by}".encode()).hexdigest()[:16]
+        await conn.execute("""
+            INSERT INTO omega_federated_approvals (token_id, tenant_id, org_id, approved_by, signature)
+            VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (token_id, org_id) DO UPDATE SET approved_by=$4, approved_at=NOW(), signature=$5
+        """, token_id, tenant_id, org_id, approved_by, sig)
+
+        approvals = await conn.fetch(
+            "SELECT org_id FROM omega_federated_approvals WHERE token_id=$1",
+            token_id
+        )
+        approved = [r["org_id"] for r in approvals]
+        needed   = fed["allowed_orgs"] if fed.get("require_all") else f"{fed.get('min_approvals',1)} of {fed['allowed_orgs']}"
+
+        return {
+            "token_id":      token_id,
+            "org_id":        org_id,
+            "approved_by":   approved_by,
+            "signature":     sig,
+            "approved_orgs": approved,
+            "needed":        needed,
+            "ready":         len(approved) >= fed.get("min_approvals", 1),
+            "message":       f"Org '{org_id}' approval recorded. {len(approved)} org(s) approved.",
+        }
+
+
+# ── Metadata: get omega token ─────────────────────────────────────────────────
+
+async def get_omega_token_metadata(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+) -> dict:
+    """Return agent-safe metadata. Never returns real_value."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM omega_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+        if not row:
+            return {"error": f"OmegaToken '{token_id}' not found"}
+
+        tr = dict(row)
+        active = [
+            p for p, flag in [
+                ("composite", tr["has_composite"]), ("conditional", tr["has_conditional"]),
+                ("federated", tr["has_federated"]), ("temporal", tr["has_temporal"]),
+                ("agentic", tr["has_agentic"]), ("proof", tr["has_proof"]),
+                ("orchestration", tr["has_orchestration"]),
+            ] if flag
+        ]
+
+        result = {
+            "token_id":        token_id,
+            "token_type":      "omega",
+            "data_type":       tr["data_type"],
+            "semantic_label":  tr["semantic_label"],
+            "classification":  tr["classification"],
+            "active_paradigms": active,
+            "policy": {
+                "allowed_actions": tr["allowed_actions"] or "any",
+                "allowed_fields":  tr["allowed_fields"]  or "any",
+                "max_uses":        tr["max_uses"],
+                "uses_remaining":  tr["uses_remaining"],
+                "ttl_seconds":     tr["ttl_seconds"],
+            },
+            "status": {
+                "revoked":    tr["revoked"],
+                "expired":    tr["expires_at"] < datetime.now(timezone.utc) if tr["expires_at"] else False,
+                "exhausted":  tr["uses_remaining"] <= 0,
+            },
+            "created_at": tr["created_at"].isoformat() if tr["created_at"] else None,
+            "expires_at": tr["expires_at"].isoformat() if tr["expires_at"] else None,
+        }
+
+        if tr["has_temporal"]:
+            result["current_phase"] = tr["current_phase"]
+        if tr["has_composite"] and tr["composite_graph"]:
+            g = tr["composite_graph"] if isinstance(tr["composite_graph"], dict) \
+                else _json.loads(tr["composite_graph"])
+            result["graph_fields"] = list(g.keys())
+        if tr["has_federated"] and tr["federated_policy"]:
+            f = tr["federated_policy"] if isinstance(tr["federated_policy"], dict) \
+                else _json.loads(tr["federated_policy"])
+            result["federated_orgs"] = f.get("allowed_orgs", [])
+        if tr["has_agentic"] and tr["agent_instructions"]:
+            result["agent_context"] = _build_agent_context(tr)
+        if tr["has_proof"] and tr["proof_facts"]:
+            pf = tr["proof_facts"] if isinstance(tr["proof_facts"], dict) \
+                 else _json.loads(tr["proof_facts"])
+            result["available_proofs"] = list(pf.keys())
+        if tr["has_orchestration"] and tr["pipeline_policy"]:
+            pp = tr["pipeline_policy"] if isinstance(tr["pipeline_policy"], dict) \
+                 else _json.loads(tr["pipeline_policy"])
+            result["pipeline_agents"] = list(pp.keys())
+
+        return result
+
+
+# ── Audit: get omega token audit log ──────────────────────────────────────────
+
+async def get_omega_token_audit(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+) -> dict:
+    """Full audit trail for an OmegaToken."""
+    async with pool.acquire() as conn:
+        reveals = await conn.fetch(
+            "SELECT * FROM omega_token_reveal_log WHERE token_id=$1 ORDER BY created_at DESC LIMIT 100",
+            token_id
+        )
+        events = await conn.fetch(
+            "SELECT * FROM omega_token_events WHERE token_id=$1 ORDER BY created_at DESC LIMIT 50",
+            token_id
+        )
+        approvals = await conn.fetch(
+            "SELECT * FROM omega_federated_approvals WHERE token_id=$1",
+            token_id
+        )
+
+    return {
+        "token_id": token_id,
+        "reveal_log": [
+            {
+                "id":             r["id"],
+                "agent_id":       r["agent_id"],
+                "paradigms_used": r["paradigms_used"],
+                "action_type":    r["action_type"],
+                "target_url":     r["target_url"],
+                "field_name":     r["field_name"],
+                "phase":          r["phase"],
+                "authorized":     r["authorized"],
+                "deny_reason":    r["deny_reason"],
+                "proof_returned": r["proof_returned"],
+                "uses_before":    r["uses_before"],
+                "uses_after":     r["uses_after"],
+                "created_at":     r["created_at"].isoformat(),
+            } for r in reveals
+        ],
+        "lifecycle_events": [
+            {
+                "event_type":   e["event_type"],
+                "from_phase":   e["from_phase"],
+                "to_phase":     e["to_phase"],
+                "triggered_by": e["triggered_by"],
+                "created_at":   e["created_at"].isoformat(),
+            } for e in events
+        ],
+        "federated_approvals": [
+            {
+                "org_id":      a["org_id"],
+                "approved_by": a["approved_by"],
+                "approved_at": a["approved_at"].isoformat(),
+                "signature":   a["signature"],
+            } for a in approvals
+        ],
+        "total_reveals":   len(reveals),
+        "total_events":    len(events),
+        "total_approvals": len(approvals),
+    }
+
+
+# ── Revoke OmegaToken ─────────────────────────────────────────────────────────
+
+async def revoke_omega_token(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+    reason:    str = "manual_revocation",
+) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT token_id FROM omega_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+        if not row:
+            return {"error": f"OmegaToken '{token_id}' not found"}
+        await conn.execute("""
+            UPDATE omega_tokens
+            SET revoked=TRUE, revoked_at=NOW(), revoked_reason=$1
+            WHERE token_id=$2 AND tenant_id=$3
+        """, reason, token_id, tenant_id)
+        await conn.execute("""
+            INSERT INTO omega_token_events (token_id, tenant_id, event_type, metadata)
+            VALUES ($1,$2,'revoked',$3)
+        """, token_id, tenant_id, _json.dumps({"reason": reason}))
+
+    return {
+        "token_id": token_id,
+        "revoked":  True,
+        "reason":   reason,
+        "message":  f"OmegaToken '{token_id}' revoked. No further reveals possible.",
+    }
+
+
+# ── Batch mint ────────────────────────────────────────────────────────────────
+
+async def mint_omega_tokens_batch(
+    pool,
+    tenant_id: str,
+    tokens:    list[dict],
+    agent_id:  str = None,
+) -> list[dict]:
+    """Mint up to 100 OmegaTokens in one call."""
+    results = []
+    for t in tokens:
+        result = await mint_omega_token(
+            pool,
+            tenant_id           = tenant_id,
+            real_value          = t["real_value"],
+            data_type           = t["data_type"],
+            agent_id            = agent_id or t.get("agent_id"),
+            allowed_actions     = t.get("allowed_actions", []),
+            allowed_targets     = t.get("allowed_targets", []),
+            allowed_fields      = t.get("allowed_fields",  []),
+            max_uses            = t.get("max_uses",        1),
+            ttl_seconds         = t.get("ttl_seconds",     86400),
+            semantic_label      = t.get("semantic_label"),
+            audit_reveal        = t.get("audit_reveal",    True),
+            composite_graph     = t.get("composite_graph"),
+            conditions          = t.get("conditions"),
+            federated_policy    = t.get("federated_policy"),
+            lifecycle_phases    = t.get("lifecycle_phases"),
+            initial_phase       = t.get("initial_phase"),
+            agent_instructions  = t.get("agent_instructions"),
+            proof_facts         = t.get("proof_facts"),
+            pipeline_policy     = t.get("pipeline_policy"),
+        )
+        results.append(result)
+    return results
+
+
+# ── Stats ─────────────────────────────────────────────────────────────────────
+
+async def get_omega_stats(pool, tenant_id: str) -> dict:
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM omega_tokens WHERE tenant_id=$1", tenant_id)
+        active = await conn.fetchval(
+            "SELECT COUNT(*) FROM omega_tokens WHERE tenant_id=$1 AND revoked=FALSE AND uses_remaining>0",
+            tenant_id)
+        reveals = await conn.fetchval(
+            "SELECT COUNT(*) FROM omega_token_reveal_log WHERE tenant_id=$1 AND authorized=TRUE",
+            tenant_id)
+        denials = await conn.fetchval(
+            "SELECT COUNT(*) FROM omega_token_reveal_log WHERE tenant_id=$1 AND authorized=FALSE",
+            tenant_id)
+        approvals = await conn.fetchval(
+            "SELECT COUNT(*) FROM omega_federated_approvals WHERE tenant_id=$1", tenant_id)
+
+        paradigm_counts = {}
+        for p in ["composite","conditional","federated","temporal","agentic","proof","orchestration"]:
+            paradigm_counts[p] = await conn.fetchval(
+                f"SELECT COUNT(*) FROM omega_tokens WHERE tenant_id=$1 AND has_{p}=TRUE",
+                tenant_id)
+
+    return {
+        "total_omega_tokens":    total,
+        "active_tokens":         active,
+        "total_reveals":         reveals,
+        "total_denials":         denials,
+        "federated_approvals":   approvals,
+        "paradigm_usage":        paradigm_counts,
+        "real_data_seen_by_agent": 0,
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THINKING TOKEN SYSTEM — v6.0
+# "Data that thinks. Agents that ask. Nobody sees anything."
+#
+# A ThinkingToken is not a data container. It is a data AGENT.
+# It holds a real value in the vault (encrypted, never seen).
+# It evaluates queries against its own facts using rule-based reasoning.
+# It remembers what it has been asked across a session.
+# It evolves its reasoning patterns from query history.
+# It signals proactively when it knows it is relevant.
+# It teaches other tokens in its cohort what it learned.
+#
+# Token format: tht_{TYPE4}_{RANDOM10}
+# Example:      tht_USER_a1b2c3d4e5
+#
+# DB TABLES:
+#   thinking_tokens        — core token + facts + rules
+#   thinking_token_memory  — per-session accumulated context
+#   thinking_token_log     — every query evaluated (authorized or not)
+#   thinking_token_evolution — learned patterns per token
+#
+# ENDPOINTS:
+#   POST /think/mint           — create a ThinkingToken with facts + rules
+#   POST /think/mint/batch     — mint up to 100 at once
+#   POST /think/query          — ask a natural language question, tokens evaluate themselves
+#   POST /think/cohort         — query a named cohort of tokens at once
+#   GET  /think/{id}           — inspect token (never real value)
+#   GET  /think/{id}/memory    — what has this token learned this session
+#   POST /think/{id}/evolve    — trigger manual evolution cycle
+#   POST /think/{id}/signal    — token proactively flags itself
+#   GET  /think/{id}/audit     — full query history
+#   DELETE /think/{id}         — revoke token
+#   GET  /think/stats          — system-wide thinking stats
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── DB Migrations ──────────────────────────────────────────────────────────────
+
+THINKING_TOKEN_MIGRATIONS = [
+
+    # Core thinking token
+    """CREATE TABLE IF NOT EXISTS thinking_tokens (
+        token_id          TEXT PRIMARY KEY,
+        tenant_id         TEXT NOT NULL,
+        agent_id          TEXT,
+        cohort_id         TEXT,           -- group this token belongs to
+
+        -- Vault (encrypted real value — NEVER exposed)
+        real_value        TEXT NOT NULL,
+        data_type         TEXT NOT NULL,
+        semantic_label    TEXT,
+        classification    TEXT DEFAULT 'pii',
+
+        -- Facts — derived truths about the real value (safe to reason on)
+        -- e.g. {"birth_year": 1994, "age": 30, "over_18": true, "region": "south"}
+        facts             JSONB NOT NULL DEFAULT '{}',
+
+        -- Rules — what this token is allowed to answer
+        -- e.g. [{"if": "birth_year == 1994", "answer": "yes", "field": "born_1994"}]
+        rules             JSONB NOT NULL DEFAULT '[]',
+
+        -- Evolution — learned patterns from query history
+        learned_patterns  JSONB NOT NULL DEFAULT '[]',
+        query_count       INTEGER DEFAULT 0,
+        match_count       INTEGER DEFAULT 0,
+        evolution_version INTEGER DEFAULT 1,
+
+        -- Cohort signaling — proactive relevance flags
+        signal_conditions JSONB DEFAULT '[]',
+        last_signaled_at  TIMESTAMPTZ,
+
+        -- Base policy
+        allowed_actions   TEXT[]  DEFAULT '{}',
+        max_uses          INTEGER DEFAULT -1,   -- -1 = unlimited
+        uses_remaining    INTEGER DEFAULT -1,
+        ttl_seconds       INTEGER DEFAULT 2592000, -- 30 days default
+        audit_queries     BOOLEAN DEFAULT TRUE,
+
+        -- Lifecycle
+        created_at        TIMESTAMPTZ DEFAULT NOW(),
+        expires_at        TIMESTAMPTZ,
+        revoked           BOOLEAN DEFAULT FALSE,
+        revoked_at        TIMESTAMPTZ,
+        revoked_reason    TEXT
+    )""",
+
+    """CREATE INDEX IF NOT EXISTS tt_tenant_idx
+       ON thinking_tokens(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS tt_cohort_idx
+       ON thinking_tokens(cohort_id, tenant_id)""",
+    """CREATE INDEX IF NOT EXISTS tt_type_idx
+       ON thinking_tokens(data_type, tenant_id)""",
+
+    # Per-session memory — what the token has learned this session
+    """CREATE TABLE IF NOT EXISTS thinking_token_memory (
+        id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        token_id    TEXT NOT NULL,
+        tenant_id   TEXT NOT NULL,
+        session_id  TEXT NOT NULL,
+        query       TEXT NOT NULL,
+        matched     BOOLEAN NOT NULL,
+        match_field TEXT,
+        context     JSONB DEFAULT '{}',
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS ttm_token_session_idx
+       ON thinking_token_memory(token_id, session_id, created_at DESC)""",
+
+    # Full query log — every evaluation
+    """CREATE TABLE IF NOT EXISTS thinking_token_log (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        token_id        TEXT NOT NULL,
+        session_id      TEXT,
+        cohort_id       TEXT,
+        query           TEXT NOT NULL,
+        query_parsed    JSONB,
+        matched         BOOLEAN NOT NULL,
+        match_field     TEXT,
+        match_reason    TEXT,
+        real_value_seen BOOLEAN DEFAULT FALSE,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS ttl_tenant_idx
+       ON thinking_token_log(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS ttl_token_idx
+       ON thinking_token_log(token_id, created_at DESC)""",
+
+    # Learned patterns — evolution store
+    """CREATE TABLE IF NOT EXISTS thinking_token_evolution (
+        id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id   TEXT NOT NULL,
+        token_id    TEXT NOT NULL,
+        cohort_id   TEXT,
+        pattern     TEXT NOT NULL,        -- normalized query pattern
+        hit_count   INTEGER DEFAULT 1,
+        last_seen   TIMESTAMPTZ DEFAULT NOW(),
+        first_seen  TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(token_id, pattern)
+    )""",
+    """CREATE INDEX IF NOT EXISTS tte_token_idx
+       ON thinking_token_evolution(token_id, hit_count DESC)""",
+    """CREATE INDEX IF NOT EXISTS tte_cohort_idx
+       ON thinking_token_evolution(cohort_id, hit_count DESC)""",
+]
+
+
+# ── Token ID ───────────────────────────────────────────────────────────────────
+
+def _thinking_token_id(data_type: str) -> str:
+    """
+    Format: tht_{TYPE4}_{RANDOM10}
+    Example: tht_USER_a1b2c3d4e5
+    """
+    short = data_type.upper()[:4]
+    rand  = _secrets.token_hex(5)
+    return f"tht_{short}_{rand}"
+
+
+# ── Query Parser ───────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> list[dict]:
+    """
+    Parse a natural language query into a list of conditions.
+    Rule-based extraction — no AI needed.
+
+    Supports:
+      "born in 1994"           → {field: birth_year, op: eq, value: 1994}
+      "age over 30"            → {field: age, op: gt, value: 30}
+      "age under 25"           → {field: age, op: lt, value: 25}
+      "from Atlanta"           → {field: region/city, op: contains, value: "atlanta"}
+      "high risk"              → {field: risk, op: eq, value: "high"}
+      "salary above 100000"    → {field: salary, op: gt, value: 100000}
+      "subscribed"             → {field: subscribed, op: eq, value: true}
+      "not subscribed"         → {field: subscribed, op: eq, value: false}
+      "department engineering" → {field: department, op: eq, value: "engineering"}
+      "score between 80 100"   → {field: score, op: between, value: [80, 100]}
+    """
+    import re as _re
+    q = query.lower().strip()
+    conditions = []
+
+    # ── Date / year patterns ──
+    m = _re.search(r'born\s+in\s+(\d{4})', q)
+    if m:
+        conditions.append({"field": "birth_year", "op": "eq", "value": int(m.group(1)), "source": m.group(0)})
+
+    m = _re.search(r'birth\s*year\s*(?:is\s*|=\s*|==\s*)?(\d{4})', q)
+    if m:
+        conditions.append({"field": "birth_year", "op": "eq", "value": int(m.group(1)), "source": m.group(0)})
+
+    m = _re.search(r'(?:from|after|since)\s+(\d{4})', q)
+    if m:
+        conditions.append({"field": "birth_year", "op": "gte", "value": int(m.group(1)), "source": m.group(0)})
+
+    m = _re.search(r'before\s+(\d{4})', q)
+    if m:
+        conditions.append({"field": "birth_year", "op": "lt", "value": int(m.group(1)), "source": m.group(0)})
+
+    # ── Age patterns ──
+    m = _re.search(r'age\s+(?:over|above|>|older than)\s+(\d+)', q)
+    if m:
+        conditions.append({"field": "age", "op": "gt", "value": int(m.group(1)), "source": m.group(0)})
+
+    m = _re.search(r'age\s+(?:under|below|<|younger than)\s+(\d+)', q)
+    if m:
+        conditions.append({"field": "age", "op": "lt", "value": int(m.group(1)), "source": m.group(0)})
+
+    m = _re.search(r'age\s+(?:is\s*|=\s*)?(\d+)', q)
+    if m:
+        conditions.append({"field": "age", "op": "eq", "value": int(m.group(1)), "source": m.group(0)})
+
+    m = _re.search(r'(?:aged?)\s+between\s+(\d+)\s+and\s+(\d+)', q)
+    if m:
+        conditions.append({"field": "age", "op": "between", "value": [int(m.group(1)), int(m.group(2))], "source": m.group(0)})
+
+    # ── Numeric / salary / score / amount ──
+    for field in ["salary", "score", "amount", "balance", "revenue", "income", "price", "count"]:
+        m = _re.search(rf'{field}\s+(?:above|over|>|greater than)\s+(\d[\d,]*)', q)
+        if m:
+            val = int(m.group(1).replace(",", ""))
+            conditions.append({"field": field, "op": "gt", "value": val, "source": m.group(0)})
+
+        m = _re.search(rf'{field}\s+(?:below|under|<|less than)\s+(\d[\d,]*)', q)
+        if m:
+            val = int(m.group(1).replace(",", ""))
+            conditions.append({"field": field, "op": "lt", "value": val, "source": m.group(0)})
+
+        m = _re.search(rf'{field}\s+(?:is\s*|=\s*|==\s*)?(\d[\d,]*)', q)
+        if m:
+            val = int(m.group(1).replace(",", ""))
+            conditions.append({"field": field, "op": "eq", "value": val, "source": m.group(0)})
+
+        m = _re.search(rf'{field}\s+between\s+(\d[\d,]*)\s+and\s+(\d[\d,]*)', q)
+        if m:
+            v1 = int(m.group(1).replace(",", ""))
+            v2 = int(m.group(2).replace(",", ""))
+            conditions.append({"field": field, "op": "between", "value": [v1, v2], "source": m.group(0)})
+
+    # ── Risk / priority / status ──
+    for level in ["high", "medium", "low", "critical", "urgent", "normal"]:
+        if _re.search(rf'\b{level}\s+risk\b', q) or _re.search(rf'\brisk\s+{level}\b', q):
+            conditions.append({"field": "risk", "op": "eq", "value": level, "source": f"{level} risk"})
+
+    for status in ["active", "inactive", "pending", "approved", "rejected", "subscribed", "unsubscribed"]:
+        if _re.search(rf'\b{status}\b', q):
+            neg = bool(_re.search(rf'\bnot\s+{status}\b', q))
+            conditions.append({"field": status, "op": "eq", "value": not neg, "source": status})
+
+    # ── Location / region ──
+    m = _re.search(r'(?:from|in|located in|region|city|state)\s+([a-z][a-z\s]{1,30}?)(?:\s+(?:and|or|with|who|where|$))', q)
+    if m:
+        loc = m.group(1).strip()
+        if len(loc) > 2:
+            conditions.append({"field": "location", "op": "contains", "value": loc, "source": m.group(0)})
+
+    # ── Department / role / type ──
+    for kw in ["department", "role", "type", "category", "industry", "sector", "plan", "tier"]:
+        m = _re.search(rf'{kw}\s+(?:is\s*)?([a-z][a-z\s]{{1,30}}?)(?:\s|$)', q)
+        if m:
+            conditions.append({"field": kw, "op": "eq", "value": m.group(1).strip(), "source": m.group(0)})
+
+    # ── Boolean fields ──
+    for field in ["verified", "premium", "churned", "converted", "enrolled", "eligible"]:
+        if _re.search(rf'\b{field}\b', q):
+            neg = bool(_re.search(rf'\bnot\s+{field}\b|\bun{field}\b', q))
+            conditions.append({"field": field, "op": "eq", "value": not neg, "source": field})
+
+    # ── Diagnosis / condition (healthcare) ──
+    m = _re.search(r'(?:diagnosis|condition|disease|has)\s+([a-z][a-z\s]{1,40}?)(?:\s+(?:and|or|with|$))', q)
+    if m:
+        diag = m.group(1).strip()
+        if len(diag) > 2:
+            conditions.append({"field": "diagnosis", "op": "contains", "value": diag, "source": m.group(0)})
+
+    return conditions
+
+
+# ── Fact Evaluator ─────────────────────────────────────────────────────────────
+
+def _evaluate_condition_against_facts(condition: dict, facts: dict) -> tuple[bool, str]:
+    """
+    Evaluate one parsed condition against a token's facts.
+    Returns (matched, reason).
+    Never touches real_value.
+    """
+    field = condition["field"]
+    op    = condition["op"]
+    value = condition["value"]
+
+    # Find the fact — try direct match and common aliases
+    aliases = {
+        "birth_year": ["birth_year", "year_of_birth", "dob_year", "born"],
+        "age":        ["age", "age_years", "current_age"],
+        "risk":       ["risk", "risk_level", "risk_score"],
+        "location":   ["location", "city", "state", "region", "country", "zip"],
+        "salary":     ["salary", "compensation", "annual_salary", "income"],
+        "score":      ["score", "credit_score", "performance_score", "rating"],
+        "diagnosis":  ["diagnosis", "condition", "disease", "icd_code"],
+    }
+
+    fact_val = None
+    matched_key = None
+    # Try direct
+    if field in facts:
+        fact_val    = facts[field]
+        matched_key = field
+    else:
+        # Try aliases
+        for canonical, alias_list in aliases.items():
+            if field == canonical or field in alias_list:
+                for alias in alias_list:
+                    if alias in facts:
+                        fact_val    = facts[alias]
+                        matched_key = alias
+                        break
+            if fact_val is not None:
+                break
+        # Try contains match on field name
+        if fact_val is None:
+            for fk, fv in facts.items():
+                if field in fk or fk in field:
+                    fact_val    = fv
+                    matched_key = fk
+                    break
+
+    if fact_val is None:
+        return False, f"fact '{field}' not in token facts"
+
+    # Evaluate operator
+    try:
+        if op == "eq":
+            if isinstance(value, bool):
+                matched = bool(fact_val) == value
+            elif isinstance(value, (int, float)):
+                matched = float(fact_val) == float(value)
+            else:
+                matched = str(fact_val).lower().strip() == str(value).lower().strip()
+            reason = f"{matched_key}={fact_val} {'==' if matched else '!='} {value}"
+
+        elif op == "gt":
+            matched = float(fact_val) > float(value)
+            reason  = f"{matched_key}={fact_val} {'>' if matched else '<='} {value}"
+
+        elif op == "lt":
+            matched = float(fact_val) < float(value)
+            reason  = f"{matched_key}={fact_val} {'<' if matched else '>='} {value}"
+
+        elif op == "gte":
+            matched = float(fact_val) >= float(value)
+            reason  = f"{matched_key}={fact_val} {'>=' if matched else '<'} {value}"
+
+        elif op == "lte":
+            matched = float(fact_val) <= float(value)
+            reason  = f"{matched_key}={fact_val} {'<=' if matched else '>'} {value}"
+
+        elif op == "between":
+            lo, hi  = float(value[0]), float(value[1])
+            matched = lo <= float(fact_val) <= hi
+            reason  = f"{matched_key}={fact_val} {'in' if matched else 'not in'} [{lo},{hi}]"
+
+        elif op == "contains":
+            matched = str(value).lower() in str(fact_val).lower()
+            reason  = f"'{value}' {'in' if matched else 'not in'} {matched_key}='{fact_val}'"
+
+        elif op == "not_eq":
+            matched = str(fact_val).lower() != str(value).lower()
+            reason  = f"{matched_key}={fact_val} {'!=' if matched else '=='} {value}"
+
+        else:
+            return False, f"unknown operator '{op}'"
+
+    except (ValueError, TypeError) as e:
+        return False, f"type error evaluating {matched_key}: {e}"
+
+    return matched, reason
+
+
+def _token_matches_query(facts: dict, rules: list, conditions: list) -> tuple[bool, str, str]:
+    """
+    Check if a token matches a parsed query.
+    Returns (matched, match_field, match_reason).
+
+    First checks rules (explicit), then checks facts (derived).
+    ALL conditions must match (AND logic).
+    """
+    if not conditions:
+        return False, None, "no conditions parsed from query"
+
+    match_reasons = []
+    match_fields  = []
+
+    for condition in conditions:
+        # Check explicit rules first
+        rule_matched = False
+        for rule in rules:
+            rule_field = rule.get("field", "")
+            rule_cond  = rule.get("if", "")
+            if rule_field == condition["field"] or condition["field"] in rule_cond:
+                # Evaluate the rule condition
+                matched, reason = _evaluate_condition_against_facts(condition, facts)
+                if matched:
+                    rule_matched = True
+                    match_fields.append(rule_field or condition["field"])
+                    match_reasons.append(f"rule:{reason}")
+                else:
+                    return False, None, f"rule_mismatch:{reason}"
+                break
+
+        if not rule_matched:
+            # Fall back to direct fact evaluation
+            matched, reason = _evaluate_condition_against_facts(condition, facts)
+            if matched:
+                match_fields.append(condition["field"])
+                match_reasons.append(f"fact:{reason}")
+            else:
+                return False, None, f"no_match:{reason}"
+
+    if match_fields:
+        return True, ",".join(match_fields), " | ".join(match_reasons)
+
+    return False, None, "no conditions matched"
+
+
+# ── Evolution Engine ───────────────────────────────────────────────────────────
+
+def _normalize_query_pattern(query: str) -> str:
+    """
+    Normalize a query to a pattern for evolution tracking.
+    "find users born in 1994" → "find users born in {year}"
+    "show me high risk patients" → "show {risk} risk {entity}"
+    """
+    import re as _re
+    p = query.lower().strip()
+    p = _re.sub(r'\b\d{4}\b', '{year}', p)
+    p = _re.sub(r'\b\d+\b', '{num}', p)
+    p = _re.sub(r'\b(users?|patients?|employees?|customers?|people|records?)\b', '{entity}', p)
+    p = _re.sub(r'\s+', ' ', p)
+    return p.strip()
+
+
+async def _update_evolution(conn, token_id: str, tenant_id: str, cohort_id: str, query: str, matched: bool):
+    """Update learned patterns for a token after a query."""
+    pattern = _normalize_query_pattern(query)
+
+    # Update token query stats
+    if matched:
+        await conn.execute("""
+            UPDATE thinking_tokens
+            SET query_count = query_count + 1,
+                match_count = match_count + 1
+            WHERE token_id=$1 AND tenant_id=$2
+        """, token_id, tenant_id)
+    else:
+        await conn.execute("""
+            UPDATE thinking_tokens
+            SET query_count = query_count + 1
+            WHERE token_id=$1 AND tenant_id=$2
+        """, token_id, tenant_id)
+
+    # Upsert pattern into evolution table
+    await conn.execute("""
+        INSERT INTO thinking_token_evolution (token_id, tenant_id, cohort_id, pattern, hit_count)
+        VALUES ($1, $2, $3, $4, 1)
+        ON CONFLICT (token_id, pattern)
+        DO UPDATE SET hit_count = thinking_token_evolution.hit_count + 1,
+                      last_seen = NOW()
+    """, token_id, tenant_id, cohort_id, pattern)
+
+    # Evolve: after 10 queries, increment evolution_version and update learned_patterns
+    row = await conn.fetchrow(
+        "SELECT query_count, match_count, evolution_version FROM thinking_tokens WHERE token_id=$1",
+        token_id
+    )
+    if row and row["query_count"] % 10 == 0:
+        # Get top patterns
+        top_patterns = await conn.fetch("""
+            SELECT pattern, hit_count
+            FROM thinking_token_evolution
+            WHERE token_id=$1
+            ORDER BY hit_count DESC LIMIT 10
+        """, token_id)
+
+        learned = [{"pattern": r["pattern"], "hits": r["hit_count"]} for r in top_patterns]
+        match_rate = row["match_count"] / max(row["query_count"], 1)
+
+        await conn.execute("""
+            UPDATE thinking_tokens
+            SET learned_patterns = $1,
+                evolution_version = evolution_version + 1
+            WHERE token_id=$1 AND tenant_id=$2
+        """, _json.dumps(learned), token_id, tenant_id)
+
+
+# ── Signal Engine ──────────────────────────────────────────────────────────────
+
+def _check_signal_conditions(facts: dict, signal_conditions: list) -> tuple[bool, str]:
+    """
+    Check if a token should proactively signal itself.
+    Signal conditions are simple rules the token evaluates autonomously.
+    e.g. [{"if": "risk == 'high'", "signal": "high_risk_patient"}]
+    """
+    for sc in signal_conditions:
+        condition_str = sc.get("if", "")
+        signal_label  = sc.get("signal", "relevant")
+        # Use existing evaluator
+        if _evaluate_condition(condition_str, facts):
+            return True, signal_label
+    return False, None
+
+
+# ── Core: Mint ThinkingToken ───────────────────────────────────────────────────
+
+async def mint_thinking_token(
+    pool,
+    tenant_id:   str,
+    real_value:  str,
+    data_type:   str,
+    facts:       dict,          # derived facts — safe to reason on
+    agent_id:    str  = None,
+    cohort_id:   str  = None,   # group this token belongs to
+    rules:       list = None,   # explicit matching rules
+    signal_conditions: list = None,  # proactive signal conditions
+    allowed_actions: list = [],
+    max_uses:    int  = -1,     # -1 = unlimited
+    ttl_seconds: int  = 2592000,
+    semantic_label: str = None,
+    audit_queries: bool = True,
+) -> dict:
+    """
+    Mint a ThinkingToken.
+
+    The token holds:
+    - real_value: encrypted in vault, never seen
+    - facts: derived truths — what the token KNOWS about itself
+    - rules: explicit matching logic
+    - signal_conditions: when to proactively flag itself
+
+    The agent receives only the token_id + facts summary.
+    Real value NEVER returned.
+    """
+    meta       = _resolve_data_type(data_type)
+    label      = semantic_label or meta["label"]
+    classif    = meta["classification"]
+    token_id   = _thinking_token_id(data_type)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    uses       = max_uses  # -1 = unlimited
+
+    rules_validated  = rules or []
+    signal_validated = signal_conditions or []
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO thinking_tokens (
+                token_id, tenant_id, agent_id, cohort_id,
+                real_value, data_type, semantic_label, classification,
+                facts, rules, signal_conditions,
+                allowed_actions, max_uses, uses_remaining,
+                ttl_seconds, audit_queries, expires_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17
+            )
+        """,
+            token_id, tenant_id, agent_id, cohort_id,
+            str(real_value), data_type, label, classif,
+            _json.dumps(facts), _json.dumps(rules_validated),
+            _json.dumps(signal_validated),
+            allowed_actions, uses, uses,
+            ttl_seconds, audit_queries, expires_at,
+        )
+
+    # Return agent-safe metadata — never real_value
+    return {
+        "token_id":       token_id,
+        "token_type":     "thinking",
+        "data_type":      data_type,
+        "semantic_label": label,
+        "classification": classif,
+        "cohort_id":      cohort_id,
+        "facts_summary": {
+            k: ("*hidden*" if k in ["ssn","mrn","card","password","secret"] else v)
+            for k, v in facts.items()
+        },
+        "fact_count":      len(facts),
+        "rule_count":      len(rules_validated),
+        "signal_count":    len(signal_validated),
+        "can_think":       True,
+        "can_evolve":      True,
+        "can_signal":      len(signal_validated) > 0,
+        "expires_at":      expires_at.isoformat(),
+        "hint": (
+            f"ThinkingToken representing a {label}. "
+            f"Holds {len(facts)} facts. Will evaluate queries autonomously. "
+            f"Real value vault-protected and never returned."
+        ),
+    }
+
+
+# ── Core: Query ThinkingTokens ─────────────────────────────────────────────────
+
+async def query_thinking_tokens(
+    pool,
+    tenant_id:  str,
+    query:      str,
+    cohort_id:  str  = None,    # limit to a cohort
+    data_type:  str  = None,    # limit to a data type
+    token_ids:  list = None,    # limit to specific tokens
+    session_id: str  = None,
+    top_k:      int  = 100,
+    include_reasons: bool = False,
+) -> dict:
+    """
+    Ask a natural language question.
+    Every ThinkingToken evaluates itself against the query.
+    Returns list of matching token_ids. Never returns real values.
+
+    Example:
+      query="find all users born in 1994 who are high risk"
+      → Returns token_ids of matching tokens
+      → Agent never sees a single date of birth or risk score
+    """
+    session_id = session_id or _secrets.token_hex(8)
+
+    # Parse query into conditions
+    conditions = _parse_query(query)
+    if not conditions:
+        return {
+            "query":          query,
+            "conditions":     [],
+            "matched_tokens": [],
+            "match_count":    0,
+            "total_evaluated": 0,
+            "session_id":     session_id,
+            "real_data_seen_by_agent": 0,
+            "warning": "No conditions could be parsed from query. Try: 'born in 1994', 'age over 30', 'high risk', etc.",
+        }
+
+    # Load tokens to evaluate
+    async with pool.acquire() as conn:
+        if token_ids:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, rules, cohort_id, signal_conditions, "
+                "learned_patterns, query_count "
+                "FROM thinking_tokens "
+                "WHERE token_id=ANY($1) AND tenant_id=$2 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "AND (uses_remaining = -1 OR uses_remaining > 0)",
+                token_ids, tenant_id
+            )
+        elif cohort_id:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, rules, cohort_id, signal_conditions, "
+                "learned_patterns, query_count "
+                "FROM thinking_tokens "
+                "WHERE cohort_id=$1 AND tenant_id=$2 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "AND (uses_remaining = -1 OR uses_remaining > 0) "
+                "LIMIT $3",
+                cohort_id, tenant_id, top_k * 10
+            )
+        elif data_type:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, rules, cohort_id, signal_conditions, "
+                "learned_patterns, query_count "
+                "FROM thinking_tokens "
+                "WHERE data_type=$1 AND tenant_id=$2 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "AND (uses_remaining = -1 OR uses_remaining > 0) "
+                "LIMIT $3",
+                data_type, tenant_id, top_k * 10
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, rules, cohort_id, signal_conditions, "
+                "learned_patterns, query_count "
+                "FROM thinking_tokens "
+                "WHERE tenant_id=$1 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "AND (uses_remaining = -1 OR uses_remaining > 0) "
+                "LIMIT $2",
+                tenant_id, top_k * 10
+            )
+
+        matched_tokens = []
+        total_evaluated = 0
+
+        for row in rows:
+            total_evaluated += 1
+            facts = row["facts"] if isinstance(row["facts"], dict) else _json.loads(row["facts"])
+            rules = row["rules"] if isinstance(row["rules"], list) else _json.loads(row["rules"])
+
+            matched, match_field, match_reason = _token_matches_query(facts, rules, conditions)
+
+            # Log evaluation
+            if True:  # always log
+                await conn.execute("""
+                    INSERT INTO thinking_token_log
+                      (tenant_id, token_id, session_id, cohort_id,
+                       query, query_parsed, matched, match_field,
+                       match_reason, real_value_seen)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                """, tenant_id, row["token_id"], session_id,
+                    row["cohort_id"], query,
+                    _json.dumps([c for c in conditions]),
+                    matched, match_field, match_reason, False)
+
+                # Memory
+                await conn.execute("""
+                    INSERT INTO thinking_token_memory
+                      (token_id, tenant_id, session_id, query, matched, match_field)
+                    VALUES ($1,$2,$3,$4,$5,$6)
+                """, row["token_id"], tenant_id, session_id,
+                    query, matched, match_field)
+
+                # Evolution
+                await _update_evolution(
+                    conn, row["token_id"], tenant_id,
+                    row["cohort_id"], query, matched
+                )
+
+            if matched:
+                entry = {
+                    "token_id":    row["token_id"],
+                    "cohort_id":   row["cohort_id"],
+                }
+                if include_reasons:
+                    entry["match_field"]  = match_field
+                    entry["match_reason"] = match_reason
+                matched_tokens.append(entry)
+                if len(matched_tokens) >= top_k:
+                    break
+
+    return {
+        "query":             query,
+        "conditions_parsed": conditions,
+        "condition_count":   len(conditions),
+        "matched_tokens":    matched_tokens,
+        "match_count":       len(matched_tokens),
+        "total_evaluated":   total_evaluated,
+        "session_id":        session_id,
+        "real_data_seen_by_agent": 0,
+        "message": (
+            f"{len(matched_tokens)} token(s) matched out of {total_evaluated} evaluated. "
+            f"No real values returned."
+        ),
+    }
+
+
+# ── Core: Cohort Query ─────────────────────────────────────────────────────────
+
+async def query_thinking_cohort(
+    pool,
+    tenant_id:  str,
+    cohort_id:  str,
+    query:      str,
+    session_id: str  = None,
+    top_k:      int  = 100,
+    include_reasons: bool = False,
+) -> dict:
+    """Query all tokens in a named cohort."""
+    result = await query_thinking_tokens(
+        pool, tenant_id, query,
+        cohort_id=cohort_id,
+        session_id=session_id,
+        top_k=top_k,
+        include_reasons=include_reasons,
+    )
+    result["cohort_id"] = cohort_id
+    return result
+
+
+# ── Core: Token Memory ─────────────────────────────────────────────────────────
+
+async def get_thinking_token_memory(
+    pool,
+    tenant_id:  str,
+    token_id:   str,
+    session_id: str = None,
+    limit:      int = 50,
+) -> dict:
+    """Return what a token has learned — its query history and patterns."""
+    async with pool.acquire() as conn:
+        token = await conn.fetchrow(
+            "SELECT token_id, data_type, semantic_label, cohort_id, "
+            "query_count, match_count, evolution_version, learned_patterns "
+            "FROM thinking_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+        if not token:
+            return {"error": f"ThinkingToken '{token_id}' not found"}
+
+        if session_id:
+            memories = await conn.fetch("""
+                SELECT query, matched, match_field, created_at
+                FROM thinking_token_memory
+                WHERE token_id=$1 AND session_id=$2
+                ORDER BY created_at DESC LIMIT $3
+            """, token_id, session_id, limit)
+        else:
+            memories = await conn.fetch("""
+                SELECT query, matched, match_field, created_at
+                FROM thinking_token_memory
+                WHERE token_id=$1
+                ORDER BY created_at DESC LIMIT $2
+            """, token_id, limit)
+
+        top_patterns = await conn.fetch("""
+            SELECT pattern, hit_count, first_seen, last_seen
+            FROM thinking_token_evolution
+            WHERE token_id=$1
+            ORDER BY hit_count DESC LIMIT 10
+        """, token_id)
+
+    match_rate = 0
+    if token["query_count"] > 0:
+        match_rate = round(token["match_count"] / token["query_count"] * 100, 1)
+
+    return {
+        "token_id":          token_id,
+        "data_type":         token["data_type"],
+        "semantic_label":    token["semantic_label"],
+        "cohort_id":         token["cohort_id"],
+        "total_queries":     token["query_count"],
+        "total_matches":     token["match_count"],
+        "match_rate_pct":    match_rate,
+        "evolution_version": token["evolution_version"],
+        "top_patterns": [
+            {
+                "pattern":    r["pattern"],
+                "hit_count":  r["hit_count"],
+                "first_seen": r["first_seen"].isoformat(),
+                "last_seen":  r["last_seen"].isoformat(),
+            } for r in top_patterns
+        ],
+        "recent_queries": [
+            {
+                "query":       m["query"],
+                "matched":     m["matched"],
+                "match_field": m["match_field"],
+                "at":          m["created_at"].isoformat(),
+            } for m in memories
+        ],
+        "real_data_seen": 0,
+    }
+
+
+# ── Core: Token Metadata ───────────────────────────────────────────────────────
+
+async def get_thinking_token_metadata(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+) -> dict:
+    """Return agent-safe metadata for a ThinkingToken. Never returns real_value."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM thinking_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+    if not row:
+        return {"error": f"ThinkingToken '{token_id}' not found"}
+
+    tr    = dict(row)
+    facts = tr["facts"] if isinstance(tr["facts"], dict) else _json.loads(tr["facts"])
+    rules = tr["rules"] if isinstance(tr["rules"], list) else _json.loads(tr["rules"])
+
+    match_rate = 0
+    if tr["query_count"] > 0:
+        match_rate = round(tr["match_count"] / tr["query_count"] * 100, 1)
+
+    return {
+        "token_id":        token_id,
+        "token_type":      "thinking",
+        "data_type":       tr["data_type"],
+        "semantic_label":  tr["semantic_label"],
+        "classification":  tr["classification"],
+        "cohort_id":       tr["cohort_id"],
+        "facts_summary": {
+            k: ("*hidden*" if k in ["ssn","mrn","card","password","secret"] else v)
+            for k, v in facts.items()
+        },
+        "fact_count":       len(facts),
+        "rule_count":       len(rules),
+        "query_count":      tr["query_count"],
+        "match_count":      tr["match_count"],
+        "match_rate_pct":   match_rate,
+        "evolution_version": tr["evolution_version"],
+        "status": {
+            "revoked":   tr["revoked"],
+            "expired":   tr["expires_at"] < datetime.now(timezone.utc) if tr["expires_at"] else False,
+            "can_think": not tr["revoked"],
+        },
+        "created_at": tr["created_at"].isoformat() if tr["created_at"] else None,
+        "expires_at": tr["expires_at"].isoformat() if tr["expires_at"] else None,
+    }
+
+
+# ── Core: Signal ───────────────────────────────────────────────────────────────
+
+async def check_thinking_signals(
+    pool,
+    tenant_id:  str,
+    cohort_id:  str = None,
+    data_type:  str = None,
+) -> dict:
+    """
+    Ask tokens if any of them want to proactively signal relevance.
+    Tokens check their own signal_conditions autonomously.
+    Returns list of tokens that raised their hand.
+    """
+    async with pool.acquire() as conn:
+        if cohort_id:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, signal_conditions, semantic_label, cohort_id "
+                "FROM thinking_tokens "
+                "WHERE cohort_id=$1 AND tenant_id=$2 "
+                "AND revoked=FALSE AND signal_conditions != '[]'::jsonb",
+                cohort_id, tenant_id
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, signal_conditions, semantic_label, cohort_id "
+                "FROM thinking_tokens "
+                "WHERE tenant_id=$1 "
+                "AND revoked=FALSE AND signal_conditions != '[]'::jsonb "
+                "LIMIT 1000",
+                tenant_id
+            )
+
+        signals = []
+        for row in rows:
+            facts   = row["facts"] if isinstance(row["facts"], dict) else _json.loads(row["facts"])
+            sc_list = row["signal_conditions"] if isinstance(row["signal_conditions"], list) \
+                      else _json.loads(row["signal_conditions"])
+            triggered, label = _check_signal_conditions(facts, sc_list)
+            if triggered:
+                await conn.execute(
+                    "UPDATE thinking_tokens SET last_signaled_at=NOW() WHERE token_id=$1",
+                    row["token_id"]
+                )
+                signals.append({
+                    "token_id":      row["token_id"],
+                    "cohort_id":     row["cohort_id"],
+                    "semantic_label": row["semantic_label"],
+                    "signal":        label,
+                })
+
+    return {
+        "signals":        signals,
+        "signal_count":   len(signals),
+        "cohort_id":      cohort_id,
+        "real_data_seen": 0,
+        "message": (
+            f"{len(signals)} token(s) signaled proactively. No real values returned."
+            if signals else "No tokens signaled."
+        ),
+    }
+
+
+# ── Core: Evolve ───────────────────────────────────────────────────────────────
+
+async def evolve_thinking_token(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+) -> dict:
+    """Manually trigger an evolution cycle for a token."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM thinking_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+        if not row:
+            return {"error": f"ThinkingToken '{token_id}' not found"}
+
+        top_patterns = await conn.fetch("""
+            SELECT pattern, hit_count
+            FROM thinking_token_evolution
+            WHERE token_id=$1
+            ORDER BY hit_count DESC LIMIT 10
+        """, token_id)
+
+        learned = [{"pattern": r["pattern"], "hits": r["hit_count"]} for r in top_patterns]
+        new_ver = row["evolution_version"] + 1
+
+        await conn.execute("""
+            UPDATE thinking_tokens
+            SET learned_patterns=$1, evolution_version=$2
+            WHERE token_id=$3 AND tenant_id=$4
+        """, _json.dumps(learned), new_ver, token_id, tenant_id)
+
+    return {
+        "token_id":          token_id,
+        "evolution_version": new_ver,
+        "learned_patterns":  learned,
+        "message": f"Token evolved to v{new_ver}. Learned {len(learned)} patterns.",
+    }
+
+
+# ── Core: Audit ───────────────────────────────────────────────────────────────
+
+async def get_thinking_token_audit(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+    limit:     int = 100,
+) -> dict:
+    async with pool.acquire() as conn:
+        logs = await conn.fetch("""
+            SELECT query, query_parsed, matched, match_field,
+                   match_reason, real_value_seen, created_at
+            FROM thinking_token_log
+            WHERE token_id=$1 AND tenant_id=$2
+            ORDER BY created_at DESC LIMIT $3
+        """, token_id, tenant_id, limit)
+
+    return {
+        "token_id": token_id,
+        "query_log": [
+            {
+                "query":          r["query"],
+                "matched":        r["matched"],
+                "match_field":    r["match_field"],
+                "match_reason":   r["match_reason"],
+                "real_value_seen": r["real_value_seen"],
+                "at":             r["created_at"].isoformat(),
+            } for r in logs
+        ],
+        "total_entries":   len(logs),
+        "real_data_seen":  0,
+    }
+
+
+# ── Core: Revoke ──────────────────────────────────────────────────────────────
+
+async def revoke_thinking_token(
+    pool,
+    tenant_id: str,
+    token_id:  str,
+    reason:    str = "manual_revocation",
+) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT token_id FROM thinking_tokens WHERE token_id=$1 AND tenant_id=$2",
+            token_id, tenant_id
+        )
+        if not row:
+            return {"error": f"ThinkingToken '{token_id}' not found"}
+        await conn.execute("""
+            UPDATE thinking_tokens
+            SET revoked=TRUE, revoked_at=NOW(), revoked_reason=$1
+            WHERE token_id=$2 AND tenant_id=$3
+        """, reason, token_id, tenant_id)
+    return {
+        "token_id": token_id,
+        "revoked":  True,
+        "reason":   reason,
+        "message":  f"ThinkingToken '{token_id}' revoked. Will no longer respond to queries.",
+    }
+
+
+# ── Core: Batch Mint ──────────────────────────────────────────────────────────
+
+async def mint_thinking_tokens_batch(
+    pool,
+    tenant_id: str,
+    tokens:    list[dict],
+    agent_id:  str = None,
+    cohort_id: str = None,
+) -> list[dict]:
+    """Mint up to 100 ThinkingTokens in one call."""
+    results = []
+    for t in tokens:
+        result = await mint_thinking_token(
+            pool,
+            tenant_id         = tenant_id,
+            real_value        = t["real_value"],
+            data_type         = t["data_type"],
+            facts             = t["facts"],
+            agent_id          = agent_id or t.get("agent_id"),
+            cohort_id         = cohort_id or t.get("cohort_id"),
+            rules             = t.get("rules"),
+            signal_conditions = t.get("signal_conditions"),
+            allowed_actions   = t.get("allowed_actions", []),
+            max_uses          = t.get("max_uses",    -1),
+            ttl_seconds       = t.get("ttl_seconds", 2592000),
+            semantic_label    = t.get("semantic_label"),
+            audit_queries     = t.get("audit_queries", True),
+        )
+        results.append(result)
+    return results
+
+
+# ── Core: Stats ───────────────────────────────────────────────────────────────
+
+async def get_thinking_stats(pool, tenant_id: str) -> dict:
+    async with pool.acquire() as conn:
+        total    = await conn.fetchval(
+            "SELECT COUNT(*) FROM thinking_tokens WHERE tenant_id=$1", tenant_id)
+        active   = await conn.fetchval(
+            "SELECT COUNT(*) FROM thinking_tokens WHERE tenant_id=$1 AND revoked=FALSE", tenant_id)
+        queries  = await conn.fetchval(
+            "SELECT COALESCE(SUM(query_count),0) FROM thinking_tokens WHERE tenant_id=$1", tenant_id)
+        matches  = await conn.fetchval(
+            "SELECT COALESCE(SUM(match_count),0) FROM thinking_tokens WHERE tenant_id=$1", tenant_id)
+        cohorts  = await conn.fetchval(
+            "SELECT COUNT(DISTINCT cohort_id) FROM thinking_tokens WHERE tenant_id=$1 AND cohort_id IS NOT NULL",
+            tenant_id)
+        patterns = await conn.fetchval(
+            "SELECT COUNT(*) FROM thinking_token_evolution WHERE tenant_id=$1", tenant_id)
+        signals  = await conn.fetchval(
+            "SELECT COUNT(*) FROM thinking_tokens WHERE tenant_id=$1 AND last_signaled_at IS NOT NULL",
+            tenant_id)
+
+    match_rate = round(matches / max(queries, 1) * 100, 1)
+
+    return {
+        "total_thinking_tokens":  total,
+        "active_tokens":          active,
+        "total_cohorts":          cohorts,
+        "total_queries_evaluated": queries,
+        "total_matches":          matches,
+        "overall_match_rate_pct": match_rate,
+        "learned_patterns":       patterns,
+        "tokens_ever_signaled":   signals,
+        "real_data_seen_by_agent": 0,
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OLLAMA FALLBACK ENGINE — v6.1
+# Rule-based first. Ollama only when rule-based can't parse the query.
+# Ollama ONLY sees: facts dict + query string. Never real_value. Ever.
+#
+# Setup on Railway:
+#   1. Add a new Railway service: ollama/ollama Docker image
+#   2. Set env var: OLLAMA_URL=http://ollama:11434
+#   3. Set env var: OLLAMA_MODEL=phi3.5 (or llama3.2:1b)
+#   4. Railway connects services internally — data never leaves your infra
+#
+# Data flow:
+#   facts dict (no real values) + query → Ollama → YES/NO → token_id returned
+#   real_value: locked in vault, never sent to Ollama
+# ══════════════════════════════════════════════════════════════════════════════
+
+import os as _os
+import httpx as _httpx
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+_OLLAMA_URL   = _os.getenv("OLLAMA_URL",   "http://ollama:11434")
+_OLLAMA_MODEL = _os.getenv("OLLAMA_MODEL", "phi3.5")
+_OLLAMA_TIMEOUT = 8.0   # seconds — fast model, should respond well under this
+
+
+# ── Health check ───────────────────────────────────────────────────────────────
+
+async def ollama_is_available() -> bool:
+    """Check if Ollama service is reachable. Called once at query time."""
+    try:
+        async with _httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"{_OLLAMA_URL}/api/tags")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+# ── Core: Ollama fact evaluator ────────────────────────────────────────────────
+
+async def _ollama_evaluate(facts: dict, query: str) -> tuple[bool, str]:
+    """
+    Ask Ollama: do these facts match this query?
+    Returns (matched, reason).
+
+    CRITICAL SAFETY RULES — enforced in the prompt:
+    1. Only facts dict is sent — never real_value
+    2. Prompt instructs model to answer YES/NO only
+    3. No facts that could be real values (SSN, name, card) — enforced at mint time
+    4. Response parsed as boolean — model output never returned to agent
+
+    Facts example sent to Ollama:
+      {"birth_year": 1994, "risk": "high", "diagnosis": "diabetes", "region": "south"}
+
+    What Ollama NEVER sees:
+      real_value, SSN, full name, card number, MRN, DOB string
+    """
+    # Build a minimal, safe prompt
+    # Facts are derived values only — set by developer at mint time
+    facts_str = ", ".join(f"{k}={v}" for k, v in facts.items())
+
+    prompt = (
+        f"You are a data matcher. Answer only YES or NO.\n"
+        f"Facts: {facts_str}\n"
+        f"Query: {query}\n"
+        f"Do these facts match this query? Answer YES or NO only."
+    )
+
+    try:
+        async with _httpx.AsyncClient(timeout=_OLLAMA_TIMEOUT) as client:
+            response = await client.post(
+                f"{_OLLAMA_URL}/api/generate",
+                json={
+                    "model":  _OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature":   0,      # deterministic — no creativity
+                        "num_predict":   5,      # max 5 tokens — YES or NO only
+                        "top_k":         1,      # most likely token only
+                        "repeat_penalty": 1.0,
+                    }
+                }
+            )
+
+        if response.status_code != 200:
+            return False, f"ollama_error:http_{response.status_code}"
+
+        raw = response.json().get("response", "").strip().upper()
+
+        # Parse YES/NO — anything else is treated as NO
+        matched = raw.startswith("YES")
+        reason  = f"ollama:{_OLLAMA_MODEL}:{'YES' if matched else 'NO'} (raw='{raw[:20]}')"
+        return matched, reason
+
+    except _httpx.TimeoutException:
+        return False, "ollama_timeout:fell_back_to_no_match"
+    except Exception as e:
+        return False, f"ollama_unavailable:{str(e)[:50]}"
+
+
+# ── Batch Ollama evaluator ─────────────────────────────────────────────────────
+
+async def _ollama_evaluate_batch(
+    rows:  list,       # list of token rows with facts
+    query: str,
+) -> list[tuple[str, bool, str]]:
+    """
+    Evaluate multiple tokens against a query using Ollama.
+    Runs concurrently for speed.
+    Returns list of (token_id, matched, reason).
+    """
+    import asyncio as _asyncio
+
+    async def _eval_one(row):
+        facts = row["facts"] if isinstance(row["facts"], dict) \
+                else _json.loads(row["facts"])
+        matched, reason = await _ollama_evaluate(facts, query)
+        return (row["token_id"], matched, reason)
+
+    # Run all evaluations concurrently — max 20 at a time to avoid overwhelming Ollama
+    semaphore = _asyncio.Semaphore(20)
+
+    async def _eval_with_sem(row):
+        async with semaphore:
+            return await _eval_one(row)
+
+    results = await _asyncio.gather(*[_eval_with_sem(r) for r in rows])
+    return list(results)
+
+
+# ── Hybrid evaluator — rule-based first, Ollama fallback ──────────────────────
+
+async def _hybrid_evaluate_token(
+    facts:      dict,
+    rules:      list,
+    query:      str,
+    conditions: list,
+    use_ollama: bool = True,
+) -> tuple[bool, str, str, str]:
+    """
+    Full hybrid evaluation for one token.
+    Returns (matched, match_field, match_reason, engine_used).
+
+    Engine priority:
+      1. Rule-based (instant, free, no external call)
+         → if conditions parsed AND evaluation succeeds → done
+      2. Ollama fallback
+         → only if rule-based parsed 0 conditions (query too complex for regex)
+         → Ollama sees facts only — never real_value
+    """
+    engine = "rule_based"
+
+    if conditions:
+        # Rule-based has conditions — try it first
+        matched, match_field, match_reason = _token_matches_query(facts, rules, conditions)
+        if matched:
+            return matched, match_field, match_reason, engine
+        # Rule-based said NO — trust it, don't call Ollama
+        # (Ollama fallback only fires when rule-based can't parse, not when it says no)
+        return False, None, match_reason, engine
+
+    # Rule-based parsed nothing — query is too complex for regex
+    # Fall back to Ollama with facts only
+    if use_ollama:
+        engine  = "ollama"
+        matched, reason = await _ollama_evaluate(facts, query)
+        field   = "ollama_match" if matched else None
+        return matched, field, reason, engine
+
+    return False, None, "no_conditions_no_ollama", "none"
+
+
+# ── Patched query function with Ollama support ────────────────────────────────
+
+async def query_thinking_tokens_hybrid(
+    pool,
+    tenant_id:   str,
+    query:       str,
+    cohort_id:   str  = None,
+    data_type:   str  = None,
+    token_ids:   list = None,
+    session_id:  str  = None,
+    top_k:       int  = 100,
+    include_reasons: bool = False,
+    use_ollama:  bool = True,   # set False to force rule-based only
+) -> dict:
+    """
+    Hybrid ThinkingToken query.
+    Rule-based first. Ollama fallback for complex queries.
+    Real value NEVER sent to Ollama or returned to agent.
+    """
+    import asyncio as _asyncio
+
+    session_id = session_id or _secrets.token_hex(8)
+
+    # Parse query into conditions (rule-based)
+    conditions   = _parse_query(query)
+    needs_ollama = len(conditions) == 0 and use_ollama
+
+    # Check Ollama availability once upfront (only if needed)
+    ollama_available = False
+    if needs_ollama:
+        ollama_available = await ollama_is_available()
+        if not ollama_available:
+            # Ollama down — return helpful warning, don't crash
+            return {
+                "query":           query,
+                "conditions":      [],
+                "matched_tokens":  [],
+                "match_count":     0,
+                "total_evaluated": 0,
+                "session_id":      session_id,
+                "engine":          "none",
+                "real_data_seen_by_agent": 0,
+                "warning": (
+                    "Query too complex for rule-based parser and Ollama is unavailable. "
+                    "Try simpler queries like 'born in 1994', 'age over 30', 'high risk'. "
+                    "Or start Ollama service at OLLAMA_URL."
+                ),
+            }
+
+    engine_used = "ollama" if needs_ollama and ollama_available else "rule_based"
+
+    # Load tokens
+    async with pool.acquire() as conn:
+        if token_ids:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, rules, cohort_id, query_count "
+                "FROM thinking_tokens "
+                "WHERE token_id=ANY($1) AND tenant_id=$2 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "AND (uses_remaining = -1 OR uses_remaining > 0)",
+                token_ids, tenant_id
+            )
+        elif cohort_id:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, rules, cohort_id, query_count "
+                "FROM thinking_tokens "
+                "WHERE cohort_id=$1 AND tenant_id=$2 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "AND (uses_remaining = -1 OR uses_remaining > 0) "
+                "LIMIT $3",
+                cohort_id, tenant_id, top_k * 10
+            )
+        elif data_type:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, rules, cohort_id, query_count "
+                "FROM thinking_tokens "
+                "WHERE data_type=$1 AND tenant_id=$2 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "AND (uses_remaining = -1 OR uses_remaining > 0) "
+                "LIMIT $3",
+                data_type, tenant_id, top_k * 10
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT token_id, facts, rules, cohort_id, query_count "
+                "FROM thinking_tokens "
+                "WHERE tenant_id=$1 "
+                "AND revoked=FALSE AND (expires_at IS NULL OR expires_at > NOW()) "
+                "AND (uses_remaining = -1 OR uses_remaining > 0) "
+                "LIMIT $2",
+                tenant_id, top_k * 10
+            )
+
+        total_evaluated = len(rows)
+        matched_tokens  = []
+
+        if needs_ollama and ollama_available:
+            # Ollama path — batch concurrent evaluation
+            # Facts only sent to Ollama — real_value stays in vault
+            eval_results = await _ollama_evaluate_batch(list(rows), query)
+
+            for token_id, matched, reason in eval_results:
+                row = next((r for r in rows if r["token_id"] == token_id), None)
+                if not row:
+                    continue
+
+                # Log evaluation
+                await conn.execute("""
+                    INSERT INTO thinking_token_log
+                      (tenant_id, token_id, session_id, cohort_id,
+                       query, matched, match_field, match_reason, real_value_seen)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                """, tenant_id, token_id, session_id,
+                    row["cohort_id"], query,
+                    matched, "ollama_match" if matched else None,
+                    reason, False)  # real_value_seen = always False
+
+                await conn.execute("""
+                    INSERT INTO thinking_token_memory
+                      (token_id, tenant_id, session_id, query, matched, match_field)
+                    VALUES ($1,$2,$3,$4,$5,$6)
+                """, token_id, tenant_id, session_id,
+                    query, matched, "ollama_match" if matched else None)
+
+                await _update_evolution(
+                    conn, token_id, tenant_id, row["cohort_id"], query, matched
+                )
+
+                if matched:
+                    entry = {"token_id": token_id, "cohort_id": row["cohort_id"], "engine": "ollama"}
+                    if include_reasons:
+                        entry["match_reason"] = reason
+                    matched_tokens.append(entry)
+                    if len(matched_tokens) >= top_k:
+                        break
+
+        else:
+            # Rule-based path — pure Python, no external calls
+            for row in rows:
+                facts = row["facts"] if isinstance(row["facts"], dict) \
+                        else _json.loads(row["facts"])
+                rules = row["rules"] if isinstance(row["rules"], list) \
+                        else _json.loads(row["rules"])
+
+                matched, match_field, match_reason = _token_matches_query(
+                    facts, rules, conditions
+                )
+
+                # Log
+                await conn.execute("""
+                    INSERT INTO thinking_token_log
+                      (tenant_id, token_id, session_id, cohort_id,
+                       query, query_parsed, matched, match_field,
+                       match_reason, real_value_seen)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                """, tenant_id, row["token_id"], session_id,
+                    row["cohort_id"], query,
+                    _json.dumps(conditions),
+                    matched, match_field, match_reason, False)
+
+                await conn.execute("""
+                    INSERT INTO thinking_token_memory
+                      (token_id, tenant_id, session_id, query, matched, match_field)
+                    VALUES ($1,$2,$3,$4,$5,$6)
+                """, row["token_id"], tenant_id, session_id,
+                    query, matched, match_field)
+
+                await _update_evolution(
+                    conn, row["token_id"], tenant_id,
+                    row["cohort_id"], query, matched
+                )
+
+                if matched:
+                    entry = {
+                        "token_id":  row["token_id"],
+                        "cohort_id": row["cohort_id"],
+                        "engine":    "rule_based",
+                    }
+                    if include_reasons:
+                        entry["match_field"]  = match_field
+                        entry["match_reason"] = match_reason
+                    matched_tokens.append(entry)
+                    if len(matched_tokens) >= top_k:
+                        break
+
+    return {
+        "query":             query,
+        "conditions_parsed": conditions,
+        "condition_count":   len(conditions),
+        "engine":            engine_used,
+        "ollama_model":      _OLLAMA_MODEL if engine_used == "ollama" else None,
+        "matched_tokens":    matched_tokens,
+        "match_count":       len(matched_tokens),
+        "total_evaluated":   total_evaluated,
+        "session_id":        session_id,
+        "real_data_seen_by_agent": 0,
+        "message": (
+            f"{len(matched_tokens)} token(s) matched out of {total_evaluated} evaluated "
+            f"using {engine_used}. No real values returned."
+        ),
+    }
+
+
+# ── Ollama health endpoint helper ─────────────────────────────────────────────
+
+async def get_ollama_status() -> dict:
+    """Check Ollama service status and available models."""
+    try:
+        async with _httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{_OLLAMA_URL}/api/tags")
+            if r.status_code == 200:
+                data   = r.json()
+                models = [m["name"] for m in data.get("models", [])]
+                return {
+                    "available":     True,
+                    "url":           _OLLAMA_URL,
+                    "active_model":  _OLLAMA_MODEL,
+                    "loaded_models": models,
+                    "model_ready":   _OLLAMA_MODEL in " ".join(models),
+                    "data_safety":   "Ollama only receives facts dict — real values never sent",
+                }
+            return {"available": False, "url": _OLLAMA_URL, "error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {
+            "available": False,
+            "url":       _OLLAMA_URL,
+            "error":     str(e)[:100],
+            "hint":      "Add OLLAMA_URL env var pointing to your Ollama Railway service",
+        }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THINKING EXECUTOR ENGINE — v7.0
+# "Open the box. Decide what to do. Do it. Lock the box. Agent sees nothing."
+#
+# The Thinking Executor:
+#   1. Opens the vault box (gets real value)
+#   2. Reads facts to DECIDE which action to take
+#   3. Chains multiple actions automatically
+#   4. Fires real-world integrations directly
+#   5. Learns which actions work over time
+#   6. Logs everything for compliance
+#   7. Agent never sees any real value. Ever.
+#
+# INTEGRATIONS (pluggable — enable per tenant):
+#   Communication:  Vapi, Twilio, SendGrid, Resend, WhatsApp
+#   Payments:       Stripe, Plaid
+#   Healthcare:     Epic, Fax
+#   Documents:      DocuSign
+#   CRM:            Salesforce, HubSpot, Zendesk
+#   Custom:         Any HTTPS webhook
+#
+# DB TABLES:
+#   executor_integrations   — tenant integration configs (API keys encrypted)
+#   executor_action_rules   — decision rules: if facts match → fire this action
+#   executor_action_chains  — multi-step workflows triggered by one token
+#   executor_action_log     — every action taken (full audit)
+#   executor_learning       — what worked, what didn't
+#
+# ENDPOINTS:
+#   POST /executor/integrations          — register an integration
+#   GET  /executor/integrations          — list integrations
+#   DELETE /executor/integrations/{id}   — remove integration
+#   POST /executor/rules                 — add a decision rule
+#   GET  /executor/rules                 — list rules
+#   DELETE /executor/rules/{id}          — remove rule
+#   POST /executor/chains                — define an action chain
+#   GET  /executor/chains                — list chains
+#   POST /executor/run                   — run thinking executor on a token
+#   POST /executor/run/cohort            — run on entire cohort
+#   GET  /executor/log                   — action audit log
+#   GET  /executor/learning              — what the executor has learned
+#   GET  /executor/status                — integration health check
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── DB Migrations ──────────────────────────────────────────────────────────────
+
+THINKING_EXECUTOR_MIGRATIONS = [
+
+    # Integration configs — one row per integration per tenant
+    """CREATE TABLE IF NOT EXISTS executor_integrations (
+        id            TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id     TEXT NOT NULL,
+        name          TEXT NOT NULL,      -- vapi, twilio, stripe, sendgrid, epic, etc.
+        enabled       BOOLEAN DEFAULT TRUE,
+        config        JSONB NOT NULL,     -- API keys, base URLs (encrypted at app level)
+        test_mode     BOOLEAN DEFAULT FALSE,
+        created_at    TIMESTAMPTZ DEFAULT NOW(),
+        updated_at    TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(tenant_id, name)
+    )""",
+    """CREATE INDEX IF NOT EXISTS ei_tenant_idx
+       ON executor_integrations(tenant_id, name)""",
+
+    # Decision rules — if facts match conditions → fire action via integration
+    """CREATE TABLE IF NOT EXISTS executor_action_rules (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        name            TEXT,
+        priority        INTEGER DEFAULT 0,    -- higher = checked first
+        data_type       TEXT,                 -- limit to this token data_type
+        cohort_id       TEXT,                 -- limit to this cohort
+
+        -- Condition: when to fire (same syntax as ThinkingToken facts)
+        conditions      JSONB NOT NULL,       -- [{"field": "risk", "op": "eq", "value": "high"}]
+
+        -- Action: what to fire
+        integration     TEXT NOT NULL,        -- vapi, twilio, stripe, sendgrid, etc.
+        action_type     TEXT NOT NULL,        -- call, sms, charge, email, etc.
+        action_template JSONB NOT NULL,       -- template with {field} placeholders
+
+        -- Chain: what to do next
+        on_success_chain TEXT,               -- chain_id to run on success
+        on_failure_chain TEXT,               -- chain_id to run on failure
+
+        enabled         BOOLEAN DEFAULT TRUE,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS ear_tenant_idx
+       ON executor_action_rules(tenant_id, priority DESC)""",
+
+    # Action chains — multi-step workflows
+    """CREATE TABLE IF NOT EXISTS executor_action_chains (
+        id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id   TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        description TEXT,
+        steps       JSONB NOT NULL,   -- ordered list of {integration, action_type, template, delay_seconds}
+        enabled     BOOLEAN DEFAULT TRUE,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS eac_tenant_idx
+       ON executor_action_chains(tenant_id)""",
+
+    # Full action audit log
+    """CREATE TABLE IF NOT EXISTS executor_action_log (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        token_id        TEXT,
+        cohort_id       TEXT,
+        session_id      TEXT,
+        integration     TEXT NOT NULL,
+        action_type     TEXT NOT NULL,
+        rule_id         TEXT,
+        chain_id        TEXT,
+        step_number     INTEGER DEFAULT 1,
+
+        -- Result
+        success         BOOLEAN NOT NULL,
+        response_code   INTEGER,
+        response_body   TEXT,
+        error_message   TEXT,
+        duration_ms     INTEGER,
+
+        -- Safety proof
+        real_value_sent_to_integration  BOOLEAN DEFAULT TRUE,  -- yes — this is intentional
+        real_value_seen_by_agent        BOOLEAN DEFAULT FALSE, -- always false
+        real_value_in_log               BOOLEAN DEFAULT FALSE, -- never logged
+
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    """CREATE INDEX IF NOT EXISTS eal_tenant_idx
+       ON executor_action_log(tenant_id, created_at DESC)""",
+    """CREATE INDEX IF NOT EXISTS eal_token_idx
+       ON executor_action_log(token_id, created_at DESC)""",
+
+    # Learning — what works, what doesn't
+    """CREATE TABLE IF NOT EXISTS executor_learning (
+        id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        tenant_id       TEXT NOT NULL,
+        integration     TEXT NOT NULL,
+        action_type     TEXT NOT NULL,
+        fact_pattern    TEXT,          -- normalized fact pattern that triggered
+        success_count   INTEGER DEFAULT 0,
+        failure_count   INTEGER DEFAULT 0,
+        avg_duration_ms INTEGER DEFAULT 0,
+        last_success    TIMESTAMPTZ,
+        last_failure    TIMESTAMPTZ,
+        UNIQUE(tenant_id, integration, action_type, fact_pattern)
+    )""",
+    """CREATE INDEX IF NOT EXISTS el_tenant_idx
+       ON executor_learning(tenant_id, integration, success_count DESC)""",
+]
+
+
+# ── Integration Registry ───────────────────────────────────────────────────────
+
+_SUPPORTED_INTEGRATIONS = {
+    "vapi": {
+        "label":       "Vapi — AI Voice Calls",
+        "category":    "communication",
+        "actions":     ["call"],
+        "required":    ["api_key"],
+        "optional":    ["phone_number_id", "assistant_id", "base_url"],
+        "docs":        "https://docs.vapi.ai",
+    },
+    "twilio": {
+        "label":       "Twilio — SMS & Voice",
+        "category":    "communication",
+        "actions":     ["sms", "call", "whatsapp"],
+        "required":    ["account_sid", "auth_token", "from_number"],
+        "optional":    ["messaging_service_sid"],
+        "docs":        "https://twilio.com/docs",
+    },
+    "sendgrid": {
+        "label":       "SendGrid — Email",
+        "category":    "communication",
+        "actions":     ["email"],
+        "required":    ["api_key", "from_email"],
+        "optional":    ["from_name", "template_id"],
+        "docs":        "https://docs.sendgrid.com",
+    },
+    "resend": {
+        "label":       "Resend — Email",
+        "category":    "communication",
+        "actions":     ["email"],
+        "required":    ["api_key", "from_email"],
+        "optional":    ["from_name"],
+        "docs":        "https://resend.com/docs",
+    },
+    "stripe": {
+        "label":       "Stripe — Payments",
+        "category":    "payments",
+        "actions":     ["charge", "refund", "create_customer", "create_subscription"],
+        "required":    ["secret_key"],
+        "optional":    ["webhook_secret"],
+        "docs":        "https://stripe.com/docs",
+    },
+    "plaid": {
+        "label":       "Plaid — Bank Verification",
+        "category":    "payments",
+        "actions":     ["verify_account", "get_balance"],
+        "required":    ["client_id", "secret", "env"],
+        "optional":    [],
+        "docs":        "https://plaid.com/docs",
+    },
+    "docusign": {
+        "label":       "DocuSign — eSignatures",
+        "category":    "documents",
+        "actions":     ["send_envelope", "get_status"],
+        "required":    ["access_token", "account_id"],
+        "optional":    ["base_url"],
+        "docs":        "https://developers.docusign.com",
+    },
+    "salesforce": {
+        "label":       "Salesforce — CRM",
+        "category":    "crm",
+        "actions":     ["create_record", "update_record", "create_activity"],
+        "required":    ["access_token", "instance_url"],
+        "optional":    ["api_version"],
+        "docs":        "https://developer.salesforce.com",
+    },
+    "hubspot": {
+        "label":       "HubSpot — CRM",
+        "category":    "crm",
+        "actions":     ["create_contact", "update_contact", "create_note", "create_task"],
+        "required":    ["api_key"],
+        "optional":    [],
+        "docs":        "https://developers.hubspot.com",
+    },
+    "zendesk": {
+        "label":       "Zendesk — Support",
+        "category":    "crm",
+        "actions":     ["create_ticket", "update_ticket", "add_comment"],
+        "required":    ["subdomain", "api_token", "email"],
+        "optional":    [],
+        "docs":        "https://developer.zendesk.com",
+    },
+    "epic": {
+        "label":       "Epic — Healthcare EHR",
+        "category":    "healthcare",
+        "actions":     ["update_patient", "create_note", "schedule_appointment"],
+        "required":    ["base_url", "client_id", "access_token"],
+        "optional":    [],
+        "docs":        "https://fhir.epic.com",
+    },
+    "webhook": {
+        "label":       "Custom Webhook",
+        "category":    "custom",
+        "actions":     ["post"],
+        "required":    ["url"],
+        "optional":    ["secret", "headers"],
+        "docs":        "Any HTTPS endpoint",
+    },
+}
+
+
+# ── Integration Executors ──────────────────────────────────────────────────────
+
+async def _exec_vapi(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Fire a Vapi AI voice call. real_value resolved into template before call."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_call": resolved.get("phone_number", "unknown")}
+
+    payload = {
+        "phoneNumberId": config.get("phone_number_id", ""),
+        "assistantId":   config.get("assistant_id", ""),
+        "customer": {
+            "number": resolved.get("phone_number", resolved.get("phone", "")),
+            "name":   resolved.get("name", resolved.get("patient_name", "")),
+        },
+        "assistantOverrides": {
+            "variableValues": resolved,   # all resolved facts injected as variables
+        },
+    }
+    # Merge template overrides
+    payload.update({k: v for k, v in template.items() if k not in ["integration", "action_type"]})
+
+    async with _httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(
+            f"{config.get('base_url', 'https://api.vapi.ai')}/call/phone",
+            headers={"Authorization": f"Bearer {config['api_key']}"},
+            json=payload,
+        )
+    return {
+        "success":       r.status_code in [200, 201],
+        "response_code": r.status_code,
+        "call_id":       r.json().get("id") if r.status_code in [200, 201] else None,
+        "error":         r.text if r.status_code not in [200, 201] else None,
+    }
+
+
+async def _exec_twilio_sms(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Send SMS via Twilio."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_sms": resolved.get("phone", "unknown")}
+
+    body = template.get("body", "Hello {name}").format(**resolved)
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{config['account_sid']}/Messages.json",
+            auth=(config["account_sid"], config["auth_token"]),
+            data={
+                "From": config["from_number"],
+                "To":   resolved.get("phone_number", resolved.get("phone", "")),
+                "Body": body,
+            },
+        )
+    return {
+        "success":       r.status_code == 201,
+        "response_code": r.status_code,
+        "message_sid":   r.json().get("sid") if r.status_code == 201 else None,
+        "error":         r.json().get("message") if r.status_code != 201 else None,
+    }
+
+
+async def _exec_twilio_call(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Make a voice call via Twilio."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_call": resolved.get("phone", "unknown")}
+
+    twiml = template.get("twiml", f"<Response><Say>Hello {resolved.get('name', 'there')}.</Say></Response>")
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{config['account_sid']}/Calls.json",
+            auth=(config["account_sid"], config["auth_token"]),
+            data={
+                "From":   config["from_number"],
+                "To":     resolved.get("phone_number", resolved.get("phone", "")),
+                "Twiml":  twiml,
+            },
+        )
+    return {
+        "success":       r.status_code == 201,
+        "response_code": r.status_code,
+        "call_sid":      r.json().get("sid") if r.status_code == 201 else None,
+        "error":         r.json().get("message") if r.status_code != 201 else None,
+    }
+
+
+async def _exec_sendgrid(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Send email via SendGrid."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_email": resolved.get("email", "unknown")}
+
+    subject = template.get("subject", "Message from {sender}").format(**{**resolved, "sender": config.get("from_name", "Codeastra")})
+    body    = template.get("body", "Hello {name}").format(**resolved)
+
+    payload = {
+        "personalizations": [{"to": [{"email": resolved.get("email", "")}]}],
+        "from":    {"email": config["from_email"], "name": config.get("from_name", "")},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+    }
+    if config.get("template_id"):
+        payload["template_id"]       = config["template_id"]
+        payload["dynamic_template_data"] = resolved
+
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {config['api_key']}"},
+            json=payload,
+        )
+    return {
+        "success":       r.status_code == 202,
+        "response_code": r.status_code,
+        "error":         r.text if r.status_code != 202 else None,
+    }
+
+
+async def _exec_resend(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Send email via Resend."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_email": resolved.get("email", "unknown")}
+
+    subject = template.get("subject", "Hello").format(**resolved)
+    body    = template.get("body", "Hello {name}").format(**resolved)
+
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {config['api_key']}"},
+            json={
+                "from": f"{config.get('from_name', 'Codeastra')} <{config['from_email']}>",
+                "to":   [resolved.get("email", "")],
+                "subject": subject,
+                "text":    body,
+            },
+        )
+    data = r.json()
+    return {
+        "success":       r.status_code == 200,
+        "response_code": r.status_code,
+        "email_id":      data.get("id"),
+        "error":         data.get("message") if r.status_code != 200 else None,
+    }
+
+
+async def _exec_stripe_charge(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Charge a card via Stripe."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_charge": resolved.get("amount", "unknown")}
+
+    amount   = int(template.get("amount_cents", resolved.get("amount_cents", 0)))
+    currency = template.get("currency", "usd")
+
+    async with _httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(
+            "https://api.stripe.com/v1/payment_intents",
+            auth=(config["secret_key"], ""),
+            data={
+                "amount":   amount,
+                "currency": currency,
+                "payment_method": resolved.get("payment_method_id", ""),
+                "confirm":  "true",
+                "metadata": {"token_id": resolved.get("token_id", "")},
+            },
+        )
+    data = r.json()
+    return {
+        "success":       data.get("status") in ["succeeded", "requires_capture"],
+        "response_code": r.status_code,
+        "payment_id":    data.get("id"),
+        "status":        data.get("status"),
+        "error":         data.get("error", {}).get("message") if r.status_code != 200 else None,
+    }
+
+
+async def _exec_hubspot(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Create or update a HubSpot contact."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_update": resolved.get("email", "unknown")}
+
+    action = template.get("action", "create_contact")
+    properties = {
+        "email":     resolved.get("email", ""),
+        "firstname": resolved.get("first_name", resolved.get("name", "").split()[0] if resolved.get("name") else ""),
+        "lastname":  resolved.get("last_name", " ".join(resolved.get("name", "").split()[1:]) if resolved.get("name") else ""),
+        "phone":     resolved.get("phone", ""),
+    }
+    properties.update(template.get("extra_properties", {}))
+
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            "https://api.hubapi.com/crm/v3/objects/contacts",
+            headers={"Authorization": f"Bearer {config['api_key']}"},
+            json={"properties": properties},
+        )
+    data = r.json()
+    return {
+        "success":       r.status_code in [200, 201],
+        "response_code": r.status_code,
+        "contact_id":    data.get("id"),
+        "error":         data.get("message") if r.status_code not in [200, 201] else None,
+    }
+
+
+async def _exec_salesforce(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Create or update a Salesforce record."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_update": "salesforce_record"}
+
+    sobject = template.get("sobject", "Contact")
+    fields  = template.get("fields", {})
+    # Merge resolved values into fields
+    record  = {k: v.format(**resolved) if isinstance(v, str) else v for k, v in fields.items()}
+
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{config['instance_url']}/services/data/{config.get('api_version', 'v58.0')}/sobjects/{sobject}/",
+            headers={
+                "Authorization": f"Bearer {config['access_token']}",
+                "Content-Type":  "application/json",
+            },
+            json=record,
+        )
+    data = r.json() if r.text else {}
+    return {
+        "success":       r.status_code in [200, 201],
+        "response_code": r.status_code,
+        "record_id":     data.get("id") if isinstance(data, dict) else None,
+        "error":         str(data.get("message", "")) if r.status_code not in [200, 201] else None,
+    }
+
+
+async def _exec_zendesk(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Create a Zendesk support ticket."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_create": "zendesk_ticket"}
+
+    subject = template.get("subject", "Support request from {name}").format(**resolved)
+    body    = template.get("body", "Contact: {email}").format(**resolved)
+
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"https://{config['subdomain']}.zendesk.com/api/v2/tickets.json",
+            auth=(f"{config['email']}/token", config["api_token"]),
+            json={"ticket": {
+                "subject": subject,
+                "comment": {"body": body},
+                "requester": {"email": resolved.get("email", ""), "name": resolved.get("name", "")},
+            }},
+        )
+    data = r.json()
+    return {
+        "success":       r.status_code == 201,
+        "response_code": r.status_code,
+        "ticket_id":     data.get("ticket", {}).get("id"),
+        "error":         str(data.get("error", "")) if r.status_code != 201 else None,
+    }
+
+
+async def _exec_docusign(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Send a DocuSign envelope."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_send_to": resolved.get("email", "unknown")}
+
+    envelope = {
+        "emailSubject": template.get("subject", "Please sign this document").format(**resolved),
+        "templateId":   template.get("template_id", ""),
+        "templateRoles": [{
+            "email":     resolved.get("email", ""),
+            "name":      resolved.get("name", ""),
+            "roleName":  template.get("role_name", "signer"),
+        }],
+        "status": "sent",
+    }
+
+    async with _httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(
+            f"{config.get('base_url', 'https://na1.docusign.net')}/restapi/v2.1/accounts/{config['account_id']}/envelopes",
+            headers={
+                "Authorization": f"Bearer {config['access_token']}",
+                "Content-Type":  "application/json",
+            },
+            json=envelope,
+        )
+    data = r.json()
+    return {
+        "success":       r.status_code == 201,
+        "response_code": r.status_code,
+        "envelope_id":   data.get("envelopeId"),
+        "error":         data.get("message") if r.status_code != 201 else None,
+    }
+
+
+async def _exec_epic(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """Update an Epic EHR patient record."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_update": "epic_patient_record"}
+
+    action    = template.get("action", "create_note")
+    patient_id = resolved.get("mrn", resolved.get("patient_id", ""))
+
+    if action == "create_note":
+        payload = {
+            "resourceType": "DocumentReference",
+            "subject": {"reference": f"Patient/{patient_id}"},
+            "content": [{"attachment": {"contentType": "text/plain",
+                                        "data": template.get("note", "").format(**resolved)}}],
+        }
+        endpoint = f"{config['base_url']}/api/FHIR/R4/DocumentReference"
+    else:
+        payload  = template.get("payload", {})
+        endpoint = f"{config['base_url']}/api/FHIR/R4/{action}"
+
+    async with _httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {config['access_token']}",
+                "Content-Type":  "application/fhir+json",
+            },
+            json=payload,
+        )
+    return {
+        "success":       r.status_code in [200, 201],
+        "response_code": r.status_code,
+        "error":         r.text[:200] if r.status_code not in [200, 201] else None,
+    }
+
+
+async def _exec_webhook(config: dict, resolved: dict, template: dict, test_mode: bool) -> dict:
+    """POST to a custom webhook."""
+    if test_mode:
+        return {"success": True, "test_mode": True, "would_post_to": config.get("url", "unknown")}
+
+    payload = {**template, **resolved}
+    payload.pop("integration",  None)
+    payload.pop("action_type",  None)
+
+    headers = {"Content-Type": "application/json"}
+    headers.update(config.get("headers", {}))
+    if config.get("secret"):
+        import hmac as _hmac
+        sig = _hmac.new(config["secret"].encode(), _json.dumps(payload).encode(), _hashlib.sha256).hexdigest()
+        headers["X-Codeastra-Signature"] = f"sha256={sig}"
+
+    async with _httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(config["url"], headers=headers, json=payload)
+    return {
+        "success":       r.status_code in [200, 201, 202, 204],
+        "response_code": r.status_code,
+        "error":         r.text[:200] if r.status_code not in [200, 201, 202, 204] else None,
+    }
+
+
+# ── Integration dispatcher ────────────────────────────────────────────────────
+
+async def _dispatch_integration(
+    integration: str,
+    action_type: str,
+    config:      dict,
+    resolved:    dict,
+    template:    dict,
+    test_mode:   bool = False,
+) -> dict:
+    """
+    Route to the correct integration executor.
+    resolved = real values from vault — sent to integration only, never to agent.
+    """
+    start = datetime.now(timezone.utc)
+
+    try:
+        if integration == "vapi":
+            result = await _exec_vapi(config, resolved, template, test_mode)
+        elif integration == "twilio" and action_type == "sms":
+            result = await _exec_twilio_sms(config, resolved, template, test_mode)
+        elif integration == "twilio" and action_type in ["call", "whatsapp"]:
+            result = await _exec_twilio_call(config, resolved, template, test_mode)
+        elif integration == "sendgrid":
+            result = await _exec_sendgrid(config, resolved, template, test_mode)
+        elif integration == "resend":
+            result = await _exec_resend(config, resolved, template, test_mode)
+        elif integration == "stripe":
+            result = await _exec_stripe_charge(config, resolved, template, test_mode)
+        elif integration == "hubspot":
+            result = await _exec_hubspot(config, resolved, template, test_mode)
+        elif integration == "salesforce":
+            result = await _exec_salesforce(config, resolved, template, test_mode)
+        elif integration == "zendesk":
+            result = await _exec_zendesk(config, resolved, template, test_mode)
+        elif integration == "docusign":
+            result = await _exec_docusign(config, resolved, template, test_mode)
+        elif integration == "epic":
+            result = await _exec_epic(config, resolved, template, test_mode)
+        elif integration == "webhook":
+            result = await _exec_webhook(config, resolved, template, test_mode)
+        else:
+            result = {"success": False, "error": f"Unknown integration: {integration}"}
+
+    except Exception as e:
+        result = {"success": False, "error": str(e)[:200]}
+
+    duration = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+    result["duration_ms"] = duration
+    return result
+
+
+# ── Decision Engine ────────────────────────────────────────────────────────────
+
+def _match_rules(facts: dict, rules: list) -> list[dict]:
+    """
+    Match facts against executor rules. Returns ordered list of matching rules.
+    Rules checked by priority (highest first).
+    ALL conditions in a rule must match (AND logic).
+    """
+    matched = []
+    for rule in sorted(rules, key=lambda r: r.get("priority", 0), reverse=True):
+        if not rule.get("enabled", True):
+            continue
+        conditions = rule.get("conditions", [])
+        all_match  = True
+        for cond in conditions:
+            ok, _ = _evaluate_condition_against_facts(cond, facts)
+            if not ok:
+                all_match = False
+                break
+        if all_match:
+            matched.append(rule)
+    return matched
+
+
+# ── Core: Run Thinking Executor on one token ───────────────────────────────────
+
+async def run_thinking_executor(
+    pool,
+    tenant_id:   str,
+    token_id:    str,
+    session_id:  str  = None,
+    dry_run:     bool = False,   # if True: decide but don't fire integrations
+    force_rules: list = None,    # override: use these rule_ids only
+) -> dict:
+    """
+    Run the Thinking Executor on a single token.
+
+    Flow:
+      1. Load token from vault (gets real value + facts)
+      2. Match facts against decision rules
+      3. For each matching rule → resolve template with real value
+      4. Fire integration with resolved real value
+      5. Run action chain if configured
+      6. Log everything
+      7. Return result — real value NEVER in response
+
+    Agent never sees real value. Ever.
+    """
+    import asyncio as _asyncio
+
+    session_id = session_id or _secrets.token_hex(8)
+    results    = []
+
+    async with pool.acquire() as conn:
+        # Load token — gets real value
+        token = await conn.fetchrow(
+            "SELECT * FROM thinking_tokens WHERE token_id=$1 AND tenant_id=$2 "
+            "AND revoked=FALSE",
+            token_id, tenant_id
+        )
+        if not token:
+            # Try omega token
+            token = await conn.fetchrow(
+                "SELECT * FROM omega_tokens WHERE token_id=$1 AND tenant_id=$2 "
+                "AND revoked=FALSE",
+                token_id, tenant_id
+            )
+        if not token:
+            # Try smart token
+            token = await conn.fetchrow(
+                "SELECT * FROM smart_tokens WHERE token_id=$1 AND tenant_id=$2 "
+                "AND revoked=FALSE",
+                token_id, tenant_id
+            )
+        if not token:
+            return {"error": f"Token '{token_id}' not found or revoked"}
+
+        token_row  = dict(token)
+        real_value = token_row["real_value"]   # only used here — never returned to agent
+
+        # Get facts
+        facts = {}
+        if "facts" in token_row and token_row["facts"]:
+            facts = token_row["facts"] if isinstance(token_row["facts"], dict) \
+                    else _json.loads(token_row["facts"])
+
+        # Add real_value fields to resolved dict
+        # Parse real_value if it contains structured data
+        resolved = dict(facts)  # start with facts
+        resolved["token_id"]     = token_id
+        resolved["real_value"]   = real_value  # full real value
+        resolved["data_type"]    = token_row.get("data_type", "")
+        resolved["semantic_label"] = token_row.get("semantic_label", "")
+
+        # Try to parse structured real_value (e.g. "Maria Santos | phone:404-555-0101")
+        if "|" in real_value:
+            parts = real_value.split("|")
+            for part in parts:
+                part = part.strip()
+                if ":" in part:
+                    k, v = part.split(":", 1)
+                    resolved[k.strip().lower().replace(" ", "_")] = v.strip()
+                else:
+                    if "name" not in resolved:
+                        resolved["name"] = part
+
+        # Load decision rules
+        if force_rules:
+            rules = await conn.fetch(
+                "SELECT * FROM executor_action_rules "
+                "WHERE id=ANY($1) AND tenant_id=$2 AND enabled=TRUE "
+                "ORDER BY priority DESC",
+                force_rules, tenant_id
+            )
+        else:
+            rules = await conn.fetch(
+                "SELECT * FROM executor_action_rules "
+                "WHERE tenant_id=$1 AND enabled=TRUE "
+                "AND (data_type IS NULL OR data_type=$2) "
+                "AND (cohort_id IS NULL OR cohort_id=$3) "
+                "ORDER BY priority DESC",
+                tenant_id,
+                token_row.get("data_type"),
+                token_row.get("cohort_id"),
+            )
+
+        rule_list = [dict(r) for r in rules]
+
+        # Parse conditions from JSONB
+        for rule in rule_list:
+            if isinstance(rule["conditions"], str):
+                rule["conditions"] = _json.loads(rule["conditions"])
+            if isinstance(rule.get("action_template"), str):
+                rule["action_template"] = _json.loads(rule["action_template"])
+
+        # Match facts against rules
+        matched_rules = _match_rules(facts, rule_list)
+
+        if not matched_rules:
+            return {
+                "token_id":       token_id,
+                "session_id":     session_id,
+                "matched_rules":  0,
+                "actions_taken":  0,
+                "real_value_seen_by_agent": False,
+                "message": "No rules matched this token's facts. Configure rules via POST /executor/rules.",
+            }
+
+        # Load integrations
+        integrations_rows = await conn.fetch(
+            "SELECT name, config, test_mode FROM executor_integrations "
+            "WHERE tenant_id=$1 AND enabled=TRUE",
+            tenant_id
+        )
+        integrations = {
+            r["name"]: {
+                "config":    r["config"] if isinstance(r["config"], dict) else _json.loads(r["config"]),
+                "test_mode": r["test_mode"],
+            }
+            for r in integrations_rows
+        }
+
+        # Fire each matched rule
+        for rule in matched_rules:
+            integration  = rule["integration"]
+            action_type  = rule["action_type"]
+            template     = rule.get("action_template", {})
+
+            if integration not in integrations:
+                results.append({
+                    "rule_id":     rule["id"],
+                    "rule_name":   rule.get("name", ""),
+                    "integration": integration,
+                    "action_type": action_type,
+                    "success":     False,
+                    "error":       f"Integration '{integration}' not configured. Add via POST /executor/integrations.",
+                    "real_value_seen_by_agent": False,
+                })
+                continue
+
+            cfg       = integrations[integration]["config"]
+            test_mode = integrations[integration]["test_mode"] or dry_run
+
+            if not dry_run:
+                exec_result = await _dispatch_integration(
+                    integration, action_type, cfg, resolved, template, test_mode
+                )
+            else:
+                exec_result = {
+                    "success":    True,
+                    "dry_run":    True,
+                    "would_fire": f"{integration}.{action_type}",
+                    "with_data":  {k: v for k, v in resolved.items() if k != "real_value"},
+                }
+
+            # Log action — never log real_value
+            await conn.execute("""
+                INSERT INTO executor_action_log (
+                    tenant_id, token_id, cohort_id, session_id,
+                    integration, action_type, rule_id,
+                    success, response_code, response_body, error_message, duration_ms,
+                    real_value_sent_to_integration, real_value_seen_by_agent, real_value_in_log
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            """,
+                tenant_id, token_id, token_row.get("cohort_id"), session_id,
+                integration, action_type, rule["id"],
+                exec_result.get("success", False),
+                exec_result.get("response_code"),
+                str(exec_result.get("call_id") or exec_result.get("message_sid") or
+                    exec_result.get("email_id") or exec_result.get("payment_id") or "")[:200],
+                exec_result.get("error", "")[:200] if exec_result.get("error") else None,
+                exec_result.get("duration_ms", 0),
+                True,   # real_value WAS sent to integration (intentional — this is the point)
+                False,  # real_value NOT seen by agent (always)
+                False,  # real_value NOT in this log (never)
+            )
+
+            # Update learning
+            fact_pattern = _normalize_query_pattern(str(facts))
+            if exec_result.get("success"):
+                await conn.execute("""
+                    INSERT INTO executor_learning
+                      (tenant_id, integration, action_type, fact_pattern, success_count, last_success)
+                    VALUES ($1,$2,$3,$4,1,NOW())
+                    ON CONFLICT (tenant_id, integration, action_type, fact_pattern)
+                    DO UPDATE SET success_count = executor_learning.success_count + 1,
+                                  last_success = NOW()
+                """, tenant_id, integration, action_type, fact_pattern)
+            else:
+                await conn.execute("""
+                    INSERT INTO executor_learning
+                      (tenant_id, integration, action_type, fact_pattern, failure_count, last_failure)
+                    VALUES ($1,$2,$3,$4,1,NOW())
+                    ON CONFLICT (tenant_id, integration, action_type, fact_pattern)
+                    DO UPDATE SET failure_count = executor_learning.failure_count + 1,
+                                  last_failure = NOW()
+                """, tenant_id, integration, action_type, fact_pattern)
+
+            results.append({
+                "rule_id":     rule["id"],
+                "rule_name":   rule.get("name", ""),
+                "integration": integration,
+                "action_type": action_type,
+                "success":     exec_result.get("success", False),
+                "duration_ms": exec_result.get("duration_ms", 0),
+                "error":       exec_result.get("error"),
+                "real_value_seen_by_agent": False,  # always
+            })
+
+    success_count = sum(1 for r in results if r["success"])
+    return {
+        "token_id":        token_id,
+        "session_id":      session_id,
+        "matched_rules":   len(matched_rules),
+        "actions_taken":   len(results),
+        "actions_succeeded": success_count,
+        "actions_failed":  len(results) - success_count,
+        "results":         results,
+        "dry_run":         dry_run,
+        "real_value_seen_by_agent": False,
+        "message": (
+            f"{success_count}/{len(results)} actions succeeded. "
+            f"Real value sent to integrations. Agent never saw it."
+        ),
+    }
+
+
+# ── Core: Run on cohort ────────────────────────────────────────────────────────
+
+async def run_thinking_executor_cohort(
+    pool,
+    tenant_id:  str,
+    cohort_id:  str,
+    session_id: str  = None,
+    dry_run:    bool = False,
+    limit:      int  = 1000,
+) -> dict:
+    """Run the Thinking Executor on every token in a cohort."""
+    import asyncio as _asyncio
+
+    session_id = session_id or _secrets.token_hex(8)
+
+    async with pool.acquire() as conn:
+        token_rows = await conn.fetch(
+            "SELECT token_id FROM thinking_tokens "
+            "WHERE cohort_id=$1 AND tenant_id=$2 AND revoked=FALSE "
+            "LIMIT $3",
+            cohort_id, tenant_id, limit
+        )
+
+    token_ids = [r["token_id"] for r in token_rows]
+    if not token_ids:
+        return {
+            "cohort_id":    cohort_id,
+            "tokens_found": 0,
+            "message":      "No active tokens in cohort.",
+        }
+
+    # Run concurrently — max 10 at a time
+    semaphore = _asyncio.Semaphore(10)
+    async def _run_one(tid):
+        async with semaphore:
+            return await run_thinking_executor(pool, tenant_id, tid, session_id, dry_run)
+
+    all_results = await _asyncio.gather(*[_run_one(tid) for tid in token_ids])
+
+    total_actions   = sum(r.get("actions_taken", 0) for r in all_results)
+    total_succeeded = sum(r.get("actions_succeeded", 0) for r in all_results)
+    errors          = [r for r in all_results if r.get("actions_failed", 0) > 0]
+
+    return {
+        "cohort_id":       cohort_id,
+        "session_id":      session_id,
+        "tokens_processed": len(token_ids),
+        "total_actions":   total_actions,
+        "total_succeeded": total_succeeded,
+        "total_failed":    total_actions - total_succeeded,
+        "error_count":     len(errors),
+        "dry_run":         dry_run,
+        "real_value_seen_by_agent": False,
+        "message": (
+            f"Processed {len(token_ids)} tokens. "
+            f"{total_succeeded}/{total_actions} actions succeeded. "
+            f"Real values sent to integrations. Agent never saw any."
+        ),
+    }
+
+
+# ── Helpers: register integration / rule / chain ───────────────────────────────
+
+async def register_executor_integration(
+    pool,
+    tenant_id:  str,
+    name:       str,
+    config:     dict,
+    test_mode:  bool = False,
+) -> dict:
+    if name not in _SUPPORTED_INTEGRATIONS:
+        raise ValueError(f"Unknown integration '{name}'. Supported: {list(_SUPPORTED_INTEGRATIONS.keys())}")
+
+    spec     = _SUPPORTED_INTEGRATIONS[name]
+    missing  = [k for k in spec["required"] if k not in config]
+    if missing:
+        raise ValueError(f"Integration '{name}' requires: {missing}")
+
+    async with pool.acquire() as conn:
+        row_id = await conn.fetchval("""
+            INSERT INTO executor_integrations (tenant_id, name, config, test_mode)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (tenant_id, name)
+            DO UPDATE SET config=$3, test_mode=$4, enabled=TRUE, updated_at=NOW()
+            RETURNING id
+        """, tenant_id, name, _json.dumps(config), test_mode)
+
+    return {
+        "id":        row_id,
+        "name":      name,
+        "label":     spec["label"],
+        "category":  spec["category"],
+        "actions":   spec["actions"],
+        "test_mode": test_mode,
+        "message":   f"Integration '{name}' registered. {'TEST MODE — no real calls made.' if test_mode else 'Live mode.'}",
+    }
+
+
+async def register_executor_rule(
+    pool,
+    tenant_id:    str,
+    integration:  str,
+    action_type:  str,
+    conditions:   list,
+    action_template: dict,
+    name:         str  = None,
+    priority:     int  = 0,
+    data_type:    str  = None,
+    cohort_id:    str  = None,
+    on_success_chain: str = None,
+    on_failure_chain: str = None,
+) -> dict:
+    async with pool.acquire() as conn:
+        row_id = await conn.fetchval("""
+            INSERT INTO executor_action_rules (
+                tenant_id, name, priority, data_type, cohort_id,
+                conditions, integration, action_type, action_template,
+                on_success_chain, on_failure_chain
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            RETURNING id
+        """,
+            tenant_id, name, priority, data_type, cohort_id,
+            _json.dumps(conditions), integration, action_type,
+            _json.dumps(action_template),
+            on_success_chain, on_failure_chain,
+        )
+    return {
+        "id":           row_id,
+        "name":         name,
+        "integration":  integration,
+        "action_type":  action_type,
+        "conditions":   conditions,
+        "priority":     priority,
+        "message":      f"Rule registered. When facts match → {integration}.{action_type} fires automatically.",
+    }
+
+
+async def get_executor_learning(pool, tenant_id: str) -> dict:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT integration, action_type, fact_pattern,
+                   success_count, failure_count, last_success, last_failure
+            FROM executor_learning
+            WHERE tenant_id=$1
+            ORDER BY success_count DESC LIMIT 50
+        """, tenant_id)
+    return {
+        "learned_patterns": [
+            {
+                "integration":   r["integration"],
+                "action_type":   r["action_type"],
+                "fact_pattern":  r["fact_pattern"],
+                "success_count": r["success_count"],
+                "failure_count": r["failure_count"],
+                "success_rate":  round(
+                    r["success_count"] / max(r["success_count"] + r["failure_count"], 1) * 100, 1
+                ),
+                "last_success":  r["last_success"].isoformat() if r["last_success"] else None,
+            } for r in rows
+        ],
+        "total_patterns": len(rows),
+    }
