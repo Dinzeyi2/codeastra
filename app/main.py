@@ -366,6 +366,25 @@ async def lifespan(app: FastAPI):
     elif IS_PROD:
         raise RuntimeError("REDIS_URL required in prod")
     await init_db()
+
+    # Run all system migrations — omega, thinking tokens, executor
+    try:
+        from app.v3 import (
+            OMEGA_TOKEN_MIGRATIONS,
+            THINKING_TOKEN_MIGRATIONS,
+            THINKING_EXECUTOR_MIGRATIONS,
+        )
+        async with pool.acquire() as conn:
+            for sql in OMEGA_TOKEN_MIGRATIONS:
+                await conn.execute(sql)
+            for sql in THINKING_TOKEN_MIGRATIONS:
+                await conn.execute(sql)
+            for sql in THINKING_EXECUTOR_MIGRATIONS:
+                await conn.execute(sql)
+        log.info("migrations.complete", systems="omega,thinking,executor")
+    except Exception as e:
+        log.error("migrations.failed", error=str(e))
+
     log.info("agentguard.started", version="3.8.0", env=AGENTGUARD_ENV)
     yield
     await pool.close()
